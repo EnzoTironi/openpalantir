@@ -1,15 +1,19 @@
 //! Install teaching cases by calling live OMS builder Actions, then Funnel.
 //!
 //! [`install`] is wastewater. [`install_highered`] is the higher-education case
-//! (Zhang 2026). Both use the same builder APIs; neither is a second OMS.
+//! (Zhang 2026). [`install_healthcare`] is the instructional healthcare case
+//! (Zhang 2026). All use the same builder APIs; none is a second OMS.
 //! Schema is created on a branch and merged. Instances arrive through Funnel.
 //! `AerationTank.target_do` is `ActionWritten`: Funnel must not overwrite it.
+//! Healthcare never computes a prescribed quantity.
 
 #![allow(clippy::missing_errors_doc)] // OntoError is the public contract
 #![allow(clippy::too_many_lines)] // teaching-case install is one schema dump
 
+mod healthcare;
 mod highered;
 
+pub use healthcare::{define_healthcare, install_healthcare, HealthcareIds};
 pub use highered::{define_highered, install_highered, HigheredIds};
 
 use onto::{

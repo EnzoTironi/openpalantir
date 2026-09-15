@@ -3,7 +3,7 @@ name = "onto-bootstrap"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Runtime-created wastewater and higher-ed ontologies (same builder APIs as a human)"
+description = "Runtime-created wastewater, higher-ed, and healthcare ontologies (same builder APIs as a human)"
 
 [dependencies]
 onto = { path = "../onto" }
