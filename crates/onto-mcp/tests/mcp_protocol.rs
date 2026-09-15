@@ -1,4 +1,4 @@
-use onto::{dispatch, Actor, Engine, Session};
+use onto::{dispatch, Actor, AgentTier, Engine, Session};
 use onto_bootstrap::install;
 use serde_json::json;
 
@@ -6,7 +6,10 @@ use serde_json::json;
 fn consumer_tools_projected_from_live_oms() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
-    let session = Session::new(Actor::consumer("agent", &["operator"], 2), "mcp");
+    let session = Session::new(
+        Actor::consumer("agent", &["operator"], AgentTier::T2),
+        "mcp",
+    );
     let listed = dispatch(&engine, &session, "list_tools", json!({})).unwrap();
     let names: Vec<String> = listed
         .as_array()
@@ -40,7 +43,10 @@ fn builder_tools_exclude_production_reads() {
 fn mcp_style_call_propose() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
-    let session = Session::new(Actor::consumer("agent", &["operator"], 2), "mcp");
+    let session = Session::new(
+        Actor::consumer("agent", &["operator"], AgentTier::T2),
+        "mcp",
+    );
     let out = dispatch(
         &engine,
         &session,
@@ -65,7 +71,10 @@ fn mcp_style_call_propose() {
 fn mcp_decision_record_has_write_path_trace() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
-    let session = Session::new(Actor::consumer("agent", &["operator"], 2), "mcp");
+    let session = Session::new(
+        Actor::consumer("agent", &["operator"], AgentTier::T2),
+        "mcp",
+    );
     let out = dispatch(
         &engine,
         &session,
@@ -102,9 +111,11 @@ fn mcp_decision_record_has_write_path_trace() {
             "declare_side_effects"
         ])
     );
-    assert!(rec["data_snapshot"]["objects"].as_array().unwrap().iter().any(|o| {
-        o["id"] == ids.sensor1
-    }));
+    assert!(rec["data_snapshot"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|o| { o["id"] == ids.sensor1 }));
     assert_eq!(rec["data_snapshot"]["engine_version"], onto::ENGINE_VERSION);
 }
 
@@ -122,5 +133,8 @@ fn mcp_keys_stay_separated_on_write_path() {
             "params": { "tank": "tank-1" }
         }),
     );
-    assert!(denied.is_err(), "builder key cannot submit production actions");
+    assert!(
+        denied.is_err(),
+        "builder key cannot submit production actions"
+    );
 }

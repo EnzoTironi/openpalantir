@@ -42,11 +42,7 @@ pub struct ObjectSetSpec {
 }
 
 impl ObjectSet {
-    pub fn inline(
-        type_name: Option<String>,
-        filter: ObjectSetFilter,
-        limit: usize,
-    ) -> Self {
+    pub fn inline(type_name: Option<String>, filter: ObjectSetFilter, limit: usize) -> Self {
         Self {
             type_name,
             filter,
@@ -104,11 +100,10 @@ impl ObjectSet {
                 return false;
             }
         }
-        self.filter.equals.iter().all(|(k, v)| {
-            view.properties
-                .get(k)
-                .is_some_and(|p| p.value == *v)
-        })
+        self.filter
+            .equals
+            .iter()
+            .all(|(k, v)| view.properties.get(k).is_some_and(|p| p.value == *v))
     }
 }
 
@@ -161,6 +156,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tiers::AgentTier;
     use crate::types::{Actor, PropertySource, PropertyView};
     use serde_json::json;
 
@@ -244,7 +240,7 @@ mod tests {
     #[test]
     fn restricted_permission_strips_rationale() {
         let session = Session::new(
-            Actor::consumer("ops.restricted", &["restricted"], 2),
+            Actor::consumer("ops.restricted", &["restricted"], AgentTier::T2),
             "test",
         );
         let raw = view(

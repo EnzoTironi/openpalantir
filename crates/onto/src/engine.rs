@@ -6,6 +6,7 @@ use crate::oss::{
     apply_permission, evaluate_members, ObjectSet, ObjectSetFilter, ObjectSetSpec,
     OBJECT_SETS_TABLE,
 };
+use crate::tiers::{self, AutoBound, RiskBand};
 use crate::types::*;
 use crate::write_path::{pin_version, resolve_idempotency_key, StagedOp, WritePath};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -1072,6 +1073,7 @@ impl Engine {
 
     pub fn list_inbox(&self, session: &Session) -> Result<Vec<InboxItem>> {
         Self::require_consumer(session)?;
+        tiers::require_syscall(session.actor.tier, "list_inbox")?;
         let db = self.db.lock().expect("db");
         let mut stmt = db.prepare(
             "SELECT id, action_name, proposed_by, params, status, created_at FROM inbox ORDER BY created_at",
@@ -1095,7 +1097,10 @@ impl Engine {
 
     pub fn describe_action(&self, session: &Session, name: &str) -> Result<ActionTypeSpec> {
         match session.actor.key {
-            KeyKind::Consumer => self.load_action_type(MAIN_BRANCH, name),
+            KeyKind::Consumer => {
+                tiers::require_syscall(session.actor.tier, "describe_action")?;
+                self.load_action_type(MAIN_BRANCH, name)
+            }
             KeyKind::Builder => Err(OntoError::Denied(
                 "builder key cannot read production actions as syscalls".into(),
             )),
@@ -1107,9 +1112,12 @@ impl Engine {
             KeyKind::Builder => Ok(builder_tools()),
             KeyKind::Consumer => {
                 let mut tools = consumer_base_tools();
+                tools.retain(|t| session.actor.tier.allows_syscall(&t.name));
                 let schema = self.get_schema(session, None)?;
                 for action in schema.action_types {
-                    if session.actor.tier >= action.required_tier {
+                    if session.actor.tier >= action.required_tier
+                        && session.actor.tier.allows_syscall("submit_action")
+                    {
                         tools.push(action_to_tool(&action));
                     }
                 }
@@ -1125,6 +1133,7 @@ impl Engine {
         params: Value,
     ) -> Result<ActionOutcome> {
         Self::require_consumer(session)?;
+        tiers::require_syscall(session.actor.tier, "submit_action")?;
         let spec = self.load_action_type(MAIN_BRANCH, action_name)?;
         self.execute_action(session, &spec, params, None)
     }
@@ -1152,19 +1161,16 @@ impl Engine {
 
     pub fn confirm_action(&self, session: &Session, inbox_id: &str) -> Result<ActionOutcome> {
         Self::require_consumer(session)?;
-        if !session.actor.has_role("supervisor") && session.actor.tier < 3 {
-            return Err(OntoError::Denied(
-                "confirmer must be supervisor or tier 3+".into(),
-            ));
-        }
-        let (action_name, params, status): (String, String, String) = {
+        tiers::require_syscall(session.actor.tier, "confirm_action")?;
+        let (action_name, params, status, proposed_by): (String, String, String, String) = {
             let db = self.db.lock().expect("db");
             db.query_row(
-                "SELECT action_name, params, status FROM inbox WHERE id = ?1",
+                "SELECT action_name, params, status, proposed_by FROM inbox WHERE id = ?1",
                 params![inbox_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?
         };
+        tiers::require_distinct_confirmer(&session.actor.id, &proposed_by)?;
         if status != "pending" {
             return Err(OntoError::Conflict(format!("inbox item is {status}")));
         }
@@ -1190,6 +1196,7 @@ impl Engine {
         reason: &str,
     ) -> Result<ActionOutcome> {
         Self::require_consumer(session)?;
+        tiers::require_syscall(session.actor.tier, "override_action")?;
         if !session.actor.has_role("supervisor") {
             return Err(OntoError::Denied("override requires supervisor".into()));
         }
@@ -1248,6 +1255,27 @@ impl Engine {
             alternative: None,
             guard_results: vec![],
         })
+    }
+
+    /// T4 unsupervised auto. Bound starts empty, so every claim is denied.
+    pub fn auto_action(
+        &self,
+        session: &Session,
+        action_name: &str,
+        object_set: &str,
+        risk_band: RiskBand,
+        params: Value,
+    ) -> Result<ActionOutcome> {
+        Self::require_consumer(session)?;
+        tiers::require_syscall(session.actor.tier, "auto_action")?;
+        tiers::require_auto(
+            session.actor.tier,
+            &AutoBound::empty(),
+            action_name,
+            object_set,
+            risk_band,
+        )?;
+        self.submit_action(session, action_name, params)
     }
 
     pub fn get_decision_record(&self, session: &Session, id: &str) -> Result<DecisionRecordView> {
@@ -2143,6 +2171,10 @@ fn consumer_base_tools() -> Vec<ToolSpec> {
             "Event-path ingest; never overwrites ActionWritten",
         ),
         ("create_link", "Create a named link between instances"),
+        (
+            "auto_action",
+            "T4 auto inside a declared bound {action_type × object_set × risk_band}",
+        ),
     ]
     .into_iter()
     .map(|(name, description)| ToolSpec {

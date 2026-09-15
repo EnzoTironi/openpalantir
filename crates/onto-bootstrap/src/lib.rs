@@ -1,9 +1,9 @@
 //! Install the wastewater case by calling live OMS builder Actions, then Funnel.
 
 use onto::{
-    ActionTypeSpec, Actor, Engine, ExecutionMode, FunctionKind, FunctionSpec, InterfaceSpec,
-    IngestRecord, LinkTypeSpec, ObjectTypeSpec, ParamSpec, PropertySource, PropertySpec, Result,
-    Session, Typology, ValueTypeSpec,
+    ActionTypeSpec, Actor, AgentTier, Engine, ExecutionMode, FunctionKind, FunctionSpec,
+    IngestRecord, InterfaceSpec, LinkTypeSpec, ObjectTypeSpec, ParamSpec, PropertySource,
+    PropertySpec, Result, Session, Typology, ValueTypeSpec,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -21,12 +21,9 @@ pub struct WastewaterIds {
 
 pub fn install(engine: &Engine) -> Result<WastewaterIds> {
     let modeller = Session::new(Actor::builder("human.modeler", &["modeler"]), "bootstrap");
-    let reviewer = Session::new(
-        Actor::builder("human.reviewer", &["reviewer"]),
-        "bootstrap",
-    );
+    let reviewer = Session::new(Actor::builder("human.reviewer", &["reviewer"]), "bootstrap");
     let ops = Session::new(
-        Actor::consumer("pipeline.funnel", &["operator"], 2),
+        Actor::consumer("pipeline.funnel", &["operator"], AgentTier::T2),
         "ingest",
     );
 
@@ -38,7 +35,13 @@ pub fn install(engine: &Engine) -> Result<WastewaterIds> {
     seed_world(engine, &ops)
 }
 
-fn vt(name: &str, base: &str, min: Option<f64>, max: Option<f64>, unit: Option<&str>) -> ValueTypeSpec {
+fn vt(
+    name: &str,
+    base: &str,
+    min: Option<f64>,
+    max: Option<f64>,
+    unit: Option<&str>,
+) -> ValueTypeSpec {
     ValueTypeSpec {
         name: name.into(),
         base: base.into(),
@@ -92,7 +95,13 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
     engine.create_value_type(
         s,
         branch,
-        vt("DOConcentration", "number", Some(0.0), Some(15.0), Some("mg/L")),
+        vt(
+            "DOConcentration",
+            "number",
+            Some(0.0),
+            Some(15.0),
+            Some("mg/L"),
+        ),
     )?;
 
     engine.create_interface(
@@ -135,7 +144,12 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
             &[],
             vec![
                 prop("name", "Text", PropertySource::Mapped, false),
-                prop("current_do", "DOConcentration", PropertySource::Mapped, true),
+                prop(
+                    "current_do",
+                    "DOConcentration",
+                    PropertySource::Mapped,
+                    true,
+                ),
                 prop(
                     "target_do",
                     "DOConcentration",
@@ -180,9 +194,18 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
             &[],
             vec![
                 prop("name", "Text", PropertySource::Mapped, false),
-                prop("calibration_date", "Timestamp", PropertySource::Mapped, false),
+                prop(
+                    "calibration_date",
+                    "Timestamp",
+                    PropertySource::Mapped,
+                    false,
+                ),
                 prop("last_reading_at", "Timestamp", PropertySource::Mapped, true),
-                derived("days_since_calibration", "Timestamp", "days_since_calibration"),
+                derived(
+                    "days_since_calibration",
+                    "Timestamp",
+                    "days_since_calibration",
+                ),
             ],
         ),
     )?;
@@ -295,7 +318,12 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
             &["Reviewable", "Evidenced"],
             vec![
                 prop("name", "Text", PropertySource::ActionWritten, true),
-                prop("target_do", "DOConcentration", PropertySource::ActionWritten, false),
+                prop(
+                    "target_do",
+                    "DOConcentration",
+                    PropertySource::ActionWritten,
+                    false,
+                ),
                 prop("rationale", "Text", PropertySource::ActionWritten, false),
                 prop("status", "Text", PropertySource::ActionWritten, false),
             ],
@@ -371,7 +399,13 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
         ("monitors", "DO_Sensor", "AerationTank", "1:1", false),
         ("supplies_air", "Blower", "AerationTank", "1:n", false),
         ("treats", "ChemicalDoser", "AerationTank", "n:n", false),
-        ("evidence_for", "TelemetryReading", "ControlRecommendation", "n:n", false),
+        (
+            "evidence_for",
+            "TelemetryReading",
+            "ControlRecommendation",
+            "n:n",
+            false,
+        ),
     ] {
         engine.create_link_type(
             s,
@@ -428,7 +462,7 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
             { "max_days_since_calibration": 365, "object": "sensor" }
         ]),
         required_roles: vec!["operator".into()],
-        required_tier: 2,
+        required_tier: AgentTier::T2,
         effects: json!([]),
         compensation: Some("revert_setpoint_change".into()),
         side_effects: json!({}),
@@ -479,7 +513,7 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
                 { "lte_field": "target_do", "object": "permit", "field": "do_max" }
             ]),
             required_roles: vec!["supervisor".into()],
-            required_tier: 3,
+            required_tier: AgentTier::T3,
             effects: json!([
                 {
                     "update": "tank",
@@ -578,7 +612,7 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
             ],
             guards: json!([]),
             required_roles: vec!["supervisor".into()],
-            required_tier: 3,
+            required_tier: AgentTier::T3,
             effects: json!([{
                 "create": "Override",
                 "properties": {
@@ -606,7 +640,7 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
             }],
             guards: json!([]),
             required_roles: vec!["operator".into()],
-            required_tier: 2,
+            required_tier: AgentTier::T2,
             effects: json!([{
                 "create": "CalibrationRequest",
                 "properties": { "name": "calibrate" }
@@ -620,12 +654,7 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
     Ok(())
 }
 
-fn rec(
-    type_name: &str,
-    id: &str,
-    pairs: &[(&str, serde_json::Value)],
-    as_of: i64,
-) -> IngestRecord {
+fn rec(type_name: &str, id: &str, pairs: &[(&str, serde_json::Value)], as_of: i64) -> IngestRecord {
     IngestRecord {
         type_name: type_name.into(),
         id: Some(id.into()),
@@ -653,10 +682,30 @@ fn seed_world(engine: &Engine, ops: &Session) -> Result<WastewaterIds> {
     engine.funnel_ingest(
         ops,
         vec![
-            rec("TreatmentPlant", &ids.plant, &[("name", json!("Eastworks"))], t),
-            rec("AerationTank", &ids.tank1, &[("name", json!("Basin 1")), ("current_do", json!(1.8))], t),
-            rec("AerationTank", &ids.tank2, &[("name", json!("Basin 2")), ("current_do", json!(2.1))], t),
-            rec("AerationTank", &ids.tank3, &[("name", json!("Basin 3")), ("current_do", json!(1.9))], t),
+            rec(
+                "TreatmentPlant",
+                &ids.plant,
+                &[("name", json!("Eastworks"))],
+                t,
+            ),
+            rec(
+                "AerationTank",
+                &ids.tank1,
+                &[("name", json!("Basin 1")), ("current_do", json!(1.8))],
+                t,
+            ),
+            rec(
+                "AerationTank",
+                &ids.tank2,
+                &[("name", json!("Basin 2")), ("current_do", json!(2.1))],
+                t,
+            ),
+            rec(
+                "AerationTank",
+                &ids.tank3,
+                &[("name", json!("Basin 3")), ("current_do", json!(1.9))],
+                t,
+            ),
             rec(
                 "DO_Sensor",
                 &ids.sensor1,
@@ -667,13 +716,32 @@ fn seed_world(engine: &Engine, ops: &Session) -> Result<WastewaterIds> {
                 ],
                 t,
             ),
-            rec("Blower", &ids.blower, &[("name", json!("B-1")), ("status", json!("on"))], t),
-            rec("ChemicalDoser", &ids.doser, &[("name", json!("Carbon-1"))], t),
-            rec("PermitVersion", &ids.permit, &[("name", json!("2026-A")), ("do_max", json!(4.0))], t),
+            rec(
+                "Blower",
+                &ids.blower,
+                &[("name", json!("B-1")), ("status", json!("on"))],
+                t,
+            ),
+            rec(
+                "ChemicalDoser",
+                &ids.doser,
+                &[("name", json!("Carbon-1"))],
+                t,
+            ),
+            rec(
+                "PermitVersion",
+                &ids.permit,
+                &[("name", json!("2026-A")), ("do_max", json!(4.0))],
+                t,
+            ),
             rec(
                 "TelemetryReading",
                 "tele-1",
-                &[("name", json!("t1")), ("do_value", json!(1.8)), ("observed_at", json!(t))],
+                &[
+                    ("name", json!("t1")),
+                    ("do_value", json!(1.8)),
+                    ("observed_at", json!(t)),
+                ],
                 t,
             ),
         ],
