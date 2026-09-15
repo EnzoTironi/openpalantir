@@ -1,4 +1,11 @@
-//! Install the wastewater case by calling live OMS builder Actions, then Funnel.
+//! Install teaching cases by calling live OMS builder Actions, then Funnel.
+//!
+//! [`install`] is wastewater. [`install_highered`] is the higher-education case
+//! (Zhang 2026). Both use the same builder APIs; neither is a second OMS.
+
+mod highered;
+
+pub use highered::{define_highered, install_highered, HigheredIds};
 
 use onto::{
     ActionTypeSpec, Actor, AgentTier, AuthzDecision, AuthzLevel, AuthzOp, Engine, ExecutionMode,

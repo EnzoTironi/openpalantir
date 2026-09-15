@@ -24,7 +24,7 @@ Inspirado em Zhang, *Operational Ontology: From Business Mirror to Decision Runt
 - `crates/onto` — motor
 - `crates/onto-sdk` — cliente + CLI `onto`
 - `crates/onto-mcp` — MCP stdio e HTTP em `:43177/mcp`
-- `crates/onto-bootstrap` — caso wastewater via as mesmas APIs de builder
+- `crates/onto-bootstrap` — casos wastewater e ensino superior via as mesmas APIs de builder
 
 ## Rodar
 
@@ -64,3 +64,12 @@ cargo run -p onto-sdk --bin onto -- --key builder --id ke --roles modeler,review
 4. Supervisor `confirm_action` ou `override_action`.
 5. `get_decision_record` replay do dossier.
 6. Supervisor `compensate_action` no Allow: Action inversa (`revert_setpoint_change`), não rollback.
+
+## Loop ensino superior (Zhang 2026)
+
+Turma cheia entra em fila (`Waitlist`). `propose_enroll` não faz Auto: vai para a inbox de Review. O supervisor confirma e `approve_enroll` atribui o `Seat`, ou `Deny` se `slots` já é 0. Segunda confirmação no mesmo assento não faz double-book. Compensação é `release_seat` (inversa para frente). Sem tipos de saúde.
+
+```bash
+# mesmo comando; testes em crates/onto-bootstrap/tests/highered.rs
+cargo test --workspace -- --test-threads=1
+```
