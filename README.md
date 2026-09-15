@@ -24,7 +24,7 @@ Inspirado em Zhang, *Operational Ontology: From Business Mirror to Decision Runt
 - `crates/onto` — motor
 - `crates/onto-sdk` — cliente + CLI `onto`
 - `crates/onto-mcp` — MCP stdio e HTTP em `:43177/mcp`
-- `crates/onto-bootstrap` — caso wastewater via as mesmas APIs de builder
+- `crates/onto-bootstrap` — casos wastewater e ensino superior via as mesmas APIs de builder
 
 ## Rodar
 
@@ -75,3 +75,12 @@ Testes nomeados (`crates/onto-bootstrap/tests/wastewater_case.rs`):
 - override sela `DecisionRecord` replayável; confirmer ≠ proposer
 - Funnel não sobrescreve `AerationTank.target_do` (`ActionWritten`)
 - schema em branch não mesclado não altera instâncias de produção
+
+## Loop ensino superior (Zhang 2026)
+
+Turma cheia entra em fila (`Waitlist`). `propose_enroll` não faz Auto: vai para a inbox de Review. O supervisor confirma e `approve_enroll` atribui o `Seat`, ou `Deny` se `slots` já é 0. Segunda confirmação no mesmo assento não faz double-book. Compensação é `release_seat` (inversa para frente). Sem tipos de saúde.
+
+```bash
+# mesmo comando; testes em crates/onto-bootstrap/tests/highered.rs
+cargo test --workspace -- --test-threads=1
+```

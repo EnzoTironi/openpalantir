@@ -1,7 +1,13 @@
-//! Install the wastewater teaching case (Zhang 2026) via live OMS builder APIs.
+//! Install teaching cases by calling live OMS builder Actions, then Funnel.
 //!
+//! [`install`] is wastewater. [`install_highered`] is the higher-education case
+//! (Zhang 2026). Both use the same builder APIs; neither is a second OMS.
 //! Schema is created on a branch and merged. Instances arrive through Funnel.
 //! `AerationTank.target_do` is `ActionWritten`: Funnel must not overwrite it.
+
+mod highered;
+
+pub use highered::{define_highered, install_highered, HigheredIds};
 
 use onto::{
     ActionTypeSpec, Actor, AgentTier, AuthzDecision, AuthzLevel, AuthzOp, Engine, ExecutionMode,
