@@ -20,6 +20,7 @@ fn consumer_tools_projected_from_live_oms() {
     assert!(names.contains(&"get_object".into()));
     assert!(names.contains(&"action.propose_setpoint_change".into()));
     assert!(!names.contains(&"create_object_type".into()));
+    assert!(!names.contains(&"create_link".into()));
 }
 
 #[test]

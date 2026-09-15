@@ -1,9 +1,9 @@
 //! Install the wastewater case by calling live OMS builder Actions, then Funnel.
 
 use onto::{
-    ActionTypeSpec, Actor, AgentTier, Engine, ExecutionMode, FunctionKind, FunctionSpec,
-    IngestRecord, InterfaceSpec, LinkTypeSpec, ObjectTypeSpec, ParamSpec, PropertySource,
-    PropertySpec, Result, Session, Typology, ValueTypeSpec,
+    ActionTypeSpec, Actor, AgentTier, AuthzDecision, AuthzLevel, AuthzOp, Engine, ExecutionMode,
+    FunctionKind, FunctionSpec, IngestRecord, InterfaceSpec, KeyKind, LinkTypeSpec, ObjectTypeSpec,
+    ParamSpec, PolicySpec, PropertySource, PropertySpec, Result, Session, Typology, ValueTypeSpec,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -630,6 +630,48 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
         s,
         branch,
         ActionTypeSpec {
+            name: "assert_link".into(),
+            mode: ExecutionMode::Auto,
+            parameters: vec![
+                ParamSpec {
+                    name: "link_type".into(),
+                    value_type: "Text".into(),
+                    object_type: None,
+                    required: true,
+                },
+                ParamSpec {
+                    name: "from".into(),
+                    value_type: "Text".into(),
+                    object_type: None,
+                    required: true,
+                },
+                ParamSpec {
+                    name: "to".into(),
+                    value_type: "Text".into(),
+                    object_type: None,
+                    required: true,
+                },
+            ],
+            guards: json!([]),
+            required_roles: vec!["operator".into()],
+            required_tier: AgentTier::T2,
+            effects: json!([{
+                "link": "$link_type",
+                "from": "from",
+                "to": "to"
+            }]),
+            compensation: None,
+            side_effects: json!({}),
+            on_review: None,
+        },
+    )?;
+
+    seed_policies(engine, s, branch)?;
+
+    engine.create_action_type(
+        s,
+        branch,
+        ActionTypeSpec {
             name: "request_sensor_calibration".into(),
             mode: ExecutionMode::Auto,
             parameters: vec![ParamSpec {
@@ -746,15 +788,234 @@ fn seed_world(engine: &Engine, ops: &Session) -> Result<WastewaterIds> {
             ),
         ],
     )?;
-    engine.create_link(ops, "contains", &ids.plant, &ids.tank1)?;
-    engine.create_link(ops, "contains", &ids.plant, &ids.tank2)?;
-    engine.create_link(ops, "contains", &ids.plant, &ids.tank3)?;
-    engine.create_link(ops, "upstream_of", &ids.tank1, &ids.tank2)?;
-    engine.create_link(ops, "upstream_of", &ids.tank2, &ids.tank3)?;
-    engine.create_link(ops, "upstream_of", &ids.tank3, &ids.tank1)?;
-    engine.create_link(ops, "monitors", &ids.sensor1, &ids.tank1)?;
-    engine.create_link(ops, "supplies_air", &ids.blower, &ids.tank1)?;
-    engine.create_link(ops, "treats", &ids.doser, &ids.tank1)?;
-    engine.create_link(ops, "treats", &ids.doser, &ids.tank2)?;
+    seed_links(engine, ops, &ids)?;
     Ok(ids)
+}
+
+fn seed_links(engine: &Engine, ops: &Session, ids: &WastewaterIds) -> Result<()> {
+    for (link_type, from, to) in [
+        ("contains", ids.plant.as_str(), ids.tank1.as_str()),
+        ("contains", ids.plant.as_str(), ids.tank2.as_str()),
+        ("contains", ids.plant.as_str(), ids.tank3.as_str()),
+        ("upstream_of", ids.tank1.as_str(), ids.tank2.as_str()),
+        ("upstream_of", ids.tank2.as_str(), ids.tank3.as_str()),
+        ("upstream_of", ids.tank3.as_str(), ids.tank1.as_str()),
+        ("monitors", ids.sensor1.as_str(), ids.tank1.as_str()),
+        ("supplies_air", ids.blower.as_str(), ids.tank1.as_str()),
+        ("treats", ids.doser.as_str(), ids.tank1.as_str()),
+        ("treats", ids.doser.as_str(), ids.tank2.as_str()),
+    ] {
+        let out = engine.submit_action(
+            ops,
+            "assert_link",
+            json!({
+                "link_type": link_type,
+                "from": from,
+                "to": to,
+            }),
+        )?;
+        match out.verdict {
+            onto::Verdict::Allow => {}
+            onto::Verdict::Deny | onto::Verdict::Review => {
+                return Err(onto::OntoError::Denied(format!(
+                    "assert_link {link_type} {from}->{to}: {}",
+                    out.reason
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn seed_policies(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
+    let consumer = Some(KeyKind::Consumer);
+    let readers: &[&str] = &["operator", "supervisor", "restricted"];
+    let writers: &[&str] = &["operator", "supervisor"];
+    for spec in [
+        grant(
+            "platform_consumer_read",
+            AuthzLevel::Platform,
+            AuthzOp::Read,
+            consumer,
+            None,
+            None,
+            None,
+            &[],
+            0,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "platform_consumer_write",
+            AuthzLevel::Platform,
+            AuthzOp::Write,
+            consumer,
+            None,
+            None,
+            None,
+            &[],
+            0,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "type_star_read",
+            AuthzLevel::Type,
+            AuthzOp::Read,
+            consumer,
+            Some("*"),
+            None,
+            None,
+            readers,
+            1,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "type_t1_observe",
+            AuthzLevel::Type,
+            AuthzOp::Read,
+            consumer,
+            Some("*"),
+            None,
+            None,
+            &[],
+            1,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "type_star_write",
+            AuthzLevel::Type,
+            AuthzOp::Write,
+            consumer,
+            Some("*"),
+            None,
+            None,
+            writers,
+            2,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "instance_star_read",
+            AuthzLevel::Instance,
+            AuthzOp::Read,
+            consumer,
+            Some("*"),
+            Some("*"),
+            None,
+            readers,
+            1,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "instance_t1_observe",
+            AuthzLevel::Instance,
+            AuthzOp::Read,
+            consumer,
+            Some("*"),
+            Some("*"),
+            None,
+            &[],
+            1,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "instance_star_write",
+            AuthzLevel::Instance,
+            AuthzOp::Write,
+            consumer,
+            Some("*"),
+            Some("*"),
+            None,
+            writers,
+            2,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "property_star_read",
+            AuthzLevel::Property,
+            AuthzOp::Read,
+            consumer,
+            Some("*"),
+            Some("*"),
+            Some("*"),
+            readers,
+            1,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "property_t1_observe",
+            AuthzLevel::Property,
+            AuthzOp::Read,
+            consumer,
+            Some("*"),
+            Some("*"),
+            Some("*"),
+            &[],
+            1,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "property_star_write",
+            AuthzLevel::Property,
+            AuthzOp::Write,
+            consumer,
+            Some("*"),
+            Some("*"),
+            Some("*"),
+            writers,
+            2,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "property_rationale_deny_restricted",
+            AuthzLevel::Property,
+            AuthzOp::Read,
+            consumer,
+            Some("*"),
+            Some("*"),
+            Some("rationale"),
+            &["restricted"],
+            1,
+            AuthzDecision::Deny,
+        ),
+        grant(
+            "property_do_max_deny_restricted",
+            AuthzLevel::Property,
+            AuthzOp::Read,
+            consumer,
+            Some("*"),
+            Some("*"),
+            Some("do_max"),
+            &["restricted"],
+            1,
+            AuthzDecision::Deny,
+        ),
+    ] {
+        engine.create_policy(s, branch, spec)?;
+    }
+    Ok(())
+}
+
+fn grant(
+    name: &str,
+    level: AuthzLevel,
+    op: AuthzOp,
+    key: Option<KeyKind>,
+    type_name: Option<&str>,
+    instance_id: Option<&str>,
+    property: Option<&str>,
+    roles: &[&str],
+    min_tier: u8,
+    decision: AuthzDecision,
+) -> PolicySpec {
+    PolicySpec {
+        name: name.into(),
+        level,
+        op,
+        key,
+        type_name: type_name.map(|s| s.into()),
+        instance_id: instance_id.map(|s| s.into()),
+        property: property.map(|s| s.into()),
+        roles: roles.iter().map(|s| (*s).to_string()).collect(),
+        min_tier,
+        decision,
+    }
 }

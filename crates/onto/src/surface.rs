@@ -2,6 +2,7 @@ use crate::bitemporal::AsOf;
 use crate::engine::Engine;
 use crate::error::{OntoError, Result};
 use crate::functions::FunctionSpec;
+use crate::security::PolicySpec;
 use crate::tiers::{self, RiskBand};
 use crate::types::*;
 use serde_json::{json, Value};
@@ -98,6 +99,12 @@ fn dispatch_builder(engine: &Engine, session: &Session, tool: &str, args: Value)
             let spec: FunctionSpec = serde_json::from_value(require(&args, "spec")?)?;
             Ok(json!({
                 "name": engine.create_function(session, str_arg(&args, "branch")?, spec)?
+            }))
+        }
+        "create_policy" => {
+            let spec: PolicySpec = serde_json::from_value(require(&args, "spec")?)?;
+            Ok(json!({
+                "name": engine.create_policy(session, str_arg(&args, "branch")?, spec)?
             }))
         }
         "submit_proposal" => Ok(json!({
@@ -206,6 +213,9 @@ fn dispatch_consumer(engine: &Engine, session: &Session, tool: &str, args: Value
             let records: Vec<IngestRecord> = serde_json::from_value(require(&args, "records")?)?;
             Ok(json!({ "ids": engine.funnel_ingest(session, records)? }))
         }
+        "create_link" => Err(OntoError::Denied(
+            "create_link is not a consumer store write; use Action or Funnel".into(),
+        )),
         "create_object_type" | "open_branch" | "merge_to_main" | "create_action_type"
         | "add_property" | "submit_proposal" | "review_proposal" | "create_function" => Err(
             OntoError::Denied("consumer key cannot mutate schema".into()),

@@ -3,9 +3,9 @@ use crate::compensation::{self, Compensation};
 use crate::error::{OntoError, Result};
 use crate::functions::{self, FunctionSpec};
 use crate::oss::{
-    apply_permission, evaluate_members, ObjectSet, ObjectSetFilter, ObjectSetSpec,
-    OBJECT_SETS_TABLE,
+    apply_permission, evaluate_members, ObjectSet, ObjectSetFilter, ObjectSetSpec, OBJECT_SETS_TABLE,
 };
+use crate::security::{authorize, filter_view, AuthzDecision, AuthzOp, PolicySpec, POLICIES_TABLE};
 use crate::tiers::{self, AutoBound, RiskBand};
 use crate::types::*;
 use crate::write_path::{pin_version, resolve_idempotency_key, StagedOp, WritePath};
@@ -97,6 +97,12 @@ impl Engine {
                 PRIMARY KEY (branch, name)
             );
             CREATE TABLE IF NOT EXISTS schema_object_sets (
+                branch TEXT NOT NULL,
+                name TEXT NOT NULL,
+                spec TEXT NOT NULL,
+                PRIMARY KEY (branch, name)
+            );
+            CREATE TABLE IF NOT EXISTS schema_policies (
                 branch TEXT NOT NULL,
                 name TEXT NOT NULL,
                 spec TEXT NOT NULL,
@@ -243,6 +249,7 @@ impl Engine {
             "schema_action_types",
             "schema_functions",
             OBJECT_SETS_TABLE,
+            POLICIES_TABLE,
         ];
         let db = self.db.lock().expect("db");
         for table in tables {
@@ -630,6 +637,7 @@ impl Engine {
             "schema_action_types",
             "schema_functions",
             OBJECT_SETS_TABLE,
+            POLICIES_TABLE,
         ];
         let db = self.db.lock().expect("db");
         for table in tables {
@@ -780,6 +788,71 @@ impl Engine {
         Ok(spec.name)
     }
 
+    pub fn create_policy(
+        &self,
+        session: &Session,
+        branch: &str,
+        spec: PolicySpec,
+    ) -> Result<String> {
+        Self::require_builder(session)?;
+        self.require_open_branch(branch)?;
+        spec.validate()?;
+        let db = self.db.lock().expect("db");
+        Self::put_spec(
+            &db,
+            POLICIES_TABLE,
+            branch,
+            &spec.name,
+            &serde_json::to_value(&spec)?,
+        )?;
+        Ok(spec.name)
+    }
+
+    fn load_policies(&self) -> Result<Vec<PolicySpec>> {
+        self.load_all(MAIN_BRANCH, POLICIES_TABLE)
+    }
+
+    fn authorize_read(
+        &self,
+        session: &Session,
+        type_name: &str,
+        instance_id: &str,
+    ) -> Result<AuthzDecision> {
+        Ok(authorize(
+            &self.load_policies()?,
+            session,
+            AuthzOp::Read,
+            Some(type_name),
+            Some(instance_id),
+            None,
+        ))
+    }
+
+    fn authorize_write(
+        &self,
+        session: &Session,
+        type_name: &str,
+        instance_id: &str,
+    ) -> Result<AuthzDecision> {
+        Ok(authorize(
+            &self.load_policies()?,
+            session,
+            AuthzOp::Write,
+            Some(type_name),
+            Some(instance_id),
+            None,
+        ))
+    }
+
+    fn require_write(&self, session: &Session, type_name: &str, instance_id: &str) -> Result<()> {
+        match self.authorize_write(session, type_name, instance_id)? {
+            AuthzDecision::Allow => Ok(()),
+            AuthzDecision::Deny => Err(OntoError::Denied(format!(
+                "write denied for {type_name}/{instance_id}"
+            ))),
+        }
+    }
+
     pub fn search_objects(&self, session: &Session, query: Query) -> Result<Vec<ObjectView>> {
         self.search_object_set(session, ObjectSet::from_query(&query))
     }
@@ -842,18 +915,32 @@ impl Engine {
     }
 
     fn load_permitted_view(&self, session: &Session, id: &str) -> Result<ObjectView> {
-        Ok(apply_permission(
-            session,
-            self.load_object_view(id, AsOf::Current)?,
-        ))
+        let view = self.load_object_view(id, AsOf::Current)?;
+        match self.authorize_read(session, &view.type_name, &view.id)? {
+            AuthzDecision::Allow => {
+                let view = filter_view(&self.load_policies()?, session, view);
+                Ok(apply_permission(session, view))
+            }
+            AuthzDecision::Deny => Err(OntoError::NotFound(format!("object {id}"))),
+        }
     }
 
     /// Current version when `as_of` is [`AsOf::Current`]; otherwise the version
     /// whose valid span covers that time. Missing coverage is [`OntoError::NotFound`],
-    /// not a silent current row.
+    /// not a silent current row. Property-level Deny hides the property.
     pub fn get_object(&self, session: &Session, id: &str, as_of: AsOf) -> Result<ObjectView> {
         Self::require_consumer(session)?;
-        Ok(apply_permission(session, self.load_object_view(id, as_of)?))
+        let view = self.load_object_view(id, as_of)?;
+        match self.authorize_read(session, &view.type_name, &view.id)? {
+            AuthzDecision::Allow => {
+                let view = filter_view(&self.load_policies()?, session, view);
+                Ok(apply_permission(session, view))
+            }
+            AuthzDecision::Deny => Err(OntoError::Denied(format!(
+                "read denied for {}/{id}",
+                view.type_name
+            ))),
+        }
     }
 
     /// Spans for one identity, oldest valid_from first.
@@ -971,23 +1058,6 @@ impl Engine {
         }))
     }
 
-    pub fn create_link(
-        &self,
-        session: &Session,
-        type_name: &str,
-        from_id: &str,
-        to_id: &str,
-    ) -> Result<String> {
-        Self::require_consumer(session)?;
-        let id = new_id();
-        let db = self.db.lock().expect("db");
-        db.execute(
-            "INSERT INTO links(id, type_name, from_id, to_id) VALUES (?1, ?2, ?3, ?4)",
-            params![id, type_name, from_id, to_id],
-        )?;
-        Ok(id)
-    }
-
     pub fn funnel_ingest(
         &self,
         session: &Session,
@@ -996,6 +1066,10 @@ impl Engine {
         Self::require_consumer(session)?;
         let mut ids = Vec::new();
         for rec in records {
+            let id = rec.id.clone().unwrap_or_else(new_id);
+            self.require_write(session, &rec.type_name, &id)?;
+            let mut rec = rec;
+            rec.id = Some(id);
             ids.push(self.ingest_one(rec)?);
         }
         self.audit(
@@ -1880,7 +1954,13 @@ impl Engine {
                     properties: serde_json::to_string(&view_props)?,
                 });
             }
-            if let Some(link) = obj.get("link").and_then(|v| v.as_str()) {
+            if obj.get("link").is_some() {
+                let link = match resolve_value(obj.get("link").unwrap_or(&Value::Null), params) {
+                    Value::String(s) if !s.is_empty() => s,
+                    _ => {
+                        return Err(OntoError::Invalid("link effect needs a link type".into()));
+                    }
+                };
                 let from = param_str(
                     params,
                     obj.get("from").and_then(|v| v.as_str()).unwrap_or("from"),
@@ -1894,7 +1974,7 @@ impl Engine {
                 };
                 staged.push(StagedOp::InsertLink {
                     id: new_id(),
-                    type_name: link.into(),
+                    type_name: link,
                     from_id: from,
                     to_id: to,
                 });
@@ -2123,6 +2203,10 @@ fn builder_tools() -> Vec<ToolSpec> {
         ("alter_action_type", "Alter an action type on a branch"),
         ("create_function", "Create a function record on a branch"),
         ("create_object_set", "Create a named object set on a branch"),
+        (
+            "create_policy",
+            "Create a four-level policy grant on a branch",
+        ),
         ("submit_proposal", "Submit a branch for review"),
         ("review_proposal", "Approve or reject a proposal"),
         ("merge_to_main", "Merge an approved proposal into main"),
@@ -2170,7 +2254,6 @@ fn consumer_base_tools() -> Vec<ToolSpec> {
             "funnel_ingest",
             "Event-path ingest; never overwrites ActionWritten",
         ),
-        ("create_link", "Create a named link between instances"),
         (
             "auto_action",
             "T4 auto inside a declared bound {action_type × object_set × risk_band}",
