@@ -1,4 +1,4 @@
-use onto::{dispatch, Actor, Engine, KeyKind, Query, Session, Verdict};
+use onto::{dispatch, Actor, Engine, KeyKind, Query, Session, Verdict, WritePathStep};
 use onto_bootstrap::install;
 use serde_json::json;
 
@@ -373,4 +373,205 @@ fn consumer_cannot_read_working_branch_schema() {
 #[test]
 fn builder_and_consumer_keys_are_distinct() {
     assert_ne!(KeyKind::Builder, KeyKind::Consumer);
+}
+
+#[test]
+fn write_path_seven_steps_in_order() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    let proposed = engine
+        .submit_action(
+            &operator(),
+            "propose_setpoint_change",
+            json!({
+                "tank": ids.tank1,
+                "sensor": ids.sensor1,
+                "permit": ids.permit,
+                "target_do": 2.5,
+                "rationale": "seven steps"
+            }),
+        )
+        .unwrap();
+    assert_eq!(proposed.verdict, Verdict::Allow);
+    let rec = engine
+        .get_decision_record(
+            &operator(),
+            proposed.decision_record_id.as_deref().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        rec.proof_trace,
+        vec![
+            WritePathStep::Submit,
+            WritePathStep::ParamAndPermission,
+            WritePathStep::SubmissionCriteria,
+            WritePathStep::StagedEdits,
+            WritePathStep::Commit,
+            WritePathStep::SealDecisionRecord,
+            WritePathStep::DeclareSideEffects,
+        ]
+    );
+    assert_eq!(rec.proof_trace, WritePathStep::ALL.to_vec());
+}
+
+#[test]
+fn guard_fail_at_step_three_discards_stage() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    let tank_before = engine.get_object(&operator(), &ids.tank1).unwrap();
+    let objects_before = engine
+        .search_objects(
+            &operator(),
+            Query {
+                type_name: Some("AerationTank".into()),
+                ..Query::default()
+            },
+        )
+        .unwrap();
+    let over = engine
+        .submit_action(
+            &operator(),
+            "propose_setpoint_change",
+            json!({
+                "tank": ids.tank1,
+                "sensor": ids.sensor1,
+                "permit": ids.permit,
+                "target_do": 9.0,
+                "rationale": "exceeds permit"
+            }),
+        )
+        .unwrap();
+    assert_eq!(over.verdict, Verdict::Deny);
+    assert!(over.inbox_id.is_none());
+    assert!(over.created_ids.is_empty());
+    assert!(engine.list_inbox(&operator()).unwrap().is_empty());
+    let tank_after = engine.get_object(&operator(), &ids.tank1).unwrap();
+    assert_eq!(
+        serde_json::to_value(&tank_before.properties).unwrap(),
+        serde_json::to_value(&tank_after.properties).unwrap()
+    );
+    let objects_after = engine
+        .search_objects(
+            &operator(),
+            Query {
+                type_name: Some("AerationTank".into()),
+                ..Query::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(objects_before.len(), objects_after.len());
+    let rec = engine
+        .get_decision_record(&operator(), over.decision_record_id.as_deref().unwrap())
+        .unwrap();
+    assert_eq!(
+        rec.proof_trace,
+        vec![
+            WritePathStep::Submit,
+            WritePathStep::ParamAndPermission,
+            WritePathStep::SubmissionCriteria,
+            WritePathStep::SealDecisionRecord,
+        ]
+    );
+}
+
+#[test]
+fn decision_snapshot_pins_reads_and_versions() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    let proposed = engine
+        .submit_action(
+            &operator(),
+            "propose_setpoint_change",
+            json!({
+                "tank": ids.tank1,
+                "sensor": ids.sensor1,
+                "permit": ids.permit,
+                "target_do": 2.3,
+                "rationale": "snapshot"
+            }),
+        )
+        .unwrap();
+    let rec = engine
+        .get_decision_record(
+            &operator(),
+            proposed.decision_record_id.as_deref().unwrap(),
+        )
+        .unwrap();
+    let objects = rec.data_snapshot["objects"]
+        .as_array()
+        .expect("snapshot objects");
+    let by_id = |want: &str| {
+        objects
+            .iter()
+            .find(|o| o["id"] == want)
+            .unwrap_or_else(|| panic!("missing {want} in snapshot"))
+    };
+    let tank = by_id(&ids.tank1);
+    assert_eq!(tank["type_name"], "AerationTank");
+    assert_eq!(tank["properties"]["name"], "Basin 1");
+    let sensor = by_id(&ids.sensor1);
+    assert_eq!(sensor["type_name"], "DO_Sensor");
+    assert!(sensor["properties"].get("last_reading_at").is_some());
+    let permit = by_id(&ids.permit);
+    assert_eq!(permit["properties"]["do_max"], 4.0);
+    assert_eq!(rec.data_snapshot["engine_version"], onto::ENGINE_VERSION);
+    assert_eq!(
+        rec.data_snapshot["function_version"],
+        onto::FUNCTION_VERSION
+    );
+    let rule = rec.data_snapshot["rule_version"]
+        .as_str()
+        .expect("rule_version");
+    assert!(
+        rule.starts_with("propose_setpoint_change:"),
+        "rule_version pins the action spec, got {rule}"
+    );
+    assert_eq!(rec.engine_version, onto::ENGINE_VERSION);
+    assert_eq!(rec.function_version, onto::FUNCTION_VERSION);
+}
+
+#[test]
+fn idempotent_side_effect_key_does_not_double_apply() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    let params = json!({
+        "tank": ids.tank1,
+        "sensor": ids.sensor1,
+        "permit": ids.permit,
+        "target_do": 2.6,
+        "rationale": "idempotent",
+        "idempotency_key": "setpoint:tank-1:2.6"
+    });
+    let first = engine
+        .submit_action(&supervisor(), "approve_setpoint_change", params.clone())
+        .unwrap();
+    assert_eq!(first.verdict, Verdict::Allow);
+    let second = engine
+        .submit_action(&supervisor(), "approve_setpoint_change", params)
+        .unwrap();
+    assert_eq!(first.decision_record_id, second.decision_record_id);
+    assert_eq!(first.created_ids, second.created_ids);
+    let tank = engine.get_object(&operator(), &ids.tank1).unwrap();
+    assert_eq!(tank.properties["target_do"].value, json!(2.6));
+    let approvals = engine
+        .search_objects(
+            &operator(),
+            Query {
+                type_name: Some("ApprovalRecord".into()),
+                ..Query::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(approvals.len(), 1);
+    let rec = engine
+        .get_decision_record(
+            &operator(),
+            first.decision_record_id.as_deref().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        rec.effects["idempotency_key"],
+        "setpoint:tank-1:2.6"
+    );
+    assert_eq!(rec.proof_trace, WritePathStep::ALL.to_vec());
 }

@@ -7,6 +7,7 @@ mod engine;
 mod error;
 mod surface;
 mod types;
+mod write_path;
 
 pub use engine::Engine;
 pub use error::{OntoError, Result};

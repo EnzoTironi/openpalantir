@@ -10,7 +10,8 @@ Inspirado em Zhang, *Operational Ontology: From Business Mirror to Decision Runt
 - Só o meta-modelo é compilado: `ObjectType`, `PropertyType`, `ValueType`, `LinkType`, `InterfaceType`, `ActionType`, `Policy`, `OntologyBranch`, `OntologyProposal`.
 - **Chave consumer:** consultar o mundo e executar Actions pré-definidas. Não edita schema.
 - **Chave builder:** edita schema num branch. Não lê nem escreve instâncias de produção.
-- Toda escrita de negócio passa por Action (7 passos). Funnel não sobrescreve propriedade `ActionWritten`.
+- Toda escrita de negócio passa por Action no write path de 7 passos (`WritePathStep`): submit → param+permission → submission criteria → staged edits (all-or-discard) → commit atômico → selar `DecisionRecord` → declarar side effects com chave de idempotência. Funnel não sobrescreve propriedade `ActionWritten`.
+- `DecisionRecord.data_snapshot` pina os objetos lidos nos guards, mais `rule_version`, `function_version` e `engine_version`.
 - Inbox é objeto, não tela. Confirmar/vetar é Action.
 
 ## Crates
@@ -23,7 +24,7 @@ Inspirado em Zhang, *Operational Ontology: From Business Mirror to Decision Runt
 ## Rodar
 
 ```bash
-cargo test
+cargo test --workspace -- --test-threads=1
 ```
 
 MCP consumer (stdio):

@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub const ENGINE_VERSION: &str = "0.1.0";
+pub const FUNCTION_VERSION: &str = "days_since_calibration:0.1";
 pub const MAIN_BRANCH: &str = "main";
 
 pub const KERNEL_TYPES: &[&str] = &[
@@ -56,6 +57,47 @@ pub enum ExecutionMode {
     Propose,
     Approve,
     Shadow,
+}
+
+/// Ordered Action write-path steps (Zhang 2026, Ch. 3.4 / Ch. 9).
+///
+/// The executor is a typestate machine over this enum. A legal run visits
+/// each variant in order. There is no public constructor that starts mid-path
+/// and no method that jumps a successor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WritePathStep {
+    Submit,
+    ParamAndPermission,
+    SubmissionCriteria,
+    StagedEdits,
+    Commit,
+    SealDecisionRecord,
+    DeclareSideEffects,
+}
+
+impl WritePathStep {
+    pub const ALL: [WritePathStep; 7] = [
+        Self::Submit,
+        Self::ParamAndPermission,
+        Self::SubmissionCriteria,
+        Self::StagedEdits,
+        Self::Commit,
+        Self::SealDecisionRecord,
+        Self::DeclareSideEffects,
+    ];
+
+    pub fn successor(self) -> Option<Self> {
+        match self {
+            Self::Submit => Some(Self::ParamAndPermission),
+            Self::ParamAndPermission => Some(Self::SubmissionCriteria),
+            Self::SubmissionCriteria => Some(Self::StagedEdits),
+            Self::StagedEdits => Some(Self::Commit),
+            Self::Commit => Some(Self::SealDecisionRecord),
+            Self::SealDecisionRecord => Some(Self::DeclareSideEffects),
+            Self::DeclareSideEffects => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,7 +288,26 @@ pub struct DecisionRecordView {
     pub function_version: String,
     pub engine_version: String,
     pub data_snapshot: Value,
+    #[serde(default)]
+    pub proof_trace: Vec<WritePathStep>,
     pub created_at: String,
+}
+
+/// Object identity and property values pinned when an Action read the store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotObject {
+    pub id: String,
+    pub type_name: String,
+    pub properties: BTreeMap<String, Value>,
+}
+
+/// Pins the objects actually read plus the three versions that produced the verdict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataSnapshot {
+    pub objects: Vec<SnapshotObject>,
+    pub rule_version: String,
+    pub function_version: String,
+    pub engine_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

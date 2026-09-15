@@ -1,5 +1,8 @@
 use crate::error::{OntoError, Result};
 use crate::types::*;
+use crate::write_path::{
+    pin_version, resolve_idempotency_key, StagedOp, WritePath,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -123,6 +126,14 @@ impl Engine {
                 function_version TEXT NOT NULL,
                 engine_version TEXT NOT NULL,
                 data_snapshot TEXT NOT NULL,
+                proof_trace TEXT NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS side_effect_keys (
+                idempotency_key TEXT PRIMARY KEY,
+                decision_record_id TEXT NOT NULL,
+                action_name TEXT NOT NULL,
+                outcome TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS audit_log (
@@ -134,6 +145,10 @@ impl Engine {
             );
             "#,
         )?;
+        let _ = db.execute(
+            "ALTER TABLE decision_records ADD COLUMN proof_trace TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
         db.execute(
             "INSERT OR IGNORE INTO branches(name, status, created_by, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![MAIN_BRANCH, "merged", "kernel", 0],
@@ -1010,13 +1025,6 @@ impl Engine {
             }
         };
         let outcome = self.execute_action(session, &spec, params, Some(inbox_id))?;
-        if outcome.verdict == Verdict::Allow {
-            let db = self.db.lock().expect("db");
-            db.execute(
-                "UPDATE inbox SET status = 'confirmed' WHERE id = ?1",
-                params![inbox_id],
-            )?;
-        }
         Ok(outcome)
     }
 
@@ -1057,18 +1065,25 @@ impl Engine {
         if let Some(spec) = override_spec {
             return self.execute_action(session, &spec, params, Some(inbox_id));
         }
-        let rec = self.seal_decision(
+        let rec = self.persist_decision(
             session,
             "override_setpoint",
             Some(&session.actor.id),
             Verdict::Allow,
-            params.clone(),
-            vec![GuardResult {
+            &params,
+            &[GuardResult {
                 name: "override".into(),
                 verdict: Verdict::Allow,
                 reason: format!("{category}: {reason}"),
             }],
             json!({ "inbox": inbox_id }),
+            &DataSnapshot {
+                objects: vec![],
+                rule_version: "override_setpoint".into(),
+                function_version: FUNCTION_VERSION.into(),
+                engine_version: ENGINE_VERSION.into(),
+            },
+            &[WritePathStep::Submit, WritePathStep::SealDecisionRecord],
         )?;
         Ok(ActionOutcome {
             verdict: Verdict::Allow,
@@ -1085,7 +1100,7 @@ impl Engine {
         Self::require_consumer(session)?;
         let db = self.db.lock().expect("db");
         db.query_row(
-            "SELECT id, action_name, actor, confirmer, verdict, params, guard_results, effects, rule_version, function_version, engine_version, data_snapshot, created_at
+            "SELECT id, action_name, actor, confirmer, verdict, params, guard_results, effects, rule_version, function_version, engine_version, data_snapshot, created_at, COALESCE(proof_trace, '[]')
              FROM decision_records WHERE id = ?1",
             params![id],
             |r| {
@@ -1110,6 +1125,8 @@ impl Engine {
                     engine_version: r.get(10)?,
                     data_snapshot: serde_json::from_str(&r.get::<_, String>(11)?).unwrap_or(Value::Null),
                     created_at: r.get::<_, i64>(12)?.to_string(),
+                    proof_trace: serde_json::from_str(&r.get::<_, String>(13).unwrap_or_else(|_| "[]".into()))
+                        .unwrap_or_default(),
                 })
             },
         )
@@ -1136,171 +1153,246 @@ impl Engine {
         params: Value,
         confirmer_inbox: Option<&str>,
     ) -> Result<ActionOutcome> {
-        if session.actor.tier < spec.required_tier {
-            return self.deny(
-                session,
-                spec,
-                params,
-                "authorization",
-                format!("tier {} required, actor is {}", spec.required_tier, session.actor.tier),
-            );
+        let key = resolve_idempotency_key(&spec.name, &session.actor.id, &params);
+        if let Some(cached) = self.load_cached_outcome(&key)? {
+            return Ok(cached);
         }
-        for role in &spec.required_roles {
-            if !session.actor.has_role(role) {
-                return self.deny(
-                    session,
-                    spec,
-                    params,
-                    "authorization",
-                    format!("role {role} required"),
-                );
-            }
-        }
-        self.validate_params(spec, &params)?;
-        let guard_results = self.evaluate_guards(&spec.guards, &params)?;
-        let worst = worst_verdict(&guard_results);
-        match worst {
-            Verdict::Deny => {
-                let reason = guard_results
-                    .iter()
-                    .find(|g| g.verdict == Verdict::Deny)
-                    .map(|g| g.reason.clone())
-                    .unwrap_or_else(|| "denied".into());
-                let rec = self.seal_decision(
-                    session,
-                    &spec.name,
-                    confirmer_inbox.map(|_| session.actor.id.as_str()),
+
+        let path = WritePath::begin(key.clone());
+        match self.check_param_and_permission(session, spec, &params) {
+            Err(e) => Err(e),
+            Ok(Err(auth)) => {
+                let path = path.param_and_permission(Vec::new()).abort_seal(
+                    vec![GuardResult {
+                        name: auth.name,
+                        verdict: Verdict::Deny,
+                        reason: auth.reason.clone(),
+                    }],
                     Verdict::Deny,
-                    params,
-                    guard_results.clone(),
-                    json!({}),
-                )?;
-                Ok(ActionOutcome {
-                    verdict: Verdict::Deny,
-                    reason,
-                    decision_record_id: Some(rec),
-                    inbox_id: None,
-                    created_ids: vec![],
-                    alternative: spec.on_review.clone(),
-                    guard_results,
-                })
+                );
+                self.finish_abort(session, spec, &params, path, auth.reason, None)
             }
-            Verdict::Review => {
-                let reason = guard_results
-                    .iter()
-                    .find(|g| g.verdict == Verdict::Review)
-                    .map(|g| g.reason.clone())
-                    .unwrap_or_else(|| "needs review".into());
-                let rec = self.seal_decision(
-                    session,
-                    &spec.name,
-                    None,
-                    Verdict::Review,
-                    params.clone(),
-                    guard_results.clone(),
-                    json!({ "alternative": spec.on_review }),
-                )?;
-                Ok(ActionOutcome {
-                    verdict: Verdict::Review,
-                    reason,
-                    decision_record_id: Some(rec),
-                    inbox_id: None,
-                    created_ids: vec![],
-                    alternative: spec.on_review.clone(),
-                    guard_results,
-                })
+            Ok(Ok(param_reads)) => {
+                let path = path.param_and_permission(param_reads);
+                let (guards, guard_reads) = self.evaluate_guards(&spec.guards, &params)?;
+                let worst = worst_verdict(&guards);
+                let path = path.submission_criteria(guards, guard_reads, worst);
+                match worst {
+                    Verdict::Deny | Verdict::Review => {
+                        let reason = path
+                            .guards
+                            .iter()
+                            .find(|g| g.verdict == worst)
+                            .map(|g| g.reason.clone())
+                            .unwrap_or_else(|| match worst {
+                                Verdict::Deny => "denied".into(),
+                                Verdict::Review => "needs review".into(),
+                                Verdict::Allow => unreachable!("matched deny/review"),
+                            });
+                        let alternative = spec.on_review.clone();
+                        let path = path.discard_stage();
+                        self.finish_abort(session, spec, &params, path, reason, alternative)
+                    }
+                    Verdict::Allow => self.finish_allow(session, spec, params, confirmer_inbox, path),
+                }
             }
-            Verdict::Allow => match spec.mode {
-                ExecutionMode::Propose | ExecutionMode::Shadow => {
-                    let inbox_id = new_id();
-                    let db = self.db.lock().expect("db");
-                    db.execute(
-                        "INSERT INTO inbox(id, action_name, proposed_by, params, status, created_at)
-                         VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
-                        params![
-                            inbox_id,
-                            spec.name,
-                            session.actor.id,
-                            params.to_string(),
-                            self.now()
-                        ],
-                    )?;
-                    drop(db);
-                    let rec = self.seal_decision(
-                        session,
-                        &spec.name,
-                        None,
-                        Verdict::Allow,
-                        params,
-                        guard_results.clone(),
-                        json!({ "inbox": inbox_id, "mode": spec.mode }),
-                    )?;
-                    Ok(ActionOutcome {
-                        verdict: Verdict::Allow,
-                        reason: "proposed".into(),
-                        decision_record_id: Some(rec),
-                        inbox_id: Some(inbox_id),
-                        created_ids: vec![],
-                        alternative: None,
-                        guard_results,
-                    })
-                }
-                ExecutionMode::Auto | ExecutionMode::Approve => {
-                    let created = self.apply_effects(&spec.effects, &params, &session.actor.id)?;
-                    let rec = self.seal_decision(
-                        session,
-                        &spec.name,
-                        Some(&session.actor.id),
-                        Verdict::Allow,
-                        params,
-                        guard_results.clone(),
-                        json!({ "created": created, "side_effects": spec.side_effects }),
-                    )?;
-                    Ok(ActionOutcome {
-                        verdict: Verdict::Allow,
-                        reason: "committed".into(),
-                        decision_record_id: Some(rec),
-                        inbox_id: confirmer_inbox.map(|s| s.to_string()),
-                        created_ids: created,
-                        alternative: None,
-                        guard_results,
-                    })
-                }
-            },
         }
     }
 
-    fn deny(
+    fn check_param_and_permission(
+        &self,
+        session: &Session,
+        spec: &ActionTypeSpec,
+        params: &Value,
+    ) -> Result<std::result::Result<Vec<SnapshotObject>, AuthFail>> {
+        if session.actor.tier < spec.required_tier {
+            return Ok(Err(AuthFail {
+                name: "authorization".into(),
+                reason: format!(
+                    "tier {} required, actor is {}",
+                    spec.required_tier, session.actor.tier
+                ),
+            }));
+        }
+        for role in &spec.required_roles {
+            if !session.actor.has_role(role) {
+                return Ok(Err(AuthFail {
+                    name: "authorization".into(),
+                    reason: format!("role {role} required"),
+                }));
+            }
+        }
+        self.validate_params(spec, params)?;
+        let mut reads = Vec::new();
+        for p in &spec.parameters {
+            if p.object_type.is_some() {
+                if let Some(id) = params.get(&p.name).and_then(|v| v.as_str()) {
+                    reads.push(self.snapshot_object(id)?);
+                }
+            }
+        }
+        Ok(Ok(reads))
+    }
+
+    fn finish_abort(
+        &self,
+        session: &Session,
+        spec: &ActionTypeSpec,
+        params: &Value,
+        path: WritePath<crate::write_path::SealDecisionRecord>,
+        reason: String,
+        alternative: Option<String>,
+    ) -> Result<ActionOutcome> {
+        let snapshot = path.data_snapshot(
+            rule_version(spec),
+            FUNCTION_VERSION.into(),
+            ENGINE_VERSION.into(),
+        );
+        let confirmer = match path.verdict {
+            Verdict::Deny => None,
+            Verdict::Review => None,
+            Verdict::Allow => None,
+        };
+        let effects = match path.verdict {
+            Verdict::Review => json!({ "alternative": spec.on_review }),
+            Verdict::Deny | Verdict::Allow => json!({}),
+        };
+        let rec = self.persist_decision(
+            session,
+            &spec.name,
+            confirmer,
+            path.verdict,
+            params,
+            &path.guards,
+            effects,
+            &snapshot,
+            &path.trace,
+        )?;
+        let outcome = ActionOutcome {
+            verdict: path.verdict,
+            reason,
+            decision_record_id: Some(rec.clone()),
+            inbox_id: None,
+            created_ids: vec![],
+            alternative,
+            guard_results: path.guards.clone(),
+        };
+        self.store_idempotency(&path.idempotency_key, &spec.name, &rec, &outcome)?;
+        Ok(outcome)
+    }
+
+    fn finish_allow(
         &self,
         session: &Session,
         spec: &ActionTypeSpec,
         params: Value,
-        name: &str,
-        reason: String,
+        confirmer_inbox: Option<&str>,
+        path: WritePath<crate::write_path::SubmissionCriteria>,
     ) -> Result<ActionOutcome> {
-        let guards = vec![GuardResult {
-            name: name.into(),
-            verdict: Verdict::Deny,
-            reason: reason.clone(),
-        }];
-        let rec = self.seal_decision(
+        let (staged, inbox_id) = self.build_stage(session, spec, &params, confirmer_inbox)?;
+        let path = path.stage(staged);
+        let created = self.commit_staged(&path.staged)?;
+        let path = path.commit(created.clone());
+        let path = path.seal();
+
+        let declaration = json!({
+            "idempotency_key": path.idempotency_key,
+            "declared": spec.side_effects,
+        });
+        let path = path.declare(declaration.clone());
+
+        let snapshot = path.data_snapshot(
+            rule_version(spec),
+            FUNCTION_VERSION.into(),
+            ENGINE_VERSION.into(),
+        );
+        let confirmer = match spec.mode {
+            ExecutionMode::Auto | ExecutionMode::Approve => Some(session.actor.id.as_str()),
+            ExecutionMode::Propose | ExecutionMode::Shadow => None,
+        };
+        let mut effects = json!({
+            "created": created,
+            "side_effects": spec.side_effects,
+            "idempotency_key": path.idempotency_key,
+        });
+        if let Some(iid) = &inbox_id {
+            effects["inbox"] = json!(iid);
+            effects["mode"] = json!(spec.mode);
+        }
+        let rec = self.persist_decision(
             session,
             &spec.name,
-            None,
-            Verdict::Deny,
-            params,
-            guards.clone(),
-            json!({}),
+            confirmer,
+            Verdict::Allow,
+            &params,
+            &path.guards,
+            effects,
+            &snapshot,
+            &path.trace,
         )?;
-        Ok(ActionOutcome {
-            verdict: Verdict::Deny,
-            reason,
-            decision_record_id: Some(rec),
-            inbox_id: None,
-            created_ids: vec![],
+        let reason = match spec.mode {
+            ExecutionMode::Propose | ExecutionMode::Shadow => "proposed",
+            ExecutionMode::Auto | ExecutionMode::Approve => "committed",
+        };
+        let outcome = ActionOutcome {
+            verdict: Verdict::Allow,
+            reason: reason.into(),
+            decision_record_id: Some(rec.clone()),
+            inbox_id,
+            created_ids: created,
             alternative: None,
-            guard_results: guards,
-        })
+            guard_results: path.guards.clone(),
+        };
+        self.store_idempotency(&path.idempotency_key, &spec.name, &rec, &outcome)?;
+        self.audit(
+            &session.actor.id,
+            "side_effect",
+            json!({
+                "idempotency_key": path.idempotency_key,
+                "action": spec.name,
+                "declaration": spec.side_effects,
+                "decision_record_id": rec,
+            }),
+        )?;
+        let _finished: WritePath<crate::write_path::DeclareSideEffects> = path;
+        Ok(outcome)
+    }
+
+    fn build_stage(
+        &self,
+        session: &Session,
+        spec: &ActionTypeSpec,
+        params: &Value,
+        confirmer_inbox: Option<&str>,
+    ) -> Result<(Vec<StagedOp>, Option<String>)> {
+        match spec.mode {
+            ExecutionMode::Propose | ExecutionMode::Shadow => {
+                let inbox_id = new_id();
+                Ok((
+                    vec![StagedOp::InsertInbox {
+                        id: inbox_id.clone(),
+                        action_name: spec.name.clone(),
+                        proposed_by: session.actor.id.clone(),
+                        params: params.to_string(),
+                        created_at: self.now(),
+                    }],
+                    Some(inbox_id),
+                ))
+            }
+            ExecutionMode::Auto | ExecutionMode::Approve => {
+                let mut ops = self.stage_effects(&spec.effects, params, &session.actor.id)?;
+                let inbox_id = confirmer_inbox.map(|s| s.to_string());
+                if let Some(id) = &inbox_id {
+                    ops.push(StagedOp::ConfirmInbox { id: id.clone() });
+                }
+                Ok((ops, inbox_id))
+            }
+        }
+    }
+
+    fn snapshot_object(&self, id: &str) -> Result<SnapshotObject> {
+        let view = self.load_object_view(id)?;
+        Ok(snapshot_from_view(&view))
     }
 
     fn validate_params(&self, spec: &ActionTypeSpec, params: &Value) -> Result<()> {
@@ -1347,32 +1439,45 @@ impl Engine {
         Ok(())
     }
 
-    fn evaluate_guards(&self, guards: &Value, params: &Value) -> Result<Vec<GuardResult>> {
+    fn evaluate_guards(
+        &self,
+        guards: &Value,
+        params: &Value,
+    ) -> Result<(Vec<GuardResult>, Vec<SnapshotObject>)> {
+        let mut reads = Vec::new();
         if guards.is_null() || guards == &json!({}) {
-            return Ok(vec![GuardResult {
-                name: "empty".into(),
-                verdict: Verdict::Allow,
-                reason: "no guards".into(),
-            }]);
+            return Ok((
+                vec![GuardResult {
+                    name: "empty".into(),
+                    verdict: Verdict::Allow,
+                    reason: "no guards".into(),
+                }],
+                reads,
+            ));
         }
         let Some(arr) = guards.as_array() else {
-            return Ok(vec![self.eval_one_guard(guards, params)?]);
+            return Ok((vec![self.eval_one_guard(guards, params, &mut reads)?], reads));
         };
         let mut out = Vec::new();
         for g in arr {
-            out.push(self.eval_one_guard(g, params)?);
+            out.push(self.eval_one_guard(g, params, &mut reads)?);
         }
-        Ok(out)
+        Ok((out, reads))
     }
 
-    fn eval_one_guard(&self, guard: &Value, params: &Value) -> Result<GuardResult> {
+    fn eval_one_guard(
+        &self,
+        guard: &Value,
+        params: &Value,
+        reads: &mut Vec<SnapshotObject>,
+    ) -> Result<GuardResult> {
         let obj = guard
             .as_object()
             .ok_or_else(|| OntoError::Invalid("guard must be object".into()))?;
         if let Some(name) = obj.get("freshness").and_then(|v| v.as_str()) {
             let max = obj.get("max_age_secs").and_then(|v| v.as_i64()).unwrap_or(300);
             let id = param_str(params, name)?;
-            let view = self.load_object_view(&id)?;
+            let view = self.read_for_guard(&id, reads)?;
             let as_of = view
                 .properties
                 .get("last_reading_at")
@@ -1411,7 +1516,7 @@ impl Engine {
                 .ok_or_else(|| OntoError::Invalid("exists_field needs object".into()))?;
             let field = field.as_str().unwrap_or("");
             let id = param_str(params, object_param)?;
-            let view = self.load_object_view(&id)?;
+            let view = self.read_for_guard(&id, reads)?;
             if view.properties.get(field).is_none() {
                 return Ok(GuardResult {
                     name: "complete".into(),
@@ -1430,7 +1535,7 @@ impl Engine {
             let field = obj.get("field").and_then(|v| v.as_str()).unwrap_or("do_max");
             let n = param_f64(params, param)?;
             let permit_id = param_str(params, object_param)?;
-            let view = self.load_object_view(&permit_id)?;
+            let view = self.read_for_guard(&permit_id, reads)?;
             let bound = view
                 .properties
                 .get(field)
@@ -1468,7 +1573,7 @@ impl Engine {
         if let Some(days) = obj.get("max_days_since_calibration").and_then(|v| v.as_i64()) {
             let object_param = obj.get("object").and_then(|v| v.as_str()).unwrap_or("sensor");
             let id = param_str(params, object_param)?;
-            let view = self.load_object_view(&id)?;
+            let view = self.read_for_guard(&id, reads)?;
             let cal = view
                 .properties
                 .get("calibration_date")
@@ -1495,15 +1600,22 @@ impl Engine {
         })
     }
 
-    fn apply_effects(
+    fn read_for_guard(&self, id: &str, reads: &mut Vec<SnapshotObject>) -> Result<ObjectView> {
+        let view = self.load_object_view(id)?;
+        reads.push(snapshot_from_view(&view));
+        Ok(view)
+    }
+
+    fn stage_effects(
         &self,
         effects: &Value,
         params: &Value,
         actor: &str,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<StagedOp>> {
+        let mut staged = Vec::new();
         let mut created = Vec::new();
         let Some(arr) = effects.as_array() else {
-            return Ok(created);
+            return Ok(staged);
         };
         for effect in arr {
             let obj = effect
@@ -1530,11 +1642,13 @@ impl Engine {
                     .get("title")
                     .or_else(|| props.get("name"))
                     .and_then(|p| p.value.as_str().map(|s| s.to_string()));
-                let db = self.db.lock().expect("db");
-                db.execute(
-                    "INSERT INTO objects(id, type_name, title, properties, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![id, type_name, title, serde_json::to_string(&props)?, self.now()],
-                )?;
+                staged.push(StagedOp::InsertObject {
+                    id: id.clone(),
+                    type_name: type_name.into(),
+                    title,
+                    properties: serde_json::to_string(&props)?,
+                    created_at: self.now(),
+                });
                 created.push(id);
             }
             if let Some(target_param) = obj.get("update").and_then(|v| v.as_str()) {
@@ -1562,14 +1676,16 @@ impl Engine {
                         );
                     }
                 }
-                let db = self.db.lock().expect("db");
-                db.execute(
-                    "UPDATE objects SET properties = ?1 WHERE id = ?2",
-                    params![serde_json::to_string(&view_props)?, id],
-                )?;
+                staged.push(StagedOp::UpdateObject {
+                    id,
+                    properties: serde_json::to_string(&view_props)?,
+                });
             }
             if let Some(link) = obj.get("link").and_then(|v| v.as_str()) {
-                let from = param_str(params, obj.get("from").and_then(|v| v.as_str()).unwrap_or("from"))?;
+                let from = param_str(
+                    params,
+                    obj.get("from").and_then(|v| v.as_str()).unwrap_or("from"),
+                )?;
                 let to = if let Some(to_param) = obj.get("to").and_then(|v| v.as_str()) {
                     param_str(params, to_param)?
                 } else if let Some(last) = created.last() {
@@ -1577,26 +1693,89 @@ impl Engine {
                 } else {
                     return Err(OntoError::Invalid("link effect needs to".into()));
                 };
-                let lid = new_id();
-                let db = self.db.lock().expect("db");
-                db.execute(
-                    "INSERT INTO links(id, type_name, from_id, to_id) VALUES (?1, ?2, ?3, ?4)",
-                    params![lid, link, from, to],
-                )?;
+                staged.push(StagedOp::InsertLink {
+                    id: new_id(),
+                    type_name: link.into(),
+                    from_id: from,
+                    to_id: to,
+                });
             }
         }
+        Ok(staged)
+    }
+
+    fn commit_staged(&self, ops: &[StagedOp]) -> Result<Vec<String>> {
+        let mut db = self.db.lock().expect("db");
+        let tx = db.transaction()?;
+        let mut created = Vec::new();
+        for op in ops {
+            match op {
+                StagedOp::InsertObject {
+                    id,
+                    type_name,
+                    title,
+                    properties,
+                    created_at,
+                } => {
+                    tx.execute(
+                        "INSERT INTO objects(id, type_name, title, properties, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![id, type_name, title, properties, created_at],
+                    )?;
+                    created.push(id.clone());
+                }
+                StagedOp::UpdateObject { id, properties } => {
+                    tx.execute(
+                        "UPDATE objects SET properties = ?1 WHERE id = ?2",
+                        params![properties, id],
+                    )?;
+                }
+                StagedOp::InsertLink {
+                    id,
+                    type_name,
+                    from_id,
+                    to_id,
+                } => {
+                    tx.execute(
+                        "INSERT INTO links(id, type_name, from_id, to_id) VALUES (?1, ?2, ?3, ?4)",
+                        params![id, type_name, from_id, to_id],
+                    )?;
+                }
+                StagedOp::InsertInbox {
+                    id,
+                    action_name,
+                    proposed_by,
+                    params: inbox_params,
+                    created_at,
+                } => {
+                    tx.execute(
+                        "INSERT INTO inbox(id, action_name, proposed_by, params, status, created_at)
+                         VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+                        params![id, action_name, proposed_by, inbox_params, created_at],
+                    )?;
+                }
+                StagedOp::ConfirmInbox { id } => {
+                    tx.execute(
+                        "UPDATE inbox SET status = 'confirmed' WHERE id = ?1",
+                        params![id],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
         Ok(created)
     }
 
-    fn seal_decision(
+    fn persist_decision(
         &self,
         session: &Session,
         action: &str,
         confirmer: Option<&str>,
         verdict: Verdict,
-        params: Value,
-        guards: Vec<GuardResult>,
+        params: &Value,
+        guards: &[GuardResult],
         effects: Value,
+        snapshot: &DataSnapshot,
+        trace: &[WritePathStep],
     ) -> Result<String> {
         let id = new_id();
         let verdict_s = match verdict {
@@ -1604,22 +1783,12 @@ impl Engine {
             Verdict::Review => "review",
             Verdict::Deny => "deny",
         };
-        let snapshot = json!({
-            "actor": session.actor.id,
-            "purpose": session.purpose,
-            "clock": self.now()
-        });
-        let rule_version = self
-            .load_action_type(MAIN_BRANCH, action)
-            .ok()
-            .map(|a| a.name)
-            .unwrap_or_else(|| action.to_string());
         let db = self.db.lock().expect("db");
         db.execute(
             "INSERT INTO decision_records(
                 id, action_name, actor, confirmer, verdict, params, guard_results, effects,
-                rule_version, function_version, engine_version, data_snapshot, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rule_version, function_version, engine_version, data_snapshot, proof_trace, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 id,
                 action,
@@ -1627,17 +1796,76 @@ impl Engine {
                 confirmer,
                 verdict_s,
                 params.to_string(),
-                serde_json::to_string(&guards)?,
+                serde_json::to_string(guards)?,
                 effects.to_string(),
-                rule_version,
-                "fn-0.1",
-                ENGINE_VERSION,
-                snapshot.to_string(),
+                snapshot.rule_version,
+                snapshot.function_version,
+                snapshot.engine_version,
+                serde_json::to_string(snapshot)?,
+                serde_json::to_string(trace)?,
                 self.now()
             ],
         )?;
         Ok(id)
     }
+
+    fn store_idempotency(
+        &self,
+        key: &str,
+        action: &str,
+        rec_id: &str,
+        outcome: &ActionOutcome,
+    ) -> Result<()> {
+        let db = self.db.lock().expect("db");
+        db.execute(
+            "INSERT OR IGNORE INTO side_effect_keys(idempotency_key, decision_record_id, action_name, outcome, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                key,
+                rec_id,
+                action,
+                serde_json::to_string(outcome)?,
+                self.now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn load_cached_outcome(&self, key: &str) -> Result<Option<ActionOutcome>> {
+        let db = self.db.lock().expect("db");
+        let raw: Option<String> = db
+            .query_row(
+                "SELECT outcome FROM side_effect_keys WHERE idempotency_key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw.map(|s| serde_json::from_str(&s)).transpose()?)
+    }
+}
+
+struct AuthFail {
+    name: String,
+    reason: String,
+}
+
+fn snapshot_from_view(view: &ObjectView) -> SnapshotObject {
+    SnapshotObject {
+        id: view.id.clone(),
+        type_name: view.type_name.clone(),
+        properties: view
+            .properties
+            .iter()
+            .map(|(k, p)| (k.clone(), p.value.clone()))
+            .collect(),
+    }
+}
+
+fn rule_version(spec: &ActionTypeSpec) -> String {
+    pin_version(
+        &spec.name,
+        &serde_json::to_string(spec).unwrap_or_default(),
+    )
 }
 
 fn param_str(params: &Value, name: &str) -> Result<String> {
