@@ -256,7 +256,9 @@ pub fn define_healthcare(engine: &Engine, s: &Session, branch: &str) -> Result<(
                 { "freshness": "observation", "max_age_secs": 300 },
                 { "exists_field": "last_reading_at", "object": "observation" },
                 { "gt_field": 0, "object": "observation", "field": "coded_clearance" },
-                { "lte_field": "need_clearance", "object": "observation", "field": "coded_clearance" }
+                { "lte_field": "need_clearance", "object": "observation", "field": "coded_clearance" },
+                { "linked": "observation_of", "from": "observation", "to": "patient" },
+                { "linked": "order_for", "from": "order", "to": "patient" }
             ]),
             required_roles: vec!["operator".into()],
             required_tier: AgentTier::T2,
@@ -280,7 +282,9 @@ pub fn define_healthcare(engine: &Engine, s: &Session, branch: &str) -> Result<(
                 { "freshness": "observation", "max_age_secs": 300 },
                 { "exists_field": "last_reading_at", "object": "observation" },
                 { "gt_field": 0, "object": "observation", "field": "coded_clearance" },
-                { "lte_field": "need_clearance", "object": "observation", "field": "coded_clearance" }
+                { "lte_field": "need_clearance", "object": "observation", "field": "coded_clearance" },
+                { "linked": "observation_of", "from": "observation", "to": "patient" },
+                { "linked": "order_for", "from": "order", "to": "patient" }
             ]),
             required_roles: vec!["supervisor".into()],
             required_tier: AgentTier::T3,

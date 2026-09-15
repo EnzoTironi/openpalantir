@@ -40,9 +40,19 @@ pub enum Guard {
         object: String,
         days: i64,
     },
+    EqField {
+        param: String,
+        object: String,
+        field: String,
+    },
+    Linked {
+        link: String,
+        from: String,
+        to: String,
+    },
 }
 
-const OPERATORS: [&str; 7] = [
+const OPERATORS: [&str; 9] = [
     "freshness",
     "exists_field",
     "lte_field",
@@ -50,6 +60,8 @@ const OPERATORS: [&str; 7] = [
     "gt",
     "gt_field",
     "max_days_since_calibration",
+    "eq_field",
+    "linked",
 ];
 
 /// Parse published guards. Empty list or `{}` is an intentional empty rule.
@@ -154,6 +166,30 @@ fn parse_one(value: &Value) -> Result<Guard> {
                 let object = required_str(obj, "object")?;
                 Ok(Guard::MaxDaysSinceCalibration { object, days })
             }
+            "eq_field" => {
+                let param = obj
+                    .get("eq_field")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| OntoError::Invalid("eq_field needs a param".into()))?
+                    .to_string();
+                let object = required_str(obj, "object")?;
+                let field = required_str(obj, "field")?;
+                Ok(Guard::EqField {
+                    param,
+                    object,
+                    field,
+                })
+            }
+            "linked" => {
+                let link = obj
+                    .get("linked")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| OntoError::Invalid("linked needs a link type".into()))?
+                    .to_string();
+                let from = required_str(obj, "from")?;
+                let to = required_str(obj, "to")?;
+                Ok(Guard::Linked { link, from, to })
+            }
             other => {
                 let _ = other;
                 Err(OntoError::Invalid("unrecognized guard".into()))
@@ -170,14 +206,16 @@ fn required_str(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Strin
 }
 
 /// Evaluate parsed guards. Empty set is an intentional pass.
-pub fn evaluate<F>(
+pub fn evaluate<F, L>(
     guards: &[Guard],
     params: &Value,
     now: i64,
     mut read: F,
+    mut linked: L,
 ) -> Result<(Vec<GuardResult>, Vec<SnapshotObject>)>
 where
     F: FnMut(&str) -> Result<ObjectView>,
+    L: FnMut(&str, &str, &str) -> Result<bool>,
 {
     let mut reads = Vec::new();
     if guards.is_empty() {
@@ -192,21 +230,30 @@ where
     }
     let mut out = Vec::new();
     for guard in guards {
-        out.push(eval_one(guard, params, now, &mut read, &mut reads)?);
+        out.push(eval_one(
+            guard,
+            params,
+            now,
+            &mut read,
+            &mut linked,
+            &mut reads,
+        )?);
     }
     Ok((out, reads))
 }
 
 #[allow(clippy::too_many_lines)] // one arm per Guard variant
-fn eval_one<F>(
+fn eval_one<F, L>(
     guard: &Guard,
     params: &Value,
     now: i64,
     read: &mut F,
+    linked: &mut L,
     reads: &mut Vec<SnapshotObject>,
 ) -> Result<GuardResult>
 where
     F: FnMut(&str) -> Result<ObjectView>,
+    L: FnMut(&str, &str, &str) -> Result<bool>,
 {
     match guard {
         Guard::Freshness {
@@ -374,6 +421,52 @@ where
                 reason: "calibrated".into(),
             })
         }
+        Guard::EqField {
+            param,
+            object,
+            field,
+        } => {
+            let expected = param_str(params, param)?;
+            let id = param_str(params, object)?;
+            let view = read_view(&id, read, reads)?;
+            let Some(actual) = view.properties.get(field).and_then(|p| p.value.as_str()) else {
+                return Ok(GuardResult {
+                    name: "eq_field".into(),
+                    verdict: Verdict::Review,
+                    reason: format!("missing {field} on {object}"),
+                });
+            };
+            if actual == expected {
+                Ok(GuardResult {
+                    name: "eq_field".into(),
+                    verdict: Verdict::Allow,
+                    reason: "bound".into(),
+                })
+            } else {
+                Ok(GuardResult {
+                    name: "eq_field".into(),
+                    verdict: Verdict::Deny,
+                    reason: format!("{param} is not the committed {field}"),
+                })
+            }
+        }
+        Guard::Linked { link, from, to } => {
+            let from_id = param_str(params, from)?;
+            let to_id = param_str(params, to)?;
+            if linked(link, &from_id, &to_id)? {
+                Ok(GuardResult {
+                    name: "linked".into(),
+                    verdict: Verdict::Allow,
+                    reason: "bound".into(),
+                })
+            } else {
+                Ok(GuardResult {
+                    name: "linked".into(),
+                    verdict: Verdict::Deny,
+                    reason: format!("{from} is not linked to {to} by {link}"),
+                })
+            }
+        }
     }
 }
 
@@ -394,7 +487,13 @@ where
     F: FnMut(&str) -> Result<ObjectView>,
 {
     let view = read(id)?;
-    reads.push(crate::types::snapshot_from_view(&view));
+    if let Some(existing) = reads.iter_mut().find(|s| s.id == id) {
+        existing.delegated = true;
+    } else {
+        let mut snap = crate::types::snapshot_from_view(&view);
+        snap.delegated = true;
+        reads.push(snap);
+    }
     Ok(view)
 }
 
@@ -468,9 +567,13 @@ mod tests {
             stale: vec![],
             version_id: String::new(),
         };
-        let (results, _) = evaluate(&guards, &json!({"permit":"p","n":2.0}), 1, |_| {
-            Ok(view.clone())
-        })
+        let (results, _) = evaluate(
+            &guards,
+            &json!({"permit":"p","n":2.0}),
+            1,
+            |_| Ok(view.clone()),
+            |_, _, _| Ok(false),
+        )
         .unwrap();
         assert_eq!(results[0].verdict, Verdict::Review);
         assert_eq!(results[0].name, "insufficient_evidence");
@@ -491,5 +594,67 @@ mod tests {
             json_schema_from_value_type(&clearance)["type"],
             serde_json::json!("number")
         );
+    }
+
+    #[test]
+    fn does_deny_eq_field_if_value_differs() {
+        let guards =
+            parse_guards(&json!([{"eq_field":"student","object":"seat","field":"occupant"}]))
+                .unwrap();
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "occupant".into(),
+            crate::types::PropertyView {
+                value: json!("ana"),
+                source: crate::types::PropertySource::ActionWritten,
+                as_of: None,
+                provenance: None,
+            },
+        );
+        let view = ObjectView {
+            id: "seat".into(),
+            type_name: "Seat".into(),
+            title: None,
+            properties,
+            missing: vec![],
+            stale: vec![],
+            version_id: String::new(),
+        };
+        let (results, reads) = evaluate(
+            &guards,
+            &json!({"student":"bruno","seat":"seat"}),
+            1,
+            |_| Ok(view.clone()),
+            |_, _, _| Ok(false),
+        )
+        .unwrap();
+        assert_eq!(results[0].verdict, Verdict::Deny);
+        assert!(reads[0].delegated);
+    }
+
+    #[test]
+    fn does_deny_linked_if_edge_is_missing() {
+        let guards =
+            parse_guards(&json!([{"linked":"observation_of","from":"observation","to":"patient"}]))
+                .unwrap();
+        let (results, _) = evaluate(
+            &guards,
+            &json!({"observation":"o1","patient":"p1"}),
+            1,
+            |_| {
+                Ok(ObjectView {
+                    id: "o1".into(),
+                    type_name: "Observation".into(),
+                    title: None,
+                    properties: BTreeMap::new(),
+                    missing: vec![],
+                    stale: vec![],
+                    version_id: String::new(),
+                })
+            },
+            |_, _, _| Ok(false),
+        )
+        .unwrap();
+        assert_eq!(results[0].verdict, Verdict::Deny);
     }
 }

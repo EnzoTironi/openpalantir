@@ -266,6 +266,10 @@ fn dedupe_reads(reads: &[SnapshotObject]) -> Vec<SnapshotObject> {
     for obj in reads {
         if seen.insert(obj.id.clone()) {
             out.push(obj.clone());
+        } else if obj.delegated {
+            if let Some(existing) = out.iter_mut().find(|o| o.id == obj.id) {
+                existing.delegated = true;
+            }
         }
     }
     out
@@ -374,6 +378,7 @@ mod tests {
             properties: BTreeMap::new(),
             as_of: BTreeMap::new(),
             provenance: BTreeMap::new(),
+            delegated: false,
         };
         let later = SnapshotObject {
             id: "tank-1".into(),
@@ -382,6 +387,7 @@ mod tests {
             properties: BTreeMap::new(),
             as_of: BTreeMap::new(),
             provenance: BTreeMap::new(),
+            delegated: false,
         };
         let sensor = SnapshotObject {
             id: "sensor-1".into(),
@@ -390,6 +396,7 @@ mod tests {
             properties: BTreeMap::new(),
             as_of: BTreeMap::new(),
             provenance: BTreeMap::new(),
+            delegated: false,
         };
         let path = WritePath::begin("k".into()).param_and_permission(vec![tank, later, sensor]);
         let snap = path.data_snapshot("rule:1".into(), "fn:1".into(), "0.1.0".into());

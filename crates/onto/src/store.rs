@@ -11,7 +11,8 @@ use crate::error::{OntoError, Result};
 use crate::oss::OBJECT_SETS_TABLE;
 use crate::security::POLICIES_TABLE;
 use crate::types::{
-    DataSnapshot, DecisionRecordView, GuardResult, InboxItem, Verdict, WritePathStep, MAIN_BRANCH,
+    new_id, DataSnapshot, DecisionRecordView, GuardResult, InboxItem, Verdict, WritePathStep,
+    MAIN_BRANCH,
 };
 use crate::write_path::{pin_version, StagedOp};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -152,6 +153,13 @@ const OMS_SCHEMA: &str = r"
                 status TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS closed_links (
+                id TEXT PRIMARY KEY,
+                type_name TEXT NOT NULL,
+                from_id TEXT NOT NULL,
+                to_id TEXT NOT NULL,
+                closed_at INTEGER NOT NULL
+            );
             ";
 
 /// Persistence operations. One impl now: [`SqliteStore`].
@@ -243,6 +251,26 @@ pub trait Store: Send + Sync {
     fn claim_effect(&self, decision_record_id: &str) -> Result<()>;
     fn ack_effect(&self, decision_record_id: &str) -> Result<()>;
     fn reconcile_effects(&self) -> Result<Vec<EffectIntention>>;
+    fn publish_main(
+        &self,
+        from: &str,
+        expected_base: &str,
+        proposal_id: &str,
+        actor: &str,
+        at: i64,
+        audit_id: &str,
+        payload: &str,
+    ) -> Result<()>;
+    fn list_closed_links(&self) -> Result<Vec<ClosedLink>>;
+}
+
+/// Historical close of a relationship. Live `links` no longer holds the edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedLink {
+    pub type_name: String,
+    pub from_id: String,
+    pub to_id: String,
+    pub closed_at: i64,
 }
 
 /// Inbox row including the pinned apply Action and rule digest.
@@ -440,6 +468,11 @@ fn apply_staged(tx: &Transaction<'_>, ops: &[StagedOp], at: i64) -> Result<Vec<S
                 from_id,
                 to_id,
             } => {
+                tx.execute(
+                    "INSERT INTO closed_links(id, type_name, from_id, to_id, closed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![new_id(), type_name, from_id, to_id, at],
+                )?;
                 let n = tx.execute(
                     "DELETE FROM links WHERE type_name = ?1 AND from_id = ?2 AND to_id = ?3",
                     params![type_name, from_id, to_id],
@@ -1227,6 +1260,60 @@ impl Store for SqliteStore {
         declared.append(&mut claimed);
         declared.sort_by(|a, b| a.decision_record_id.cmp(&b.decision_record_id));
         Ok(declared)
+    }
+
+    #[allow(clippy::too_many_arguments)] // one Store txn for schema + admin + audit
+    fn publish_main(
+        &self,
+        from: &str,
+        expected_base: &str,
+        proposal_id: &str,
+        actor: &str,
+        at: i64,
+        audit_id: &str,
+        payload: &str,
+    ) -> Result<()> {
+        let mut db = self.conn()?;
+        let tx = db.transaction()?;
+        let current = schema_revision_on(&tx, MAIN_BRANCH)?;
+        if current != expected_base {
+            return Err(OntoError::Conflict(
+                "stale branch: main changed since this branch was opened".into(),
+            ));
+        }
+        copy_branch_over_main(&tx, from)?;
+        tx.execute(
+            "UPDATE proposals SET status = 'merged' WHERE id = ?1",
+            params![proposal_id],
+        )?;
+        tx.execute(
+            "UPDATE branches SET status = 'merged' WHERE name = ?1",
+            params![from],
+        )?;
+        tx.execute(
+            "INSERT INTO audit_log(id, at, actor, kind, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![audit_id, at, actor, "merge_to_main", payload],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn list_closed_links(&self) -> Result<Vec<ClosedLink>> {
+        let db = self.conn()?;
+        let mut stmt = db.prepare(
+            "SELECT type_name, from_id, to_id, closed_at FROM closed_links
+             ORDER BY closed_at, id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ClosedLink {
+                type_name: r.get(0)?,
+                from_id: r.get(1)?,
+                to_id: r.get(2)?,
+                closed_at: r.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 }
 

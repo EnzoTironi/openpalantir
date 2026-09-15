@@ -69,34 +69,52 @@ fn is_notification(req: &RpcRequest) -> bool {
     })
 }
 
+const ADVERTISED_PROTOCOL: &str = "2024-11-05";
+
+fn structured_content(v: Value) -> Value {
+    if v.is_object() {
+        v
+    } else {
+        json!({ "result": v })
+    }
+}
+
 fn handle(engine: &Engine, role: HostRole, req: RpcRequest) -> Option<RpcResponse> {
     if is_notification(&req) {
         return None;
     }
-    if req.jsonrpc.as_deref().is_some_and(|v| v != "2.0") {
+    if req.jsonrpc.as_deref() != Some("2.0") {
         return Some(rpc_err(req.id, "jsonrpc must be 2.0"));
     }
     let id = req.id;
     let method = req.method.unwrap_or_default();
     let params = req.params.unwrap_or(json!({}));
     Some(match method.as_str() {
-        "initialize" => RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": { "tools": {} },
-                "serverInfo": {
-                    "name": match role {
-                        HostRole::Builder => "onto-builder",
-                        HostRole::Consumer => "onto-consumer",
-                        HostRole::Reviewer => "onto-reviewer",
-                    },
-                    "version": onto::ENGINE_VERSION
+        "initialize" => {
+            let offered = params.get("protocolVersion").and_then(Value::as_str);
+            if let Some(v) = offered {
+                if v != ADVERTISED_PROTOCOL {
+                    return Some(rpc_err(id, "unsupported protocolVersion"));
                 }
-            })),
-            error: None,
-        },
+            }
+            RpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: Some(json!({
+                    "protocolVersion": ADVERTISED_PROTOCOL,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": {
+                        "name": match role {
+                            HostRole::Builder => "onto-builder",
+                            HostRole::Consumer => "onto-consumer",
+                            HostRole::Reviewer => "onto-reviewer",
+                        },
+                        "version": onto::ENGINE_VERSION
+                    }
+                })),
+                error: None,
+            }
+        }
         "tools/list" => {
             let session = session_from_role(role);
             match engine.list_tools(&session) {
@@ -131,7 +149,7 @@ fn handle(engine: &Engine, role: HostRole, req: RpcRequest) -> Option<RpcRespons
                     id,
                     result: Some(json!({
                         "content": [{ "type": "text", "text": v.to_string() }],
-                        "structuredContent": v
+                        "structuredContent": structured_content(v)
                     })),
                     error: None,
                 },
@@ -295,6 +313,78 @@ mod tests {
     use onto::KeyKind;
 
     #[test]
+    fn does_reject_if_jsonrpc_is_missing() {
+        let engine = Engine::memory().unwrap();
+        let req = RpcRequest {
+            jsonrpc: None,
+            id: Some(json!(1)),
+            method: Some("initialize".into()),
+            params: None,
+        };
+        let resp = handle(&engine, HostRole::Consumer, req).expect("request");
+        assert!(resp.error.is_some());
+        assert!(resp
+            .error
+            .as_ref()
+            .unwrap()
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("jsonrpc"));
+    }
+
+    #[test]
+    fn does_negotiate_advertised_protocol() {
+        let engine = Engine::memory().unwrap();
+        let ok = handle(
+            &engine,
+            HostRole::Consumer,
+            RpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(1)),
+                method: Some("initialize".into()),
+                params: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ok.result.as_ref().unwrap()["protocolVersion"],
+            json!(ADVERTISED_PROTOCOL)
+        );
+        let bad = handle(
+            &engine,
+            HostRole::Consumer,
+            RpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(2)),
+                method: Some("initialize".into()),
+                params: Some(json!({ "protocolVersion": "1999-01-01" })),
+            },
+        )
+        .unwrap();
+        assert!(bad.error.is_some());
+    }
+
+    #[test]
+    fn does_wrap_structured_content_if_not_object() {
+        let engine = Engine::memory().unwrap();
+        let resp = handle(
+            &engine,
+            HostRole::Consumer,
+            RpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(1)),
+                method: Some("tools/call".into()),
+                params: Some(json!({ "name": "list_tools", "arguments": {} })),
+            },
+        )
+        .unwrap();
+        let structured = resp.result.as_ref().unwrap()["structuredContent"].clone();
+        assert!(structured.is_object(), "{structured}");
+        assert!(structured.get("result").is_some(), "{structured}");
+    }
+
+    #[test]
     fn does_omit_response_if_notification() {
         let engine = Engine::memory().unwrap();
         let req = RpcRequest {
@@ -336,6 +426,19 @@ mod tests {
         let addr = spawn_mcp().await;
         let (status, body) = post_mcp(addr, "Origin: https://evil.example\r\n", INIT).await;
         assert_eq!(status, 403, "{body}");
+    }
+
+    #[tokio::test]
+    async fn does_reject_http_if_jsonrpc_is_missing() {
+        let addr = spawn_mcp().await;
+        let (status, body) = post_mcp(
+            addr,
+            "Origin: http://127.0.0.1:43177\r\n",
+            r#"{"id":1,"method":"initialize"}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("jsonrpc must be 2.0"), "{body}");
     }
 
     #[tokio::test]

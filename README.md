@@ -65,13 +65,13 @@ MCP reviewer (T3, chave de processo separada):
 cargo run -p onto-mcp -- --key reviewer --db onto.db
 ```
 
-HTTP (porta 43177). `Origin` obrigatório na allowlist (`http://127.0.0.1:43177`, `http://localhost:43177`, ou `ONTO_MCP_ORIGINS`). Ausente ou errada → 403. Identidade continua da chave de processo, não do request.
+HTTP (porta 43177). `Origin` obrigatório na allowlist (`http://127.0.0.1:43177`, `http://localhost:43177`, ou `ONTO_MCP_ORIGINS`). Ausente ou errada → 403. Identidade continua da chave de processo, não do request. Consumer MCP é T2 local de um só principal; reviewer é outra chave. Não é runtime multi-inquilino certificado. JSON-RPC 2.0 obrigatório; notificações sem resposta; protocolo anunciado `2024-11-05`.
 
 ```bash
 cargo run -p onto-mcp -- --key consumer --bootstrap --http
 ```
 
-`Engine::migrate_legacy` cancela inbox sem `apply_action` e rejeita branches sem `base_revision`. Linhas não migradas continuam fail-closed. Host T3: `list_effect_intentions` / `claim_effect` / `ack_effect` / `reconcile_effects`. Allow não é entrega.
+`Engine::migrate_legacy` cancela inbox sem `apply_action` e rejeita branches sem `base_revision`. Linhas não migradas continuam fail-closed. Host T3: `list_effect_intentions` / `claim_effect` / `ack_effect` / `reconcile_effects` / `drain_declared` in-process. Allow não é entrega. Funnel recusa campo não declarado. `get_object` aceita `as_of` (válido) e `recorded` (tempo de registro).
 
 CLI de debug (não é produto):
 

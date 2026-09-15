@@ -294,6 +294,7 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
             vec![
                 prop("name", "Text", PropertySource::Mapped, true),
                 prop("value", "DOConcentration", PropertySource::Mapped, false),
+                prop("rationale", "Text", PropertySource::Mapped, false),
             ],
         ),
     )?;
@@ -510,7 +511,7 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
         required_tier: AgentTier::T2,
         effects: json!([]),
         compensation: Some("revert_setpoint_change".into()),
-        side_effects: json!({}),
+        side_effects: json!({ "override": "override_setpoint" }),
         on_review: Some("request_sensor_calibration".into()),
         interfaces: vec![],
     };

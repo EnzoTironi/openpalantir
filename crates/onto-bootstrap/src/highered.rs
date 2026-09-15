@@ -270,7 +270,9 @@ pub fn define_highered(engine: &Engine, s: &Session, branch: &str) -> Result<()>
             name: "release_seat".into(),
             mode: ExecutionMode::Auto,
             parameters: enroll_params,
-            guards: json!([]),
+            guards: json!([
+                { "eq_field": "student", "object": "seat", "field": "occupant" }
+            ]),
             required_roles: vec!["supervisor".into()],
             required_tier: AgentTier::T3,
             effects: json!([

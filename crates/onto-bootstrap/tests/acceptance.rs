@@ -737,6 +737,19 @@ fn does_evaluate_runtime_function_after_merge() {
         )
         .unwrap();
     engine
+        .create_value_type(
+            &modeller(),
+            &b,
+            onto::ValueTypeSpec {
+                name: "Integer".into(),
+                base: "number".into(),
+                min: None,
+                max: None,
+                unit: None,
+            },
+        )
+        .unwrap();
+    engine
         .create_object_type(
             &modeller(),
             &b,
@@ -756,7 +769,7 @@ fn does_evaluate_runtime_function_after_merge() {
                     },
                     onto::PropertySpec {
                         name: "n".into(),
-                        value_type: "Text".into(),
+                        value_type: "Integer".into(),
                         source: onto::PropertySource::Mapped,
                         nullable: false,
                         function: None,

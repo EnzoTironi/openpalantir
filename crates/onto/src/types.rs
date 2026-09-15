@@ -345,6 +345,13 @@ pub struct SnapshotObject {
     /// Provenance per property (R13). Empty when the read had none.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provenance: BTreeMap<String, String>,
+    /// True when this identity was loaded for a guard (delegated read).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delegated: bool,
+}
+
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 /// Pin an [`ObjectView`] including per-property `as_of` and provenance.
@@ -371,6 +378,7 @@ pub fn snapshot_from_view(view: &ObjectView) -> SnapshotObject {
             .collect(),
         as_of,
         provenance,
+        delegated: false,
     }
 }
 

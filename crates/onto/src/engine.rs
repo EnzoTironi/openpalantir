@@ -15,8 +15,8 @@ use crate::oss::{
     OBJECT_SETS_TABLE,
 };
 use crate::security::{authorize, filter_view, AuthzDecision, AuthzOp, PolicySpec, POLICIES_TABLE};
-use crate::store::{DecisionCommit, DecisionWrite, InboxRow, SqliteStore, Store};
-use crate::tiers::{self, AutoBound, RiskBand};
+use crate::store::{ClosedLink, DecisionCommit, DecisionWrite, InboxRow, SqliteStore, Store};
+use crate::tiers::{self, AgentTier, AutoBound, RiskBand};
 #[allow(clippy::wildcard_imports)] // engine is the OMS wiring hub over types
 use crate::types::*;
 use crate::write_path::{pin_version, resolve_idempotency_key, StagedOp, WritePath};
@@ -434,13 +434,14 @@ impl Engine {
                 "branch has no pinned base revision".into(),
             ));
         }
-        self.store.replace_main_schema_if_base(&branch, &expected)?;
-        self.store.set_proposal(proposal_id, "merged", None)?;
-        self.store.set_branch_status(&branch, "merged")?;
-        self.audit(
+        self.store.publish_main(
+            &branch,
+            &expected,
+            proposal_id,
             &session.actor.id,
-            "merge_to_main",
-            &json!({ "proposal": proposal_id, "branch": branch }),
+            self.now(),
+            &new_id(),
+            &json!({ "proposal": proposal_id, "branch": branch }).to_string(),
         )?;
         Ok(())
     }
@@ -902,12 +903,9 @@ impl Engine {
             None => BTreeMap::new(),
         };
         for (name, value) in rec.properties {
-            let declared = spec.properties.iter().find(|p| p.name == name);
-            if declared.is_some() {
-                self.require_write_property(session, &rec.type_name, &id, Some(&name))?;
-            }
-            let source = declared.map_or(PropertySource::Mapped, |p| p.source);
-            if source == PropertySource::ActionWritten {
+            let declared = crate::funnel::declared_property(&spec, &name)?;
+            self.require_write_property(session, &rec.type_name, &id, Some(&name))?;
+            if declared.source == PropertySource::ActionWritten {
                 continue;
             }
             if let Some(cur) = props.get(&name) {
@@ -915,9 +913,16 @@ impl Engine {
                     continue;
                 }
             }
-            if source == PropertySource::Derived {
+            if declared.source == PropertySource::Derived {
                 continue;
             }
+            let Some(vt) = self.load_value_type(MAIN_BRANCH, &declared.value_type)? else {
+                return Err(OntoError::Invalid(format!(
+                    "unknown value type {}",
+                    declared.value_type
+                )));
+            };
+            Self::validate_loaded_value(&vt, &name, &value)?;
             props.insert(
                 name,
                 PropertyView {
@@ -1002,6 +1007,11 @@ impl Engine {
     ) -> Result<ActionOutcome> {
         Self::require_consumer(session)?;
         tiers::require_syscall(session.actor.tier, "submit_action")?;
+        if session.actor.tier == AgentTier::T4 {
+            return Err(OntoError::Denied(
+                "T4 cannot submit_action; use auto_action".into(),
+            ));
+        }
         let spec = self.load_action_type(MAIN_BRANCH, action_name)?;
         self.execute_action(session, &spec, &params, None)
     }
@@ -1057,6 +1067,11 @@ impl Engine {
         self.store.reconcile_effects()
     }
 
+    pub fn list_closed_links(&self, session: &Session) -> Result<Vec<ClosedLink>> {
+        Self::require_consumer(session)?;
+        self.store.list_closed_links()
+    }
+
     pub fn confirm_action(&self, session: &Session, inbox_id: &str) -> Result<ActionOutcome> {
         Self::require_consumer(session)?;
         tiers::require_syscall(session.actor.tier, "confirm_action")?;
@@ -1100,10 +1115,13 @@ impl Engine {
             }
             ExecutionMode::Propose | ExecutionMode::Auto | ExecutionMode::Approve => {}
         }
-        if !row.rule_pin.is_empty() && rule_version(&spec) != row.rule_pin {
-            return Err(OntoError::Conflict(
-                "prepared proposal effects no longer match the pinned plan".into(),
-            ));
+        if !row.rule_pin.is_empty() {
+            let schema = self.store.schema_revision(MAIN_BRANCH)?;
+            if crate::pin::apply_pin(&row.apply_action, &spec, &schema) != row.rule_pin {
+                return Err(OntoError::Conflict(
+                    "prepared proposal effects no longer match the pinned plan".into(),
+                ));
+            }
         }
         self.execute_action(session, &spec, &params, Some(inbox_id))
     }
@@ -1120,12 +1138,19 @@ impl Engine {
         if !session.actor.has_role("supervisor") {
             return Err(OntoError::Denied("override requires supervisor".into()));
         }
-        let params = {
+        let (params, override_name) = {
             let row = self.store.load_inbox(inbox_id)?;
             if row.status != "pending" {
                 return Err(OntoError::Conflict(format!("inbox item is {}", row.status)));
             }
             tiers::require_distinct_confirmer(&session.actor.id, &row.proposed_by)?;
+            let source = self.load_action_type(MAIN_BRANCH, &row.action_name)?;
+            let override_name = source
+                .side_effects
+                .get("override")
+                .and_then(Value::as_str)
+                .ok_or_else(|| OntoError::Invalid("source action has no override".into()))?
+                .to_string();
             let mut p: Value = serde_json::from_str(&row.params)?;
             if let Value::Object(map) = &mut p {
                 map.insert("override_category".into(), json!(category));
@@ -1133,9 +1158,9 @@ impl Engine {
                 map.insert("source_action".into(), json!(row.action_name));
                 map.insert("proposed_by".into(), json!(row.proposed_by));
             }
-            p
+            (p, override_name)
         };
-        let spec = self.load_action_type(MAIN_BRANCH, "override_setpoint")?;
+        let spec = self.load_action_type(MAIN_BRANCH, &override_name)?;
         self.execute_action(session, &spec, &params, Some(inbox_id))
     }
 
@@ -1157,7 +1182,8 @@ impl Engine {
             object_set,
             risk_band,
         )?;
-        self.submit_action(session, action_name, params)
+        let spec = self.load_action_type(MAIN_BRANCH, action_name)?;
+        self.execute_action(session, &spec, &params, None)
     }
 
     pub fn get_decision_record(&self, session: &Session, id: &str) -> Result<DecisionRecordView> {
@@ -1518,7 +1544,7 @@ impl Engine {
                 }
                 let inbox_id = new_id();
                 let apply_action = apply_action_name(&spec.name);
-                let rule_pin = self.pin_apply_action(&apply_action, spec);
+                let rule_pin = self.pin_apply_action(&apply_action, spec)?;
                 Ok((
                     vec![StagedOp::InsertInbox {
                         id: inbox_id.clone(),
@@ -1667,9 +1693,19 @@ impl Engine {
         params: &Value,
     ) -> Result<(Vec<GuardResult>, Vec<SnapshotObject>)> {
         let parsed = guards::parse_guards(guards)?;
-        guards::evaluate(&parsed, params, self.now(), |id| {
-            self.load_object_view(id, AsOf::Current)
-        })
+        guards::evaluate(
+            &parsed,
+            params,
+            self.now(),
+            |id| self.load_object_view(id, AsOf::Current),
+            |link, from, to| {
+                Ok(self
+                    .store
+                    .link_targets(from, link)?
+                    .iter()
+                    .any(|id| id == to))
+            },
+        )
     }
 
     #[allow(clippy::too_many_lines)] // typed plan apply stays one write-set builder
@@ -1983,9 +2019,12 @@ impl Engine {
         Ok(Some(serde_json::from_str(&row.outcome)?))
     }
 
-    fn pin_apply_action(&self, apply_name: &str, propose: &ActionTypeSpec) -> String {
-        self.load_action_type(MAIN_BRANCH, apply_name)
-            .map_or_else(|_| rule_version(propose), |spec| rule_version(&spec))
+    fn pin_apply_action(&self, apply_name: &str, propose: &ActionTypeSpec) -> Result<String> {
+        let schema = self.store.schema_revision(MAIN_BRANCH)?;
+        Ok(self.load_action_type(MAIN_BRANCH, apply_name).map_or_else(
+            |_| crate::pin::apply_pin(apply_name, propose, &schema),
+            |spec| crate::pin::apply_pin(apply_name, &spec, &schema),
+        ))
     }
 
     fn authorize_effect_writes(
