@@ -37,6 +37,14 @@ cargo clippy --workspace --all-targets -- -D clippy::pedantic -D warnings
 cargo test --workspace -- --test-threads=1
 ```
 
+## Utilidade (comprador)
+
+Um comando. Cada reivindicação aponta para um teste `does_*`. Não é bench de latência. Texto em [UTILIDADE.md](UTILIDADE.md).
+
+```bash
+cargo run -p onto-bootstrap --bin usefulness
+```
+
 MCP consumer (stdio):
 
 ```bash

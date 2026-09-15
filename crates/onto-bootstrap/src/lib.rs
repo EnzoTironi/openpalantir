@@ -12,6 +12,7 @@
 
 mod healthcare;
 mod highered;
+pub mod usefulness;
 
 pub use healthcare::{define_healthcare, install_healthcare, HealthcareIds};
 pub use highered::{define_highered, install_highered, HigheredIds};
