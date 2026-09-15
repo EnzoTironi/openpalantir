@@ -5,11 +5,13 @@
 
 mod engine;
 mod error;
+mod oss;
 mod surface;
 mod types;
 mod write_path;
 
 pub use engine::Engine;
 pub use error::{OntoError, Result};
+pub use oss::{ObjectSet, ObjectSetFilter, ObjectSetSpec};
 pub use surface::dispatch;
 pub use types::*;

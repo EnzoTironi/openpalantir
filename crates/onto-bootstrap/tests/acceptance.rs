@@ -1,4 +1,7 @@
-use onto::{dispatch, Actor, Engine, KeyKind, Query, Session, Verdict, WritePathStep};
+use onto::{
+    dispatch, Actor, Engine, IngestRecord, KeyKind, ObjectSet, ObjectSetFilter, ObjectSetSpec,
+    Query, Session, Verdict, WritePathStep,
+};
 use onto_bootstrap::install;
 use serde_json::json;
 
@@ -19,6 +22,17 @@ fn supervisor() -> Session {
 }
 fn intern() -> Session {
     Session::new(Actor::consumer("ops.intern", &[], 1), "test")
+}
+fn restricted() -> Session {
+    Session::new(Actor::consumer("ops.restricted", &["restricted"], 2), "test")
+}
+
+fn merge_object_set(engine: &Engine, branch: &str, spec: ObjectSetSpec) {
+    let b = engine.open_branch(&modeller(), branch).unwrap();
+    engine.create_object_set(&modeller(), &b, spec).unwrap();
+    let proposal = engine.submit_proposal(&modeller(), &b).unwrap();
+    engine.review_proposal(&reviewer(), &proposal, true).unwrap();
+    engine.merge_to_main(&reviewer(), &proposal).unwrap();
 }
 
 #[test]
@@ -574,4 +588,226 @@ fn idempotent_side_effect_key_does_not_double_apply() {
         "setpoint:tank-1:2.6"
     );
     assert_eq!(rec.proof_trace, WritePathStep::ALL.to_vec());
+}
+
+#[test]
+fn empty_object_set_is_ok_empty_vec() {
+    let engine = Engine::memory().unwrap();
+    install(&engine).unwrap();
+    let none = engine
+        .search_objects(
+            &operator(),
+            Query {
+                type_name: Some("GhostAsset".into()),
+                ..Query::default()
+            },
+        )
+        .unwrap();
+    assert!(none.is_empty());
+    let miss = engine
+        .search_objects(
+            &operator(),
+            Query {
+                type_name: Some("AerationTank".into()),
+                equals: [("name".into(), json!("no such basin"))]
+                    .into_iter()
+                    .collect(),
+                ..Query::default()
+            },
+        )
+        .unwrap();
+    assert!(miss.is_empty());
+}
+
+#[test]
+fn named_set_invisible_on_main_until_merge() {
+    let engine = Engine::memory().unwrap();
+    install(&engine).unwrap();
+    let b = engine.open_branch(&modeller(), "set-aeration").unwrap();
+    engine
+        .create_object_set(
+            &modeller(),
+            &b,
+            ObjectSetSpec {
+                name: "aeration_tanks".into(),
+                type_name: Some("AerationTank".into()),
+                equals: Default::default(),
+            },
+        )
+        .unwrap();
+    let before = engine.search_objects(
+        &operator(),
+        Query {
+            set_name: Some("aeration_tanks".into()),
+            ..Query::default()
+        },
+    );
+    assert!(
+        matches!(before, Err(onto::OntoError::NotFound(_))),
+        "unmerged named set must be invisible on main, got {before:?}"
+    );
+
+    let proposal = engine.submit_proposal(&modeller(), &b).unwrap();
+    engine.review_proposal(&reviewer(), &proposal, true).unwrap();
+    engine.merge_to_main(&reviewer(), &proposal).unwrap();
+
+    let after = engine
+        .search_objects(
+            &operator(),
+            Query {
+                set_name: Some("aeration_tanks".into()),
+                ..Query::default()
+            },
+        )
+        .unwrap();
+    assert!(!after.is_empty());
+    assert!(after.iter().all(|o| o.type_name == "AerationTank"));
+}
+
+#[test]
+fn named_set_includes_new_match_excludes_non_match() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    merge_object_set(
+        &engine,
+        "set-live-tanks",
+        ObjectSetSpec {
+            name: "aeration_tanks".into(),
+            type_name: Some("AerationTank".into()),
+            equals: Default::default(),
+        },
+    );
+    let before = engine
+        .search_objects(
+            &operator(),
+            Query {
+                set_name: Some("aeration_tanks".into()),
+                ..Query::default()
+            },
+        )
+        .unwrap();
+    let before_ids: Vec<&str> = before.iter().map(|o| o.id.as_str()).collect();
+    assert!(before_ids.contains(&ids.tank1.as_str()));
+    assert!(!before_ids.contains(&"tank-4"));
+
+    engine
+        .funnel_ingest(
+            &operator(),
+            vec![
+                IngestRecord {
+                    type_name: "AerationTank".into(),
+                    id: Some("tank-4".into()),
+                    properties: [
+                        ("name".into(), json!("Basin 4")),
+                        ("current_do".into(), json!(1.5)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    as_of: Some(engine.now().to_string()),
+                    provenance: Some("test".into()),
+                },
+                IngestRecord {
+                    type_name: "Blower".into(),
+                    id: Some("blower-2".into()),
+                    properties: [("name".into(), json!("B-2"))].into_iter().collect(),
+                    as_of: Some(engine.now().to_string()),
+                    provenance: Some("test".into()),
+                },
+            ],
+        )
+        .unwrap();
+
+    let after = engine
+        .search_objects(
+            &operator(),
+            Query {
+                set_name: Some("aeration_tanks".into()),
+                ..Query::default()
+            },
+        )
+        .unwrap();
+    let after_ids: Vec<&str> = after.iter().map(|o| o.id.as_str()).collect();
+    assert!(
+        after_ids.contains(&"tank-4"),
+        "named set must include a newly created match, got {after_ids:?}"
+    );
+    assert!(
+        !after_ids.contains(&"blower-2"),
+        "named set must exclude a non-matching type, got {after_ids:?}"
+    );
+    assert_eq!(after.len(), before.len() + 1);
+}
+
+#[test]
+fn restricted_cannot_see_rationale_in_set_results() {
+    let engine = Engine::memory().unwrap();
+    install(&engine).unwrap();
+    engine
+        .funnel_ingest(
+            &operator(),
+            vec![IngestRecord {
+                type_name: "LabMeasurement".into(),
+                id: Some("lab-1".into()),
+                properties: [
+                    ("name".into(), json!("lab")),
+                    ("value".into(), json!(2.2)),
+                    ("rationale".into(), json!("hold the band")),
+                ]
+                .into_iter()
+                .collect(),
+                as_of: Some(engine.now().to_string()),
+                provenance: Some("test".into()),
+            }],
+        )
+        .unwrap();
+    let open = engine
+        .search_objects(
+            &operator(),
+            Query {
+                type_name: Some("LabMeasurement".into()),
+                ..Query::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(
+        open[0].properties["rationale"].value,
+        json!("hold the band")
+    );
+    let closed = engine
+        .search_objects(
+            &restricted(),
+            Query {
+                type_name: Some("LabMeasurement".into()),
+                ..Query::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(closed.len(), 1);
+    assert!(
+        !closed[0].properties.contains_key("rationale"),
+        "restricted role must not see rationale in set results"
+    );
+}
+
+#[test]
+fn aggregate_counts_filtered_set_not_whole_type() {
+    let engine = Engine::memory().unwrap();
+    install(&engine).unwrap();
+    let whole = engine.aggregate(&operator(), "AerationTank").unwrap();
+    assert_eq!(whole["count"], 3);
+    let filtered = engine
+        .aggregate_set(
+            &operator(),
+            ObjectSet::inline(
+                Some("AerationTank".into()),
+                ObjectSetFilter {
+                    equals: [("name".into(), json!("Basin 1"))].into_iter().collect(),
+                },
+                50,
+            ),
+        )
+        .unwrap();
+    assert_eq!(filtered["count"], 1);
+    assert_ne!(filtered["count"], whole["count"]);
 }

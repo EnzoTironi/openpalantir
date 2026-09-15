@@ -1,4 +1,8 @@
 use crate::error::{OntoError, Result};
+use crate::oss::{
+    apply_permission, evaluate_members, ObjectSet, ObjectSetFilter, ObjectSetSpec,
+    OBJECT_SETS_TABLE,
+};
 use crate::types::*;
 use crate::write_path::{
     pin_version, resolve_idempotency_key, StagedOp, WritePath,
@@ -79,6 +83,12 @@ impl Engine {
                 PRIMARY KEY (branch, name)
             );
             CREATE TABLE IF NOT EXISTS schema_action_types (
+                branch TEXT NOT NULL,
+                name TEXT NOT NULL,
+                spec TEXT NOT NULL,
+                PRIMARY KEY (branch, name)
+            );
+            CREATE TABLE IF NOT EXISTS schema_object_sets (
                 branch TEXT NOT NULL,
                 name TEXT NOT NULL,
                 spec TEXT NOT NULL,
@@ -228,6 +238,7 @@ impl Engine {
             "schema_link_types",
             "schema_interfaces",
             "schema_action_types",
+            OBJECT_SETS_TABLE,
         ];
         let db = self.db.lock().expect("db");
         for table in tables {
@@ -583,6 +594,7 @@ impl Engine {
             "schema_link_types",
             "schema_interfaces",
             "schema_action_types",
+            OBJECT_SETS_TABLE,
         ];
         let db = self.db.lock().expect("db");
         for table in tables {
@@ -673,54 +685,94 @@ impl Engine {
         Ok(spec.map(|s| serde_json::from_str(&s)).transpose()?)
     }
 
-    pub fn search_objects(&self, session: &Session, query: Query) -> Result<Vec<ObjectView>> {
-        Self::require_consumer(session)?;
+    pub fn create_object_set(
+        &self,
+        session: &Session,
+        branch: &str,
+        spec: ObjectSetSpec,
+    ) -> Result<String> {
+        Self::require_builder(session)?;
+        self.require_open_branch(branch)?;
+        spec.validate()?;
         let db = self.db.lock().expect("db");
-        let mut sql = String::from("SELECT id FROM objects");
-        let mut args: Vec<String> = Vec::new();
-        if let Some(t) = &query.type_name {
-            sql.push_str(" WHERE type_name = ?1");
-            args.push(t.clone());
-        }
-        sql.push_str(" LIMIT ?");
-        let mut stmt = db.prepare(&sql)?;
-        let ids: Vec<String> = if args.is_empty() {
-            stmt.query_map(params![query.limit as i64], |r| r.get(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        } else {
-            stmt.query_map(params![args[0], query.limit as i64], |r| r.get(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
+        Self::put_spec(
+            &db,
+            OBJECT_SETS_TABLE,
+            branch,
+            &spec.name,
+            &serde_json::to_value(&spec)?,
+        )?;
+        Ok(spec.name)
+    }
+
+    pub fn search_objects(&self, session: &Session, query: Query) -> Result<Vec<ObjectView>> {
+        self.search_object_set(session, ObjectSet::from_query(&query))
+    }
+
+    pub fn search_object_set(&self, session: &Session, set: ObjectSet) -> Result<Vec<ObjectView>> {
+        Self::require_consumer(session)?;
+        let resolved = self.resolve_object_set(set)?;
+        let ids = self.candidate_ids(resolved.type_name.as_deref())?;
+        evaluate_members(&resolved, ids, |id| self.load_permitted_view(session, id))
+    }
+
+    pub fn aggregate_set(&self, session: &Session, set: ObjectSet) -> Result<Value> {
+        Self::require_consumer(session)?;
+        let resolved = self.resolve_object_set(set.unbounded())?;
+        let ids = self.candidate_ids(resolved.type_name.as_deref())?;
+        let members = evaluate_members(&resolved, ids, |id| self.load_permitted_view(session, id))?;
+        Ok(json!({
+            "type_name": resolved.type_name,
+            "name": resolved.name,
+            "count": members.len() as i64
+        }))
+    }
+
+    fn resolve_object_set(&self, set: ObjectSet) -> Result<ObjectSet> {
+        let Some(name) = set.name.as_deref() else {
+            return Ok(set);
         };
-        drop(stmt);
-        drop(db);
-        let mut out = Vec::new();
-        for id in ids {
-            let view = self.load_object_view(&id)?;
-            if self.matches_equals(&view, &query.equals) {
-                out.push(self.filter_view(session, view));
+        let spec = self.load_object_set_spec(MAIN_BRANCH, name)?;
+        Ok(ObjectSet::from_spec(&spec, set.limit))
+    }
+
+    fn load_object_set_spec(&self, branch: &str, name: &str) -> Result<ObjectSetSpec> {
+        let db = self.db.lock().expect("db");
+        let spec: String = db
+            .query_row(
+                "SELECT spec FROM schema_object_sets WHERE branch = ?1 AND name = ?2",
+                params![branch, name],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| OntoError::NotFound(format!("object set {name} on {branch}")))?;
+        Ok(serde_json::from_str(&spec)?)
+    }
+
+    fn candidate_ids(&self, type_name: Option<&str>) -> Result<Vec<String>> {
+        let db = self.db.lock().expect("db");
+        let ids = match type_name {
+            Some(t) => {
+                let mut stmt = db.prepare("SELECT id FROM objects WHERE type_name = ?1")?;
+                stmt.query_map(params![t], |r| r.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
             }
-        }
-        Ok(out)
+            None => {
+                let mut stmt = db.prepare("SELECT id FROM objects")?;
+                stmt.query_map([], |r| r.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        };
+        Ok(ids)
     }
 
-    fn matches_equals(&self, view: &ObjectView, equals: &BTreeMap<String, Value>) -> bool {
-        equals.iter().all(|(k, v)| {
-            view.properties
-                .get(k)
-                .is_some_and(|p| p.value == *v)
-        })
-    }
-
-    fn filter_view(&self, session: &Session, mut view: ObjectView) -> ObjectView {
-        if session.actor.has_role("restricted") {
-            view.properties.retain(|name, _| name != "rationale");
-        }
-        view
+    fn load_permitted_view(&self, session: &Session, id: &str) -> Result<ObjectView> {
+        Ok(apply_permission(session, self.load_object_view(id)?))
     }
 
     pub fn get_object(&self, session: &Session, id: &str) -> Result<ObjectView> {
         Self::require_consumer(session)?;
-        Ok(self.filter_view(session, self.load_object_view(id)?))
+        self.load_permitted_view(session, id)
     }
 
     fn load_object_view(&self, id: &str) -> Result<ObjectView> {
@@ -821,14 +873,10 @@ impl Engine {
     }
 
     pub fn aggregate(&self, session: &Session, type_name: &str) -> Result<Value> {
-        Self::require_consumer(session)?;
-        let db = self.db.lock().expect("db");
-        let count: i64 = db.query_row(
-            "SELECT COUNT(*) FROM objects WHERE type_name = ?1",
-            params![type_name],
-            |r| r.get(0),
-        )?;
-        Ok(json!({ "type_name": type_name, "count": count }))
+        self.aggregate_set(
+            session,
+            ObjectSet::inline(Some(type_name.into()), ObjectSetFilter::default(), usize::MAX),
+        )
     }
 
     pub fn list_missing_evidence(&self, session: &Session, id: &str) -> Result<Value> {
@@ -1917,6 +1965,7 @@ fn builder_tools() -> Vec<ToolSpec> {
         ("attach_interface", "Attach an interface to an object type"),
         ("create_action_type", "Create an action type on a branch"),
         ("alter_action_type", "Alter an action type on a branch"),
+        ("create_object_set", "Create a named object set on a branch"),
         ("submit_proposal", "Submit a branch for review"),
         ("review_proposal", "Approve or reject a proposal"),
         ("merge_to_main", "Merge an approved proposal into main"),
@@ -1933,10 +1982,10 @@ fn builder_tools() -> Vec<ToolSpec> {
 
 fn consumer_base_tools() -> Vec<ToolSpec> {
     [
-        ("search_objects", "Permission-first object search"),
+        ("search_objects", "Permission-first object-set search"),
         ("get_object", "Load one object with freshness, provenance, missing fields"),
         ("traverse_links", "Cycle-aware link traversal"),
-        ("aggregate", "Count objects of a type"),
+        ("aggregate", "Count members of an object set"),
         ("list_missing_evidence", "Missing and stale fields for an object"),
         ("describe_action", "Projected Action card"),
         ("submit_action", "Submit a predefined Action"),
