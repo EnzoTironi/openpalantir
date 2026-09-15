@@ -4,6 +4,7 @@
 //! are projected from main after merge. There is no file-based constitution.
 
 mod bitemporal;
+mod compensation;
 mod engine;
 mod error;
 mod functions;
@@ -13,6 +14,7 @@ mod types;
 mod write_path;
 
 pub use bitemporal::{AsOf, LoadedVersion, VersionSpan};
+pub use compensation::{inverse_params, previous_written, require_allow, Compensation};
 pub use engine::Engine;
 pub use error::{OntoError, Result};
 pub use functions::{FunctionKind, FunctionSpec};

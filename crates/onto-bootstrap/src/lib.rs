@@ -500,6 +500,60 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
         s,
         branch,
         ActionTypeSpec {
+            name: "revert_setpoint_change".into(),
+            mode: ExecutionMode::Auto,
+            parameters: vec![
+                ParamSpec {
+                    name: "tank".into(),
+                    value_type: "Text".into(),
+                    object_type: Some("AerationTank".into()),
+                    required: true,
+                },
+                ParamSpec {
+                    name: "sensor".into(),
+                    value_type: "Text".into(),
+                    object_type: Some("DO_Sensor".into()),
+                    required: true,
+                },
+                ParamSpec {
+                    name: "permit".into(),
+                    value_type: "Text".into(),
+                    object_type: Some("PermitVersion".into()),
+                    required: true,
+                },
+                ParamSpec {
+                    name: "target_do".into(),
+                    value_type: "DOConcentration".into(),
+                    object_type: None,
+                    required: true,
+                },
+                ParamSpec {
+                    name: "rationale".into(),
+                    value_type: "Text".into(),
+                    object_type: None,
+                    required: true,
+                },
+            ],
+            guards: json!([
+                { "freshness": "sensor", "max_age_secs": 300 },
+                { "lte_field": "target_do", "object": "permit", "field": "do_max" }
+            ]),
+            required_roles: vec!["supervisor".into()],
+            required_tier: 3,
+            effects: json!([{
+                "update": "tank",
+                "properties": { "target_do": "$target_do" }
+            }]),
+            compensation: None,
+            side_effects: json!({ "dcs": "revert_setpoint_change", "idempotent": true }),
+            on_review: None,
+        },
+    )?;
+
+    engine.create_action_type(
+        s,
+        branch,
+        ActionTypeSpec {
             name: "override_setpoint".into(),
             mode: ExecutionMode::Auto,
             parameters: vec![

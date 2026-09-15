@@ -12,6 +12,7 @@ Inspirado em Zhang, *Operational Ontology: From Business Mirror to Decision Runt
 - **Chave consumer:** consultar o mundo e executar Actions pré-definidas. Não edita schema.
 - **Chave builder:** edita schema num branch. Não lê nem escreve instâncias de produção.
 - Toda escrita de negócio passa por Action no write path de 7 passos (`WritePathStep`): submit → param+permission → submission criteria → staged edits (all-or-discard) → commit atômico → selar `DecisionRecord` → declarar side effects com chave de idempotência. Funnel não sobrescreve propriedade `ActionWritten`.
+- Compensação de um `Allow` submete a Action nomeada em `ActionTypeSpec.compensation` pelo mesmo write path (`Engine::compensate_action`). Sela um `DecisionRecord` novo. O original permanece. Versões de objeto só acrescentam (Zhang 2026, Ch. 9: compensate forward). Sem nome de compensação é `OntoError::NoCompensation`, não sucesso silencioso. Retry com a mesma chave de idempotência não aplica de novo.
 - Instâncias são versionadas (Zhang 2026, Ch. 5): cada escrita de propriedades **acrescenta** um `VersionSpan` (valid time + transaction time). `get_object(id)` lê a versão aberta; `get_object(id, as_of)` reconstrói o objeto no tempo válido. Ponta aberta é `None`. Não há overwrite in-place na tabela `objects`.
 - `DecisionRecord.data_snapshot` pina os objetos lidos nos guards, mais `rule_version`, `function_version` (digest das funções invocadas) e `engine_version`.
 - Inbox é objeto, não tela. Confirmar/vetar é Action.
@@ -61,3 +62,4 @@ cargo run -p onto-sdk --bin onto -- --key builder --id ke --roles modeler,review
 3. Consumer `propose_setpoint_change` → item de inbox.
 4. Supervisor `confirm_action` ou `override_action`.
 5. `get_decision_record` replay do dossier.
+6. Supervisor `compensate_action` no Allow: Action inversa (`revert_setpoint_change`), não rollback.

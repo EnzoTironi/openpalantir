@@ -1061,3 +1061,199 @@ fn aggregate_counts_filtered_set_not_whole_type() {
     assert_eq!(filtered["count"], 1);
     assert_ne!(filtered["count"], whole["count"]);
 }
+
+#[test]
+fn compensate_allow_is_inverse_action_not_rollback() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    let approved = engine
+        .submit_action(
+            &supervisor(),
+            "approve_setpoint_change",
+            json!({
+                "tank": ids.tank1,
+                "sensor": ids.sensor1,
+                "permit": ids.permit,
+                "target_do": 2.5,
+                "rationale": "approve then compensate",
+                "idempotency_key": "setpoint:tank-1:approve"
+            }),
+        )
+        .unwrap();
+    assert_eq!(approved.verdict, Verdict::Allow);
+    let original_id = approved.decision_record_id.clone().expect("original record");
+    let original = engine
+        .get_decision_record(&operator(), &original_id)
+        .unwrap();
+    assert_eq!(original.action_name, "approve_setpoint_change");
+    let after_approve = engine.now();
+    let spans_after_approve = engine.object_spans(&ids.tank1).unwrap();
+
+    engine.set_clock(after_approve + 10);
+    let compensated = engine
+        .compensate_action(
+            &supervisor(),
+            &original_id,
+            json!({
+                "target_do": 1.8,
+                "rationale": "forward inverse",
+                "idempotency_key": "compensate:tank-1:once"
+            }),
+        )
+        .unwrap();
+    assert_eq!(compensated.verdict, Verdict::Allow);
+    let compensation_id = compensated
+        .decision_record_id
+        .clone()
+        .expect("compensation record");
+    assert_ne!(
+        compensation_id, original_id,
+        "compensation must seal a new DecisionRecord"
+    );
+
+    let still_original = engine
+        .get_decision_record(&operator(), &original_id)
+        .unwrap();
+    assert_eq!(still_original.id, original.id);
+    assert_eq!(still_original.action_name, original.action_name);
+    assert_eq!(still_original.verdict, Verdict::Allow);
+    assert_eq!(still_original.created_at, original.created_at);
+    assert_eq!(still_original.params, original.params);
+    assert_eq!(still_original.proof_trace, original.proof_trace);
+
+    let inverse = engine
+        .get_decision_record(&operator(), &compensation_id)
+        .unwrap();
+    assert_eq!(inverse.action_name, "revert_setpoint_change");
+    assert_eq!(inverse.proof_trace, WritePathStep::ALL.to_vec());
+    assert_eq!(inverse.verdict, Verdict::Allow);
+
+    let current = engine
+        .get_object(&operator(), &ids.tank1, AsOf::Current)
+        .unwrap();
+    assert_eq!(
+        current.properties["target_do"].value,
+        json!(1.8),
+        "current target_do is the compensated value"
+    );
+    let historical = engine
+        .get_object(&operator(), &ids.tank1, AsOf::Valid(after_approve))
+        .unwrap();
+    assert_eq!(
+        historical.properties["target_do"].value,
+        json!(2.5),
+        "as_of before compensate still sees the approved value"
+    );
+
+    let spans = engine.object_spans(&ids.tank1).unwrap();
+    assert_eq!(
+        spans.len(),
+        spans_after_approve.len() + 1,
+        "compensation appends a version; it does not rewrite history"
+    );
+}
+
+#[test]
+fn missing_compensation_name_is_error_not_silent_success() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    let over = engine
+        .submit_action(
+            &supervisor(),
+            "override_setpoint",
+            json!({
+                "tank": ids.tank1,
+                "override_category": "process_exception",
+                "override_reason": "no inverse named"
+            }),
+        )
+        .unwrap();
+    assert_eq!(over.verdict, Verdict::Allow);
+    let rec_id = over.decision_record_id.clone().expect("override record");
+    let err = engine
+        .compensate_action(&supervisor(), &rec_id, json!({}))
+        .unwrap_err();
+    assert!(
+        matches!(err, onto::OntoError::NoCompensation(name) if name == "override_setpoint"),
+        "missing compensation must be typed, got {err:?}"
+    );
+    let still = engine.get_decision_record(&operator(), &rec_id).unwrap();
+    assert_eq!(still.action_name, "override_setpoint");
+    assert_eq!(still.verdict, Verdict::Allow);
+}
+
+#[test]
+fn compensate_retry_same_key_does_not_double_apply() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    let approved = engine
+        .submit_action(
+            &supervisor(),
+            "approve_setpoint_change",
+            json!({
+                "tank": ids.tank1,
+                "sensor": ids.sensor1,
+                "permit": ids.permit,
+                "target_do": 2.5,
+                "rationale": "idempotent compensate",
+                "idempotency_key": "setpoint:tank-1:comp-src"
+            }),
+        )
+        .unwrap();
+    let original_id = approved.decision_record_id.clone().expect("original");
+    engine.set_clock(engine.now() + 10);
+    let overlay = json!({
+        "target_do": 1.8,
+        "rationale": "forward inverse",
+        "idempotency_key": "compensate:tank-1:same"
+    });
+    let first = engine
+        .compensate_action(&supervisor(), &original_id, overlay.clone())
+        .unwrap();
+    assert_eq!(first.verdict, Verdict::Allow);
+    let spans_after = engine.object_spans(&ids.tank1).unwrap();
+    let second = engine
+        .compensate_action(&supervisor(), &original_id, overlay)
+        .unwrap();
+    assert_eq!(first.decision_record_id, second.decision_record_id);
+    assert_eq!(
+        engine.object_spans(&ids.tank1).unwrap().len(),
+        spans_after.len(),
+        "retry with the same compensation idempotency key must not append another version"
+    );
+    let tank = engine
+        .get_object(&operator(), &ids.tank1, AsOf::Current)
+        .unwrap();
+    assert_eq!(tank.properties["target_do"].value, json!(1.8));
+}
+
+#[test]
+fn compensate_deny_is_not_compensable() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    let denied = engine
+        .submit_action(
+            &supervisor(),
+            "approve_setpoint_change",
+            json!({
+                "tank": ids.tank1,
+                "sensor": ids.sensor1,
+                "permit": ids.permit,
+                "target_do": 9.0,
+                "rationale": "over permit"
+            }),
+        )
+        .unwrap();
+    assert_eq!(denied.verdict, Verdict::Deny);
+    let rec_id = denied.decision_record_id.clone().expect("deny record");
+    let err = engine
+        .compensate_action(&supervisor(), &rec_id, json!({}))
+        .unwrap_err();
+    assert!(
+        matches!(err, onto::OntoError::NotCompensable(id) if id == rec_id),
+        "Deny must not compensate, got {err:?}"
+    );
+    let still = engine.get_decision_record(&operator(), &rec_id).unwrap();
+    assert_eq!(still.verdict, Verdict::Deny);
+    assert_eq!(still.action_name, "approve_setpoint_change");
+}

@@ -1,4 +1,5 @@
 use crate::bitemporal::{self, AsOf};
+use crate::compensation::{self, Compensation};
 use crate::error::{OntoError, Result};
 use crate::functions::{self, FunctionSpec};
 use crate::oss::{
@@ -1125,6 +1126,27 @@ impl Engine {
     ) -> Result<ActionOutcome> {
         Self::require_consumer(session)?;
         let spec = self.load_action_type(MAIN_BRANCH, action_name)?;
+        self.execute_action(session, &spec, params, None)
+    }
+
+    /// Submit the named inverse Action for an Allow DecisionRecord.
+    ///
+    /// The original record is left in place. A new DecisionRecord is sealed
+    /// through [`Self::execute_action`]. Missing compensation is
+    /// [`OntoError::NoCompensation`], not a silent success.
+    pub fn compensate_action(
+        &self,
+        session: &Session,
+        decision_record_id: &str,
+        overlay: Value,
+    ) -> Result<ActionOutcome> {
+        Self::require_consumer(session)?;
+        let original = self.get_decision_record(session, decision_record_id)?;
+        compensation::require_allow(&original)?;
+        let original_spec = self.load_action_type(MAIN_BRANCH, &original.action_name)?;
+        let Compensation::Inverse { action } = Compensation::from_spec(&original_spec)?;
+        let spec = self.load_action_type(MAIN_BRANCH, &action)?;
+        let params = compensation::inverse_params(&original, &overlay);
         self.execute_action(session, &spec, params, None)
     }
 

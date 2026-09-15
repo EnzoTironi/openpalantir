@@ -12,6 +12,12 @@ pub enum OntoError {
     Invalid(String),
     #[error("{0}")]
     Conflict(String),
+    /// Action spec has no `compensation` name. Not a silent success.
+    #[error("action `{0}` has no named compensation")]
+    NoCompensation(String),
+    /// Only an Allow DecisionRecord can be compensated (Zhang 2026, Ch. 9).
+    #[error("decision `{0}` cannot be compensated (verdict is not allow)")]
+    NotCompensable(String),
     #[error("store: {0}")]
     Store(String),
 }
