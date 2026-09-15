@@ -1174,7 +1174,7 @@ fn missing_compensation_name_is_error_not_silent_success() {
         .compensate_action(&supervisor(), &rec_id, json!({}))
         .unwrap_err();
     assert!(
-        matches!(err, onto::OntoError::NoCompensation(name) if name == "override_setpoint"),
+        matches!(err, onto::OntoError::NoCompensation(ref name) if name == "override_setpoint"),
         "missing compensation must be typed, got {err:?}"
     );
     let still = engine.get_decision_record(&operator(), &rec_id).unwrap();
@@ -1250,7 +1250,7 @@ fn compensate_deny_is_not_compensable() {
         .compensate_action(&supervisor(), &rec_id, json!({}))
         .unwrap_err();
     assert!(
-        matches!(err, onto::OntoError::NotCompensable(id) if id == rec_id),
+        matches!(err, onto::OntoError::NotCompensable(ref id) if id.as_str() == rec_id),
         "Deny must not compensate, got {err:?}"
     );
     let still = engine.get_decision_record(&operator(), &rec_id).unwrap();
