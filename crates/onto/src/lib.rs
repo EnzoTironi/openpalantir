@@ -10,9 +10,11 @@
 
 mod bitemporal;
 mod compensation;
+mod decision;
 mod engine;
 mod error;
 mod functions;
+mod guards;
 mod kernel;
 mod oss;
 mod security;
@@ -24,13 +26,15 @@ mod write_path;
 
 pub use bitemporal::{AsOf, LoadedVersion, VersionSpan};
 pub use compensation::{inverse_params, previous_written, require_allow, Compensation};
+pub use decision::{chosen_integration, EffectIntention, EffectStatus, IntegrationModel};
 pub use engine::Engine;
 pub use error::{OntoError, Result};
 pub use functions::{FunctionKind, FunctionSpec};
+pub use guards::{json_schema_type, parse_guards, Guard};
 pub use kernel::KernelInterface;
 pub use oss::{ObjectSet, ObjectSetFilter, ObjectSetSpec};
 pub use security::{AuthzDecision, AuthzLevel, AuthzOp, PolicySpec};
-pub use store::{SqliteStore, Store};
+pub use store::{DecisionCommit, InboxRow, SqliteStore, Store};
 pub use surface::dispatch;
 pub use tiers::{AgentTier, AutoBound, AutoClaim, IllegalTier, RiskBand};
 pub use types::*;

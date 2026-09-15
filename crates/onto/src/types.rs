@@ -333,6 +333,38 @@ pub struct SnapshotObject {
     pub id: String,
     pub type_name: String,
     pub properties: BTreeMap<String, Value>,
+    /// Valid-time stamps per property (R13). Empty when the read had none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub as_of: BTreeMap<String, String>,
+    /// Provenance per property (R13). Empty when the read had none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provenance: BTreeMap<String, String>,
+}
+
+/// Pin an [`ObjectView`] including per-property `as_of` and provenance.
+#[must_use]
+pub fn snapshot_from_view(view: &ObjectView) -> SnapshotObject {
+    let mut as_of = BTreeMap::new();
+    let mut provenance = BTreeMap::new();
+    for (k, p) in &view.properties {
+        if let Some(stamp) = &p.as_of {
+            as_of.insert(k.clone(), stamp.clone());
+        }
+        if let Some(prov) = &p.provenance {
+            provenance.insert(k.clone(), prov.clone());
+        }
+    }
+    SnapshotObject {
+        id: view.id.clone(),
+        type_name: view.type_name.clone(),
+        properties: view
+            .properties
+            .iter()
+            .map(|(k, p)| (k.clone(), p.value.clone()))
+            .collect(),
+        as_of,
+        provenance,
+    }
 }
 
 /// Pins the objects actually read plus the three versions that produced the verdict.

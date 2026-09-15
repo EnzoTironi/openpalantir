@@ -2,13 +2,14 @@ use crate::bitemporal::{self, AsOf};
 use crate::compensation::{self, Compensation};
 use crate::error::{OntoError, Result};
 use crate::functions::{self, FunctionSpec};
+use crate::guards;
 use crate::kernel::{self, KernelInterface};
 use crate::oss::{
     apply_permission, evaluate_members, ObjectSet, ObjectSetFilter, ObjectSetSpec,
     OBJECT_SETS_TABLE,
 };
 use crate::security::{authorize, filter_view, AuthzDecision, AuthzOp, PolicySpec, POLICIES_TABLE};
-use crate::store::{DecisionWrite, SqliteStore, Store};
+use crate::store::{DecisionCommit, DecisionWrite, InboxRow, SqliteStore, Store};
 use crate::tiers::{self, AutoBound, RiskBand};
 #[allow(clippy::wildcard_imports)] // engine is the OMS wiring hub over types
 use crate::types::*;
@@ -20,23 +21,26 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 /// Coordinates OMS syscalls. Persistence is [`Store`], not this type's fields.
 pub struct Engine {
-    store: SqliteStore,
+    store: Box<dyn Store>,
     clock: AtomicI64,
 }
 
 impl Engine {
-    pub fn memory() -> Result<Self> {
-        Ok(Self {
-            store: SqliteStore::memory()?,
+    /// Inject a persistence backend. The store owns the connection and lock.
+    #[must_use]
+    pub fn from_store(store: impl Store + 'static) -> Self {
+        Self {
+            store: Box::new(store),
             clock: AtomicI64::new(1_700_000_000),
-        })
+        }
+    }
+
+    pub fn memory() -> Result<Self> {
+        Ok(Self::from_store(SqliteStore::memory()?))
     }
 
     pub fn open(path: &str) -> Result<Self> {
-        Ok(Self {
-            store: SqliteStore::open(path)?,
-            clock: AtomicI64::new(1_700_000_000),
-        })
+        Ok(Self::from_store(SqliteStore::open(path)?))
     }
 
     pub fn set_clock(&self, secs: i64) {
@@ -87,8 +91,9 @@ impl Engine {
             }
             return Err(OntoError::Conflict(format!("branch {name} is {status}")));
         }
+        let base = self.store.schema_revision(MAIN_BRANCH)?;
         self.store
-            .insert_open_branch(name, &session.actor.id, self.now())?;
+            .insert_open_branch(name, &session.actor.id, self.now(), &base)?;
         self.store.copy_schema(MAIN_BRANCH, name)?;
         self.audit(&session.actor.id, "open_branch", &json!({ "branch": name }))?;
         Ok(name.to_string())
@@ -326,6 +331,7 @@ impl Engine {
     ) -> Result<String> {
         Self::require_builder(session)?;
         self.require_open_branch(branch)?;
+        guards::parse_guards(&spec.guards)?;
         self.put_spec(
             "schema_action_types",
             branch,
@@ -390,7 +396,11 @@ impl Engine {
                 "proposal must be approved before merge".into(),
             ));
         }
-        self.store.replace_main_schema(&branch)?;
+        let expected = self
+            .store
+            .branch_base_revision(&branch)?
+            .ok_or_else(|| OntoError::NotFound(format!("branch {branch}")))?;
+        self.store.replace_main_schema_if_base(&branch, &expected)?;
         self.store.set_proposal(proposal_id, "merged", None)?;
         self.store.set_branch_status(&branch, "merged")?;
         self.audit(
@@ -744,6 +754,16 @@ impl Engine {
         link_type: &str,
     ) -> Result<Vec<ObjectView>> {
         Self::require_consumer(session)?;
+        let origin = self.load_object_view(from_id, AsOf::Current)?;
+        match self.authorize_read(session, &origin.type_name, &origin.id)? {
+            AuthzDecision::Allow => {}
+            AuthzDecision::Deny => {
+                return Err(OntoError::Denied(format!(
+                    "read denied for {}/{from_id}",
+                    origin.type_name
+                )));
+            }
+        }
         let allow_cycles = self
             .get_schema(session, None)?
             .link_types
@@ -809,6 +829,13 @@ impl Engine {
         let as_of = rec.as_of.clone().unwrap_or_else(|| self.now().to_string());
         let id = rec.id.clone().unwrap_or_else(new_id);
         let existing = if self.store.identity_exists(&id)? {
+            let actual = self.store.object_type_of(&id)?;
+            if actual != rec.type_name {
+                return Err(OntoError::Invalid(format!(
+                    "funnel type {} does not match identity {id} ({actual})",
+                    rec.type_name
+                )));
+            }
             Some(self.store.current_properties(&id)?)
         } else {
             None
@@ -850,17 +877,24 @@ impl Engine {
                 .and_then(|p| p.value.as_str().map(str::to_string))
         });
         let encoded = serde_json::to_string(&props)?;
-        let at = rec
+        let valid_at = rec
             .as_of
             .as_ref()
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or_else(|| self.now());
+        let tx_at = self.now();
         if existing.is_some() {
             self.store
-                .append_version(&id, &encoded, title.as_deref(), at)?;
+                .append_version_recorded(&id, &encoded, title.as_deref(), valid_at, tx_at)?;
         } else {
-            self.store
-                .insert_object(&id, &rec.type_name, title.as_deref(), &encoded, at)?;
+            self.store.insert_object_recorded(
+                &id,
+                &rec.type_name,
+                title.as_deref(),
+                &encoded,
+                valid_at,
+                tx_at,
+            )?;
         }
         Ok(id)
     }
@@ -940,22 +974,47 @@ impl Engine {
     pub fn confirm_action(&self, session: &Session, inbox_id: &str) -> Result<ActionOutcome> {
         Self::require_consumer(session)?;
         tiers::require_syscall(session.actor.tier, "confirm_action")?;
-        let (action_name, params, status, proposed_by) = self.store.load_inbox(inbox_id)?;
-        tiers::require_distinct_confirmer(&session.actor.id, &proposed_by)?;
-        if status != "pending" {
-            return Err(OntoError::Conflict(format!("inbox item is {status}")));
+        let row = self.store.load_inbox(inbox_id)?;
+        tiers::require_distinct_confirmer(&session.actor.id, &row.proposed_by)?;
+        match row.status.as_str() {
+            "shadow" => {
+                return Err(OntoError::Denied(
+                    "shadow output cannot enter real confirmation".into(),
+                ))
+            }
+            "confirmed" => {
+                let params: Value = serde_json::from_str(&row.params)?;
+                let apply = apply_action_name_from_row(&row);
+                let key = resolve_idempotency_key(&apply, &session.actor.id, &params);
+                if let Some(cached) = self.load_cached_outcome(&key)? {
+                    return Ok(cached);
+                }
+                return Err(OntoError::Conflict("inbox item is confirmed".into()));
+            }
+            "pending" => {}
+            other => return Err(OntoError::Conflict(format!("inbox item is {other}"))),
         }
-        let params: Value = serde_json::from_str(&params)?;
-        let apply_name = action_name.replacen("propose_", "approve_", 1);
-        let spec = if let Ok(spec) = self.load_action_type(MAIN_BRANCH, &apply_name) {
-            spec
-        } else {
-            let mut spec = self.load_action_type(MAIN_BRANCH, &action_name)?;
-            spec.mode = ExecutionMode::Auto;
-            spec
-        };
-        let outcome = self.execute_action(session, &spec, &params, Some(inbox_id))?;
-        Ok(outcome)
+        let params: Value = serde_json::from_str(&row.params)?;
+        if row.apply_action.is_empty() {
+            return Err(OntoError::Invalid(
+                "inbox has no pinned apply action".into(),
+            ));
+        }
+        let spec = self.load_action_type(MAIN_BRANCH, &row.apply_action)?;
+        match spec.mode {
+            ExecutionMode::Shadow => {
+                return Err(OntoError::Denied(
+                    "shadow action cannot enter real confirmation".into(),
+                ))
+            }
+            ExecutionMode::Propose | ExecutionMode::Auto | ExecutionMode::Approve => {}
+        }
+        if !row.rule_pin.is_empty() && rule_version(&spec) != row.rule_pin {
+            return Err(OntoError::Conflict(
+                "prepared proposal effects no longer match the pinned plan".into(),
+            ));
+        }
+        self.execute_action(session, &spec, &params, Some(inbox_id))
     }
 
     pub fn override_action(
@@ -971,54 +1030,22 @@ impl Engine {
             return Err(OntoError::Denied("override requires supervisor".into()));
         }
         let params = {
-            let (action_name, raw, status, proposed_by) = self.store.load_inbox(inbox_id)?;
-            if status != "pending" {
-                return Err(OntoError::Conflict(format!("inbox item is {status}")));
+            let row = self.store.load_inbox(inbox_id)?;
+            if row.status != "pending" {
+                return Err(OntoError::Conflict(format!("inbox item is {}", row.status)));
             }
-            tiers::require_distinct_confirmer(&session.actor.id, &proposed_by)?;
-            let mut p: Value = serde_json::from_str(&raw)?;
+            tiers::require_distinct_confirmer(&session.actor.id, &row.proposed_by)?;
+            let mut p: Value = serde_json::from_str(&row.params)?;
             if let Value::Object(map) = &mut p {
                 map.insert("override_category".into(), json!(category));
                 map.insert("override_reason".into(), json!(reason));
-                map.insert("source_action".into(), json!(action_name));
-                map.insert("proposed_by".into(), json!(proposed_by));
+                map.insert("source_action".into(), json!(row.action_name));
+                map.insert("proposed_by".into(), json!(row.proposed_by));
             }
-            self.store.set_inbox_status(inbox_id, "overridden")?;
             p
         };
-        let override_spec = self.load_action_type(MAIN_BRANCH, "override_setpoint").ok();
-        if let Some(spec) = override_spec {
-            return self.execute_action(session, &spec, &params, Some(inbox_id));
-        }
-        let rec = self.persist_decision(
-            session,
-            "override_setpoint",
-            Some(&session.actor.id),
-            Verdict::Allow,
-            &params,
-            &[GuardResult {
-                name: "override".into(),
-                verdict: Verdict::Allow,
-                reason: format!("{category}: {reason}"),
-            }],
-            json!({ "inbox": inbox_id }),
-            &DataSnapshot {
-                objects: vec![],
-                rule_version: "override_setpoint".into(),
-                function_version: functions::digest(&[]),
-                engine_version: ENGINE_VERSION.into(),
-            },
-            &[WritePathStep::Submit, WritePathStep::SealDecisionRecord],
-        )?;
-        Ok(ActionOutcome {
-            verdict: Verdict::Allow,
-            reason: format!("overridden: {category}"),
-            decision_record_id: Some(rec),
-            inbox_id: Some(inbox_id.into()),
-            created_ids: vec![],
-            alternative: None,
-            guard_results: vec![],
-        })
+        let spec = self.load_action_type(MAIN_BRANCH, "override_setpoint")?;
+        self.execute_action(session, &spec, &params, Some(inbox_id))
     }
 
     /// T4 unsupervised auto. Bound starts empty, so every claim is denied.
@@ -1044,7 +1071,9 @@ impl Engine {
 
     pub fn get_decision_record(&self, session: &Session, id: &str) -> Result<DecisionRecordView> {
         Self::require_consumer(session)?;
-        self.store.load_decision(id)
+        let mut rec = self.store.load_decision(id)?;
+        self.redact_snapshot(session, &mut rec.data_snapshot)?;
+        Ok(rec)
     }
 
     pub fn get_rejection(&self, session: &Session, decision_id: &str) -> Result<Value> {
@@ -1064,11 +1093,19 @@ impl Engine {
         params: &Value,
         confirmer_inbox: Option<&str>,
     ) -> Result<ActionOutcome> {
-        let key = resolve_idempotency_key(&spec.name, &session.actor.id, params);
-        if let Some(cached) = self.load_cached_outcome(&key)? {
-            return Ok(cached);
+        match spec.mode {
+            ExecutionMode::Approve if confirmer_inbox.is_none() => {
+                return Err(OntoError::Denied(format!(
+                    "action {} requires a pending proposal",
+                    spec.name
+                )));
+            }
+            ExecutionMode::Propose
+            | ExecutionMode::Auto
+            | ExecutionMode::Shadow
+            | ExecutionMode::Approve => {}
         }
-
+        let key = resolve_idempotency_key(&spec.name, &session.actor.id, params);
         let path = WritePath::begin(key.clone());
         match self.check_param_and_permission(session, spec, params) {
             Err(e) => Err(e),
@@ -1084,6 +1121,9 @@ impl Engine {
                 self.finish_abort(session, spec, params, &path, auth.reason, None)
             }
             Ok(Ok(param_reads)) => {
+                if let Some(cached) = self.load_cached_outcome(&key)? {
+                    return Ok(cached);
+                }
                 let path = path.param_and_permission(param_reads);
                 let (mut guards, guard_reads) = self.evaluate_guards(&spec.guards, params)?;
                 guards.extend(self.evidenced_guards(spec, params)?);
@@ -1135,6 +1175,16 @@ impl Engine {
             }
         }
         self.validate_params(spec, params)?;
+        match self.authorize_effect_writes(session, spec, params) {
+            Ok(()) => {}
+            Err(OntoError::Denied(reason)) => {
+                return Ok(Err(AuthFail {
+                    name: "authorization".into(),
+                    reason,
+                }));
+            }
+            Err(e) => return Err(e),
+        }
         let mut reads = Vec::new();
         for p in &spec.parameters {
             if p.object_type.is_some() {
@@ -1165,17 +1215,7 @@ impl Engine {
             Verdict::Review => json!({ "alternative": spec.on_review }),
             Verdict::Deny | Verdict::Allow => json!({}),
         };
-        let rec = self.persist_decision(
-            session,
-            &spec.name,
-            confirmer,
-            path.verdict,
-            params,
-            &path.guards,
-            effects,
-            &snapshot,
-            &path.trace,
-        )?;
+        let rec = new_id();
         let outcome = ActionOutcome {
             verdict: path.verdict,
             reason,
@@ -1185,7 +1225,30 @@ impl Engine {
             alternative,
             guard_results: path.guards.clone(),
         };
-        self.store_idempotency(&path.idempotency_key, &spec.name, &rec, &outcome)?;
+        let outcome_json = serde_json::to_string(&outcome)?;
+        self.store.commit_decision(&DecisionCommit {
+            ops: &[],
+            decision: DecisionWrite {
+                id: &rec,
+                action: &spec.name,
+                actor: &session.actor.id,
+                confirmer,
+                verdict: path.verdict,
+                params,
+                guards: &path.guards,
+                effects: &effects,
+                snapshot: &snapshot,
+                trace: &path.trace,
+                at: self.now(),
+            },
+            idempotency_key: Some(&path.idempotency_key),
+            idempotency_outcome: Some(&outcome_json),
+            audit_id: None,
+            audit_actor: None,
+            audit_kind: None,
+            audit_payload: None,
+            effect_declaration: None,
+        })?;
         Ok(outcome)
     }
 
@@ -1199,7 +1262,18 @@ impl Engine {
     ) -> Result<ActionOutcome> {
         let (staged, inbox_id) = self.build_stage(session, spec, params, confirmer_inbox)?;
         let path = path.stage(staged);
-        let created = self.commit_staged(&path.staged)?;
+        let created: Vec<String> = path
+            .staged
+            .iter()
+            .filter_map(|op| match op {
+                StagedOp::InsertObject { id, .. } => Some(id.clone()),
+                StagedOp::UpdateObject { .. }
+                | StagedOp::InsertLink { .. }
+                | StagedOp::InsertInbox { .. }
+                | StagedOp::ConfirmInbox { .. }
+                | StagedOp::CloseLink { .. } => None,
+            })
+            .collect();
         let path = path.commit(created.clone());
         let path = path.seal();
 
@@ -1227,17 +1301,7 @@ impl Engine {
             effects["inbox"] = json!(iid);
             effects["mode"] = json!(spec.mode);
         }
-        let rec = self.persist_decision(
-            session,
-            &spec.name,
-            confirmer,
-            Verdict::Allow,
-            params,
-            &path.guards,
-            effects,
-            &snapshot,
-            &path.trace,
-        )?;
+        let rec = new_id();
         let reason = match spec.mode {
             ExecutionMode::Propose | ExecutionMode::Shadow => "proposed",
             ExecutionMode::Auto | ExecutionMode::Approve => "committed",
@@ -1247,21 +1311,44 @@ impl Engine {
             reason: reason.into(),
             decision_record_id: Some(rec.clone()),
             inbox_id,
-            created_ids: created,
+            created_ids: created.clone(),
             alternative: None,
             guard_results: path.guards.clone(),
         };
-        self.store_idempotency(&path.idempotency_key, &spec.name, &rec, &outcome)?;
-        self.audit(
-            &session.actor.id,
-            "side_effect",
-            &json!({
-                "idempotency_key": path.idempotency_key,
-                "action": spec.name,
-                "declaration": spec.side_effects,
-                "decision_record_id": rec,
-            }),
-        )?;
+        let audit_id = new_id();
+        let audit_payload = json!({
+            "idempotency_key": path.idempotency_key,
+            "action": spec.name,
+            "declaration": spec.side_effects,
+            "decision_record_id": rec,
+            "effect_status": "declared",
+        })
+        .to_string();
+        let outcome_json = serde_json::to_string(&outcome)?;
+        let declaration = declaration.to_string();
+        self.store.commit_decision(&DecisionCommit {
+            ops: &path.staged,
+            decision: DecisionWrite {
+                id: &rec,
+                action: &spec.name,
+                actor: &session.actor.id,
+                confirmer,
+                verdict: Verdict::Allow,
+                params,
+                guards: &path.guards,
+                effects: &effects,
+                snapshot: &snapshot,
+                trace: &path.trace,
+                at: self.now(),
+            },
+            idempotency_key: Some(&path.idempotency_key),
+            idempotency_outcome: Some(&outcome_json),
+            audit_id: Some(&audit_id),
+            audit_actor: Some(session.actor.id.as_str()),
+            audit_kind: Some("side_effect"),
+            audit_payload: Some(&audit_payload),
+            effect_declaration: Some(&declaration),
+        })?;
         let _: WritePath<crate::write_path::DeclareSideEffects> = path;
         Ok(outcome)
     }
@@ -1279,6 +1366,8 @@ impl Engine {
                     return Ok((Vec::new(), None));
                 }
                 let inbox_id = new_id();
+                let apply_action = apply_action_name(&spec.name);
+                let rule_pin = self.pin_apply_action(&apply_action, spec);
                 Ok((
                     vec![StagedOp::InsertInbox {
                         id: inbox_id.clone(),
@@ -1286,6 +1375,9 @@ impl Engine {
                         proposed_by: session.actor.id.clone(),
                         params: params.to_string(),
                         created_at: self.now(),
+                        status: "pending".into(),
+                        rule_pin,
+                        apply_action,
                     }],
                     Some(inbox_id),
                 ))
@@ -1299,6 +1391,9 @@ impl Engine {
                         proposed_by: session.actor.id.clone(),
                         params: params.to_string(),
                         created_at: self.now(),
+                        status: "shadow".into(),
+                        rule_pin: rule_version(spec),
+                        apply_action: spec.name.clone(),
                     }],
                     Some(inbox_id),
                 ))
@@ -1356,8 +1451,14 @@ impl Engine {
                 }
                 continue;
             };
-            if let Some(vt) = self.load_value_type(MAIN_BRANCH, &p.value_type)? {
-                if vt.base == "number" {
+            let Some(vt) = self.load_value_type(MAIN_BRANCH, &p.value_type)? else {
+                return Err(OntoError::Invalid(format!(
+                    "unknown value type {}",
+                    p.value_type
+                )));
+            };
+            match vt.base.as_str() {
+                "number" => {
                     let n = val.as_f64().ok_or_else(|| {
                         OntoError::Invalid(format!("{} must be a number", p.name))
                     })?;
@@ -1371,6 +1472,16 @@ impl Engine {
                             return Err(OntoError::Invalid(format!("{} above {}", p.name, max)));
                         }
                     }
+                }
+                "string" => {
+                    if !val.is_string() {
+                        return Err(OntoError::Invalid(format!("{} must be a string", p.name)));
+                    }
+                }
+                other => {
+                    return Err(OntoError::Invalid(format!(
+                        "unsupported value type base {other}"
+                    )));
                 }
             }
             if let Some(ot) = &p.object_type {
@@ -1394,193 +1505,17 @@ impl Engine {
         guards: &Value,
         params: &Value,
     ) -> Result<(Vec<GuardResult>, Vec<SnapshotObject>)> {
-        let mut reads = Vec::new();
-        if guards.is_null() || guards == &json!({}) {
-            return Ok((
-                vec![GuardResult {
-                    name: "empty".into(),
-                    verdict: Verdict::Allow,
-                    reason: "no guards".into(),
-                }],
-                reads,
-            ));
-        }
-        let Some(arr) = guards.as_array() else {
-            return Ok((
-                vec![self.eval_one_guard(guards, params, &mut reads)?],
-                reads,
-            ));
-        };
-        let mut out = Vec::new();
-        for g in arr {
-            out.push(self.eval_one_guard(g, params, &mut reads)?);
-        }
-        Ok((out, reads))
-    }
-
-    #[allow(clippy::too_many_lines)] // closed JSON guard interpreter; arms stay one function
-    fn eval_one_guard(
-        &self,
-        guard: &Value,
-        params: &Value,
-        reads: &mut Vec<SnapshotObject>,
-    ) -> Result<GuardResult> {
-        let obj = guard
-            .as_object()
-            .ok_or_else(|| OntoError::Invalid("guard must be object".into()))?;
-        if let Some(name) = obj.get("freshness").and_then(Value::as_str) {
-            let max = obj
-                .get("max_age_secs")
-                .and_then(Value::as_i64)
-                .unwrap_or(300);
-            let id = param_str(params, name)?;
-            let view = self.read_for_guard(&id, reads)?;
-            let as_of = view
-                .properties
-                .get("last_reading_at")
-                .or_else(|| view.properties.get("observed_at"))
-                .and_then(|p| {
-                    p.as_of
-                        .clone()
-                        .or_else(|| p.value.as_str().map(str::to_string))
-                        .or_else(|| p.value.as_i64().map(|n| n.to_string()))
-                });
-            let Some(as_of) = as_of else {
-                return Ok(GuardResult {
-                    name: "freshness".into(),
-                    verdict: Verdict::Review,
-                    reason: format!("no freshness stamp on {name} (Complete fail)"),
-                });
-            };
-            let ts = as_of.parse::<i64>().unwrap_or(0);
-            if self.now() - ts > max {
-                return Ok(GuardResult {
-                    name: "freshness".into(),
-                    verdict: Verdict::Review,
-                    reason: format!(
-                        "stale {name}: age {}s > {max}s (Current fail)",
-                        self.now() - ts
-                    ),
-                });
-            }
-            return Ok(GuardResult {
-                name: "freshness".into(),
-                verdict: Verdict::Allow,
-                reason: "fresh".into(),
-            });
-        }
-        if let Some(field) = obj.get("exists_field") {
-            let object_param = obj
-                .get("object")
-                .and_then(Value::as_str)
-                .ok_or_else(|| OntoError::Invalid("exists_field needs object".into()))?;
-            let field = field.as_str().unwrap_or("");
-            let id = param_str(params, object_param)?;
-            let view = self.read_for_guard(&id, reads)?;
-            if !view.properties.contains_key(field) {
-                return Ok(GuardResult {
-                    name: "complete".into(),
-                    verdict: Verdict::Review,
-                    reason: format!("missing {field} on {object_param} (Complete fail)"),
-                });
-            }
-            return Ok(GuardResult {
-                name: "complete".into(),
-                verdict: Verdict::Allow,
-                reason: "present".into(),
-            });
-        }
-        if let Some(param) = obj.get("lte_field").and_then(Value::as_str) {
-            let object_param = obj
-                .get("object")
-                .and_then(Value::as_str)
-                .unwrap_or("permit");
-            let field = obj.get("field").and_then(Value::as_str).unwrap_or("do_max");
-            let n = param_f64(params, param)?;
-            let permit_id = param_str(params, object_param)?;
-            let view = self.read_for_guard(&permit_id, reads)?;
-            let bound = view
-                .properties
-                .get(field)
-                .and_then(|p| p.value.as_f64())
-                .unwrap_or(f64::MAX);
-            if n > bound {
-                return Ok(GuardResult {
-                    name: "permit_limit".into(),
-                    verdict: Verdict::Deny,
-                    reason: format!("{param}={n} exceeds {field}={bound}"),
-                });
-            }
-            return Ok(GuardResult {
-                name: "permit_limit".into(),
-                verdict: Verdict::Allow,
-                reason: "within permit".into(),
-            });
-        }
-        if let Some(max) = obj.get("lte").and_then(Value::as_f64) {
-            let param = obj
-                .get("param")
-                .and_then(Value::as_str)
-                .unwrap_or("target_do");
-            let n = param_f64(params, param)?;
-            if n > max {
-                return Ok(GuardResult {
-                    name: "lte".into(),
-                    verdict: Verdict::Deny,
-                    reason: format!("{param}={n} > {max}"),
-                });
-            }
-            return Ok(GuardResult {
-                name: "lte".into(),
-                verdict: Verdict::Allow,
-                reason: "ok".into(),
-            });
-        }
-        if let Some(days) = obj
-            .get("max_days_since_calibration")
-            .and_then(Value::as_i64)
-        {
-            let object_param = obj
-                .get("object")
-                .and_then(Value::as_str)
-                .unwrap_or("sensor");
-            let id = param_str(params, object_param)?;
-            let view = self.read_for_guard(&id, reads)?;
-            let cal = view
-                .properties
-                .get("calibration_date")
-                .and_then(|p| p.value.as_i64().or_else(|| p.value.as_str()?.parse().ok()))
-                .unwrap_or(0);
-            let elapsed = (self.now() - cal) / 86_400;
-            if elapsed > days {
-                return Ok(GuardResult {
-                    name: "calibration".into(),
-                    verdict: Verdict::Review,
-                    reason: format!("sensor calibration is {elapsed} days old"),
-                });
-            }
-            return Ok(GuardResult {
-                name: "calibration".into(),
-                verdict: Verdict::Allow,
-                reason: "calibrated".into(),
-            });
-        }
-        Ok(GuardResult {
-            name: "unknown".into(),
-            verdict: Verdict::Allow,
-            reason: "unrecognized guard treated as pass".into(),
+        let parsed = guards::parse_guards(guards)?;
+        guards::evaluate(&parsed, params, self.now(), |id| {
+            self.load_object_view(id, AsOf::Current)
         })
     }
 
-    fn read_for_guard(&self, id: &str, reads: &mut Vec<SnapshotObject>) -> Result<ObjectView> {
-        let view = self.load_object_view(id, AsOf::Current)?;
-        reads.push(snapshot_from_view(&view));
-        Ok(view)
-    }
-
+    #[allow(clippy::too_many_lines)] // create/update/link/close_link stay one write-set builder
     fn stage_effects(&self, effects: &Value, params: &Value, actor: &str) -> Result<Vec<StagedOp>> {
         let mut staged = Vec::new();
         let mut created = Vec::new();
+        let mut pending: BTreeMap<String, BTreeMap<String, PropertyView>> = BTreeMap::new();
         let Some(arr) = effects.as_array() else {
             return Ok(staged);
         };
@@ -1589,6 +1524,11 @@ impl Engine {
                 .as_object()
                 .ok_or_else(|| OntoError::Invalid("effect must be object".into()))?;
             if let Some(type_name) = obj.get("create").and_then(Value::as_str) {
+                if self.load_object_type(MAIN_BRANCH, type_name).is_err() {
+                    return Err(OntoError::Invalid(format!(
+                        "cannot create unknown type {type_name}"
+                    )));
+                }
                 let mut props = BTreeMap::new();
                 if let Some(fields) = obj.get("properties").and_then(Value::as_object) {
                     for (k, v) in fields {
@@ -1609,6 +1549,7 @@ impl Engine {
                     .get("title")
                     .or_else(|| props.get("name"))
                     .and_then(|p| p.value.as_str().map(str::to_string));
+                pending.insert(id.clone(), props.clone());
                 staged.push(StagedOp::InsertObject {
                     id: id.clone(),
                     type_name: type_name.into(),
@@ -1620,7 +1561,9 @@ impl Engine {
             }
             if let Some(target_param) = obj.get("update").and_then(Value::as_str) {
                 let id = param_str(params, target_param)?;
-                let mut view_props = {
+                let mut view_props = if let Some(existing) = pending.get(&id) {
+                    existing.clone()
+                } else {
                     let raw = self.store.current_properties(&id)?;
                     serde_json::from_str::<BTreeMap<String, PropertyView>>(&raw)?
                 };
@@ -1638,6 +1581,11 @@ impl Engine {
                         );
                     }
                 }
+                pending.insert(id.clone(), view_props.clone());
+                staged.retain(|op| match op {
+                    StagedOp::UpdateObject { id: sid, .. } => sid != &id,
+                    _ => true,
+                });
                 staged.push(StagedOp::UpdateObject {
                     id,
                     properties: serde_json::to_string(&view_props)?,
@@ -1661,6 +1609,7 @@ impl Engine {
                 } else {
                     return Err(OntoError::Invalid("link effect needs to".into()));
                 };
+                self.validate_link(&link, &from, &to, &created)?;
                 staged.push(StagedOp::InsertLink {
                     id: new_id(),
                     type_name: link,
@@ -1668,58 +1617,32 @@ impl Engine {
                     to_id: to,
                 });
             }
+            if let Some(link) = obj.get("close_link") {
+                let type_name = match resolve_value(link, params) {
+                    Value::String(s) if !s.is_empty() => s,
+                    _ => {
+                        return Err(OntoError::Invalid(
+                            "close_link effect needs a link type".into(),
+                        ));
+                    }
+                };
+                let from = param_str(
+                    params,
+                    obj.get("from").and_then(Value::as_str).unwrap_or("from"),
+                )?;
+                let to_id = obj
+                    .get("to")
+                    .and_then(Value::as_str)
+                    .map(|name| param_str(params, name))
+                    .transpose()?;
+                staged.push(StagedOp::CloseLink {
+                    type_name,
+                    from_id: from,
+                    to_id,
+                });
+            }
         }
         Ok(staged)
-    }
-
-    fn commit_staged(&self, ops: &[StagedOp]) -> Result<Vec<String>> {
-        self.store.commit_staged(ops, self.now())
-    }
-
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)] // DecisionRecord columns
-    fn persist_decision(
-        &self,
-        session: &Session,
-        action: &str,
-        confirmer: Option<&str>,
-        verdict: Verdict,
-        params: &Value,
-        guards: &[GuardResult],
-        effects: Value,
-        snapshot: &DataSnapshot,
-        trace: &[WritePathStep],
-    ) -> Result<String> {
-        let id = new_id();
-        self.store.insert_decision(&DecisionWrite {
-            id: &id,
-            action,
-            actor: &session.actor.id,
-            confirmer,
-            verdict,
-            params,
-            guards,
-            effects: &effects,
-            snapshot,
-            trace,
-            at: self.now(),
-        })?;
-        Ok(id)
-    }
-
-    fn store_idempotency(
-        &self,
-        key: &str,
-        action: &str,
-        rec_id: &str,
-        outcome: &ActionOutcome,
-    ) -> Result<()> {
-        self.store.put_idempotency(
-            key,
-            rec_id,
-            action,
-            &serde_json::to_string(outcome)?,
-            self.now(),
-        )
     }
 
     fn load_cached_outcome(&self, key: &str) -> Result<Option<ActionOutcome>> {
@@ -1729,6 +1652,99 @@ impl Engine {
             .map(|s| serde_json::from_str(&s))
             .transpose()?)
     }
+
+    fn pin_apply_action(&self, apply_name: &str, propose: &ActionTypeSpec) -> String {
+        self.load_action_type(MAIN_BRANCH, apply_name)
+            .map_or_else(|_| rule_version(propose), |spec| rule_version(&spec))
+    }
+
+    fn authorize_effect_writes(
+        &self,
+        session: &Session,
+        spec: &ActionTypeSpec,
+        params: &Value,
+    ) -> Result<()> {
+        let Some(arr) = spec.effects.as_array() else {
+            return Ok(());
+        };
+        for effect in arr {
+            if let Some(target) = effect.get("update").and_then(Value::as_str) {
+                let id = param_str(params, target)?;
+                let type_name = self.store.object_type_of(&id)?;
+                self.require_write(session, &type_name, &id)?;
+            }
+            if let Some(type_name) = effect.get("create").and_then(Value::as_str) {
+                self.require_write(session, type_name, "*")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_link(&self, link: &str, from: &str, to: &str, created: &[String]) -> Result<()> {
+        let spec = self.load_named("schema_link_types", MAIN_BRANCH, link, || {
+            format!("link type {link}")
+        })?;
+        let spec: LinkTypeSpec = spec;
+        let from_ok = created.iter().any(|id| id == from) || self.store.identity_exists(from)?;
+        let to_ok = created.iter().any(|id| id == to) || self.store.identity_exists(to)?;
+        if !from_ok || !to_ok {
+            return Err(OntoError::Invalid(format!(
+                "link {link} endpoints must exist"
+            )));
+        }
+        if !created.iter().any(|id| id == from) {
+            let from_type = self.store.object_type_of(from)?;
+            if from_type != spec.from_type {
+                return Err(OntoError::Invalid(format!(
+                    "link {link} from must be {}",
+                    spec.from_type
+                )));
+            }
+        }
+        if !created.iter().any(|id| id == to) {
+            let to_type = self.store.object_type_of(to)?;
+            if to_type != spec.to_type {
+                return Err(OntoError::Invalid(format!(
+                    "link {link} to must be {}",
+                    spec.to_type
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn redact_snapshot(&self, session: &Session, snapshot: &mut Value) -> Result<()> {
+        let grants = self.load_policies()?;
+        let Some(objects) = snapshot.get_mut("objects").and_then(Value::as_array_mut) else {
+            return Ok(());
+        };
+        for obj in objects {
+            let id = obj
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let type_name = obj
+                .get("type_name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if let Some(props) = obj.get_mut("properties").and_then(Value::as_object_mut) {
+                props.retain(|name, _| {
+                    authorize(
+                        &grants,
+                        session,
+                        AuthzOp::Read,
+                        Some(&type_name),
+                        Some(&id),
+                        Some(name),
+                    )
+                    .is_allow()
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 struct AuthFail {
@@ -1736,20 +1752,24 @@ struct AuthFail {
     reason: String,
 }
 
-fn snapshot_from_view(view: &ObjectView) -> SnapshotObject {
-    SnapshotObject {
-        id: view.id.clone(),
-        type_name: view.type_name.clone(),
-        properties: view
-            .properties
-            .iter()
-            .map(|(k, p)| (k.clone(), p.value.clone()))
-            .collect(),
+fn rule_version(spec: &ActionTypeSpec) -> String {
+    pin_version(&spec.name, &serde_json::to_string(spec).unwrap_or_default())
+}
+
+fn apply_action_name(propose_name: &str) -> String {
+    if let Some(rest) = propose_name.strip_prefix("propose_") {
+        format!("approve_{rest}")
+    } else {
+        propose_name.to_string()
     }
 }
 
-fn rule_version(spec: &ActionTypeSpec) -> String {
-    pin_version(&spec.name, &serde_json::to_string(spec).unwrap_or_default())
+fn apply_action_name_from_row(row: &InboxRow) -> String {
+    if row.apply_action.is_empty() {
+        apply_action_name(&row.action_name)
+    } else {
+        row.apply_action.clone()
+    }
 }
 
 fn param_str(params: &Value, name: &str) -> Result<String> {
@@ -1758,13 +1778,6 @@ fn param_str(params: &Value, name: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| OntoError::Invalid(format!("param {name} must be a string id")))
-}
-
-fn param_f64(params: &Value, name: &str) -> Result<f64> {
-    params
-        .get(name)
-        .and_then(Value::as_f64)
-        .ok_or_else(|| OntoError::Invalid(format!("param {name} must be a number")))
 }
 
 fn resolve_value(v: &Value, params: &Value) -> Value {
@@ -1864,6 +1877,10 @@ fn consumer_base_tools() -> Vec<ToolSpec> {
             "auto_action",
             "T4 auto inside a declared bound {action_type × object_set × risk_band}",
         ),
+        (
+            "compensate_action",
+            "Submit the named inverse Action of an Allow DecisionRecord",
+        ),
     ]
     .into_iter()
     .map(|(name, description)| ToolSpec {
@@ -1878,7 +1895,10 @@ fn action_to_tool(action: &ActionTypeSpec) -> ToolSpec {
     let mut properties = serde_json::Map::new();
     let mut required = Vec::new();
     for p in &action.parameters {
-        properties.insert(p.name.clone(), json!({ "type": p.value_type }));
+        properties.insert(
+            p.name.clone(),
+            json!({ "type": guards::json_schema_type(&p.value_type) }),
+        );
         if p.required {
             required.push(p.name.clone());
         }

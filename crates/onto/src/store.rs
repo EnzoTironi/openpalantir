@@ -5,14 +5,15 @@
 //! `write_path`, OSS, or functions. No public method here takes a rusqlite type.
 
 use crate::bitemporal::{self, AsOf, LoadedVersion, VersionSpan};
+use crate::decision::EffectStatus;
 use crate::error::{OntoError, Result};
 use crate::oss::OBJECT_SETS_TABLE;
 use crate::security::POLICIES_TABLE;
 use crate::types::{
     DataSnapshot, DecisionRecordView, GuardResult, InboxItem, Verdict, WritePathStep, MAIN_BRANCH,
 };
-use crate::write_path::StagedOp;
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::write_path::{pin_version, StagedOp};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::Value;
 use std::sync::{Mutex, MutexGuard};
 
@@ -33,7 +34,8 @@ const OMS_SCHEMA: &str = r"
                 name TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
                 created_by TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                base_revision TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS schema_value_types (
                 branch TEXT NOT NULL,
@@ -108,7 +110,9 @@ const OMS_SCHEMA: &str = r"
                 proposed_by TEXT NOT NULL,
                 params TEXT NOT NULL,
                 status TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                rule_pin TEXT NOT NULL DEFAULT '',
+                apply_action TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS decision_records (
                 id TEXT PRIMARY KEY,
@@ -140,6 +144,12 @@ const OMS_SCHEMA: &str = r"
                 kind TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS effect_intentions (
+                decision_record_id TEXT PRIMARY KEY,
+                declaration TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
             ";
 
 /// Persistence operations. One impl now: [`SqliteStore`].
@@ -148,10 +158,19 @@ pub trait Store: Send + Sync {
     fn insert_audit(&self, id: &str, at: i64, actor: &str, kind: &str, payload: &str)
         -> Result<()>;
     fn branch_status(&self, name: &str) -> Result<Option<String>>;
-    fn insert_open_branch(&self, name: &str, created_by: &str, at: i64) -> Result<()>;
+    fn insert_open_branch(
+        &self,
+        name: &str,
+        created_by: &str,
+        at: i64,
+        base_revision: &str,
+    ) -> Result<()>;
     fn set_branch_status(&self, name: &str, status: &str) -> Result<()>;
     fn copy_schema(&self, from: &str, to: &str) -> Result<()>;
     fn replace_main_schema(&self, from: &str) -> Result<()>;
+    fn replace_main_schema_if_base(&self, from: &str, expected_base: &str) -> Result<()>;
+    fn schema_revision(&self, branch: &str) -> Result<String>;
+    fn branch_base_revision(&self, name: &str) -> Result<Option<String>>;
     fn put_spec(&self, table: &str, branch: &str, name: &str, spec: &str) -> Result<()>;
     fn delete_spec(&self, table: &str, branch: &str, name: &str) -> Result<()>;
     fn load_specs(&self, branch: &str, table: &str) -> Result<Vec<String>>;
@@ -181,7 +200,7 @@ pub trait Store: Send + Sync {
     ) -> Result<String>;
     fn link_targets(&self, from_id: &str, link_type: &str) -> Result<Vec<String>>;
     fn list_inbox(&self) -> Result<Vec<InboxItem>>;
-    fn load_inbox(&self, id: &str) -> Result<(String, String, String, String)>;
+    fn load_inbox(&self, id: &str) -> Result<InboxRow>;
     fn set_inbox_status(&self, id: &str, status: &str) -> Result<()>;
     fn insert_decision(&self, rec: &DecisionWrite<'_>) -> Result<()>;
     fn load_decision(&self, id: &str) -> Result<DecisionRecordView>;
@@ -195,6 +214,49 @@ pub trait Store: Send + Sync {
     ) -> Result<()>;
     fn get_idempotency(&self, key: &str) -> Result<Option<String>>;
     fn commit_staged(&self, ops: &[StagedOp], at: i64) -> Result<Vec<String>>;
+    fn commit_decision(&self, unit: &DecisionCommit<'_>) -> Result<Vec<String>>;
+    fn append_version_recorded(
+        &self,
+        id: &str,
+        properties: &str,
+        title: Option<&str>,
+        valid_at: i64,
+        tx_at: i64,
+    ) -> Result<String>;
+    fn insert_object_recorded(
+        &self,
+        id: &str,
+        type_name: &str,
+        title: Option<&str>,
+        properties: &str,
+        valid_at: i64,
+        tx_at: i64,
+    ) -> Result<()>;
+    fn object_type_of(&self, id: &str) -> Result<String>;
+}
+
+/// Inbox row including the pinned apply Action and rule digest.
+#[derive(Debug, Clone)]
+pub struct InboxRow {
+    pub action_name: String,
+    pub params: String,
+    pub status: String,
+    pub proposed_by: String,
+    pub rule_pin: String,
+    pub apply_action: String,
+}
+
+/// One transactional decision: write-set, dossier, idempotency, intention.
+pub struct DecisionCommit<'a> {
+    pub ops: &'a [StagedOp],
+    pub decision: DecisionWrite<'a>,
+    pub idempotency_key: Option<&'a str>,
+    pub idempotency_outcome: Option<&'a str>,
+    pub audit_id: Option<&'a str>,
+    pub audit_actor: Option<&'a str>,
+    pub audit_kind: Option<&'a str>,
+    pub audit_payload: Option<&'a str>,
+    pub effect_declaration: Option<&'a str>,
 }
 
 /// Columns for one `DecisionRecord` insert. Not a service layer.
@@ -250,6 +312,164 @@ fn schema_table(table: &str) -> Result<&str> {
         .ok_or_else(|| OntoError::Invalid(format!("unknown schema table {table}")))
 }
 
+fn schema_revision_on(db: &Connection, branch: &str) -> Result<String> {
+    let mut body = String::new();
+    for table in SCHEMA_TABLES {
+        let mut stmt = db.prepare(&format!(
+            "SELECT name, spec FROM {table} WHERE branch = ?1 ORDER BY name"
+        ))?;
+        let rows = stmt.query_map(params![branch], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (name, spec) = row?;
+            body.push_str(table);
+            body.push('\n');
+            body.push_str(&name);
+            body.push('\n');
+            body.push_str(&spec);
+            body.push('\n');
+        }
+    }
+    Ok(pin_version(branch, &body))
+}
+
+fn copy_branch_over_main(tx: &Transaction<'_>, from: &str) -> Result<()> {
+    for table in SCHEMA_TABLES {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE branch = ?1"),
+            params![MAIN_BRANCH],
+        )?;
+        tx.execute(
+            &format!(
+                "INSERT INTO {table}(branch, name, spec)
+                 SELECT ?1, name, spec FROM {table} WHERE branch = ?2"
+            ),
+            params![MAIN_BRANCH, from],
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_staged(tx: &Transaction<'_>, ops: &[StagedOp], at: i64) -> Result<Vec<String>> {
+    let mut created = Vec::new();
+    for op in ops {
+        match op {
+            StagedOp::InsertObject {
+                id,
+                type_name,
+                title,
+                properties,
+                created_at,
+            } => {
+                bitemporal::insert_object(
+                    tx,
+                    id,
+                    type_name,
+                    title.as_deref(),
+                    properties,
+                    *created_at,
+                )?;
+                created.push(id.clone());
+            }
+            StagedOp::UpdateObject { id, properties } => {
+                bitemporal::append_version(tx, id, properties, None, at)?;
+            }
+            StagedOp::InsertLink {
+                id,
+                type_name,
+                from_id,
+                to_id,
+            } => {
+                tx.execute(
+                    "INSERT INTO links(id, type_name, from_id, to_id) VALUES (?1, ?2, ?3, ?4)",
+                    params![id, type_name, from_id, to_id],
+                )?;
+            }
+            StagedOp::InsertInbox {
+                id,
+                action_name,
+                proposed_by,
+                params: inbox_params,
+                created_at,
+                status,
+                rule_pin,
+                apply_action,
+            } => {
+                tx.execute(
+                    "INSERT INTO inbox(id, action_name, proposed_by, params, status, created_at, rule_pin, apply_action)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        id,
+                        action_name,
+                        proposed_by,
+                        inbox_params,
+                        status,
+                        created_at,
+                        rule_pin,
+                        apply_action
+                    ],
+                )?;
+            }
+            StagedOp::ConfirmInbox { id } => {
+                let n = tx.execute(
+                    "UPDATE inbox SET status = 'confirmed' WHERE id = ?1 AND status = 'pending'",
+                    params![id],
+                )?;
+                if n != 1 {
+                    return Err(OntoError::Conflict(format!(
+                        "inbox {id} is not exclusively pending"
+                    )));
+                }
+            }
+            StagedOp::CloseLink {
+                type_name,
+                from_id,
+                to_id,
+            } => {
+                if let Some(to) = to_id {
+                    tx.execute(
+                        "DELETE FROM links WHERE type_name = ?1 AND from_id = ?2 AND to_id = ?3",
+                        params![type_name, from_id, to],
+                    )?;
+                } else {
+                    tx.execute(
+                        "DELETE FROM links WHERE type_name = ?1 AND from_id = ?2",
+                        params![type_name, from_id],
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(created)
+}
+
+fn insert_decision_on(tx: &Transaction<'_>, rec: &DecisionWrite<'_>) -> Result<()> {
+    tx.execute(
+        "INSERT INTO decision_records(
+            id, action_name, actor, confirmer, verdict, params, guard_results, effects,
+            rule_version, function_version, engine_version, data_snapshot, proof_trace, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            rec.id,
+            rec.action,
+            rec.actor,
+            rec.confirmer,
+            rec.verdict.as_stored(),
+            rec.params.to_string(),
+            serde_json::to_string(rec.guards)?,
+            rec.effects.to_string(),
+            rec.snapshot.rule_version,
+            rec.snapshot.function_version,
+            rec.snapshot.engine_version,
+            serde_json::to_string(rec.snapshot)?,
+            serde_json::to_string(rec.trace)?,
+            rec.at
+        ],
+    )?;
+    Ok(())
+}
+
 impl Store for SqliteStore {
     fn init(&self) -> Result<()> {
         let db = self.conn()?;
@@ -257,6 +477,18 @@ impl Store for SqliteStore {
         db.execute_batch(bitemporal::SCHEMA)?;
         let _ = db.execute(
             "ALTER TABLE decision_records ADD COLUMN proof_trace TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = db.execute(
+            "ALTER TABLE branches ADD COLUMN base_revision TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = db.execute(
+            "ALTER TABLE inbox ADD COLUMN rule_pin TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = db.execute(
+            "ALTER TABLE inbox ADD COLUMN apply_action TEXT NOT NULL DEFAULT ''",
             [],
         );
         db.execute(
@@ -293,10 +525,17 @@ impl Store for SqliteStore {
             .optional()?)
     }
 
-    fn insert_open_branch(&self, name: &str, created_by: &str, at: i64) -> Result<()> {
+    fn insert_open_branch(
+        &self,
+        name: &str,
+        created_by: &str,
+        at: i64,
+        base_revision: &str,
+    ) -> Result<()> {
         self.conn()?.execute(
-            "INSERT INTO branches(name, status, created_by, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![name, "open", created_by, at],
+            "INSERT INTO branches(name, status, created_by, created_at, base_revision)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, "open", created_by, at, base_revision],
         )?;
         Ok(())
     }
@@ -324,21 +563,41 @@ impl Store for SqliteStore {
     }
 
     fn replace_main_schema(&self, from: &str) -> Result<()> {
-        let db = self.conn()?;
-        for table in SCHEMA_TABLES {
-            db.execute(
-                &format!("DELETE FROM {table} WHERE branch = ?1"),
-                params![MAIN_BRANCH],
-            )?;
-            db.execute(
-                &format!(
-                    "INSERT INTO {table}(branch, name, spec)
-                     SELECT ?1, name, spec FROM {table} WHERE branch = ?2"
-                ),
-                params![MAIN_BRANCH, from],
-            )?;
-        }
+        let mut db = self.conn()?;
+        let tx = db.transaction()?;
+        copy_branch_over_main(&tx, from)?;
+        tx.commit()?;
         Ok(())
+    }
+
+    fn replace_main_schema_if_base(&self, from: &str, expected_base: &str) -> Result<()> {
+        let mut db = self.conn()?;
+        let tx = db.transaction()?;
+        let current = schema_revision_on(&tx, MAIN_BRANCH)?;
+        if current != expected_base {
+            return Err(OntoError::Conflict(
+                "stale branch: main changed since this branch was opened".into(),
+            ));
+        }
+        copy_branch_over_main(&tx, from)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn schema_revision(&self, branch: &str) -> Result<String> {
+        let db = self.conn()?;
+        schema_revision_on(&db, branch)
+    }
+
+    fn branch_base_revision(&self, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()?
+            .query_row(
+                "SELECT base_revision FROM branches WHERE name = ?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     fn put_spec(&self, table: &str, branch: &str, name: &str, spec: &str) -> Result<()> {
@@ -499,12 +758,28 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
-    fn load_inbox(&self, id: &str) -> Result<(String, String, String, String)> {
-        Ok(self.conn()?.query_row(
-            "SELECT action_name, params, status, proposed_by FROM inbox WHERE id = ?1",
-            params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )?)
+    fn load_inbox(&self, id: &str) -> Result<InboxRow> {
+        self.conn()?
+            .query_row(
+                "SELECT action_name, params, status, proposed_by,
+                        COALESCE(rule_pin, ''), COALESCE(apply_action, '')
+                 FROM inbox WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(InboxRow {
+                        action_name: r.get(0)?,
+                        params: r.get(1)?,
+                        status: r.get(2)?,
+                        proposed_by: r.get(3)?,
+                        rule_pin: r.get(4)?,
+                        apply_action: r.get(5)?,
+                    })
+                },
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => OntoError::NotFound(format!("inbox {id}")),
+                other => OntoError::Store(other.to_string()),
+            })
     }
 
     fn set_inbox_status(&self, id: &str, status: &str) -> Result<()> {
@@ -608,63 +883,86 @@ impl Store for SqliteStore {
     fn commit_staged(&self, ops: &[StagedOp], at: i64) -> Result<Vec<String>> {
         let mut db = self.conn()?;
         let tx = db.transaction()?;
-        let mut created = Vec::new();
-        for op in ops {
-            match op {
-                StagedOp::InsertObject {
-                    id,
-                    type_name,
-                    title,
-                    properties,
-                    created_at,
-                } => {
-                    bitemporal::insert_object(
-                        &tx,
-                        id,
-                        type_name,
-                        title.as_deref(),
-                        properties,
-                        *created_at,
-                    )?;
-                    created.push(id.clone());
-                }
-                StagedOp::UpdateObject { id, properties } => {
-                    bitemporal::append_version(&tx, id, properties, None, at)?;
-                }
-                StagedOp::InsertLink {
-                    id,
-                    type_name,
-                    from_id,
-                    to_id,
-                } => {
-                    tx.execute(
-                        "INSERT INTO links(id, type_name, from_id, to_id) VALUES (?1, ?2, ?3, ?4)",
-                        params![id, type_name, from_id, to_id],
-                    )?;
-                }
-                StagedOp::InsertInbox {
-                    id,
-                    action_name,
-                    proposed_by,
-                    params: inbox_params,
-                    created_at,
-                } => {
-                    tx.execute(
-                        "INSERT INTO inbox(id, action_name, proposed_by, params, status, created_at)
-                         VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
-                        params![id, action_name, proposed_by, inbox_params, created_at],
-                    )?;
-                }
-                StagedOp::ConfirmInbox { id } => {
-                    tx.execute(
-                        "UPDATE inbox SET status = 'confirmed' WHERE id = ?1",
-                        params![id],
-                    )?;
-                }
-            }
+        let created = apply_staged(&tx, ops, at)?;
+        tx.commit()?;
+        Ok(created)
+    }
+
+    fn commit_decision(&self, unit: &DecisionCommit<'_>) -> Result<Vec<String>> {
+        let mut db = self.conn()?;
+        let tx = db.transaction()?;
+        let created = apply_staged(&tx, unit.ops, unit.decision.at)?;
+        insert_decision_on(&tx, &unit.decision)?;
+        if let (Some(key), Some(outcome)) = (unit.idempotency_key, unit.idempotency_outcome) {
+            tx.execute(
+                "INSERT OR IGNORE INTO side_effect_keys(idempotency_key, decision_record_id, action_name, outcome, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![key, unit.decision.id, unit.decision.action, outcome, unit.decision.at],
+            )?;
+        }
+        if let Some(declaration) = unit.effect_declaration {
+            tx.execute(
+                "INSERT INTO effect_intentions(decision_record_id, declaration, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    unit.decision.id,
+                    declaration,
+                    EffectStatus::Declared.as_stored(),
+                    unit.decision.at
+                ],
+            )?;
+        }
+        if let (Some(id), Some(actor), Some(kind), Some(payload)) = (
+            unit.audit_id,
+            unit.audit_actor,
+            unit.audit_kind,
+            unit.audit_payload,
+        ) {
+            tx.execute(
+                "INSERT INTO audit_log(id, at, actor, kind, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, unit.decision.at, actor, kind, payload],
+            )?;
         }
         tx.commit()?;
         Ok(created)
+    }
+
+    fn append_version_recorded(
+        &self,
+        id: &str,
+        properties: &str,
+        title: Option<&str>,
+        valid_at: i64,
+        tx_at: i64,
+    ) -> Result<String> {
+        let db = self.conn()?;
+        bitemporal::append_version_recorded(&db, id, properties, title, valid_at, tx_at)
+    }
+
+    fn insert_object_recorded(
+        &self,
+        id: &str,
+        type_name: &str,
+        title: Option<&str>,
+        properties: &str,
+        valid_at: i64,
+        tx_at: i64,
+    ) -> Result<()> {
+        let db = self.conn()?;
+        bitemporal::insert_object_recorded(&db, id, type_name, title, properties, valid_at, tx_at)
+    }
+
+    fn object_type_of(&self, id: &str) -> Result<String> {
+        let db = self.conn()?;
+        db.query_row(
+            "SELECT type_name FROM objects WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => OntoError::NotFound(format!("object {id}")),
+            other => OntoError::Store(other.to_string()),
+        })
     }
 }
 

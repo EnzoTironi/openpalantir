@@ -645,12 +645,10 @@ fn does_not_double_apply_if_idempotency_key_repeats() {
         "rationale": "idempotent",
         "idempotency_key": "setpoint:tank-1:2.6"
     });
-    let first = engine
-        .submit_action(&supervisor(), "approve_setpoint_change", params.clone())
-        .unwrap();
+    let first = commit_setpoint(&engine, params.clone());
     assert_eq!(first.verdict, Verdict::Allow);
     let second = engine
-        .submit_action(&supervisor(), "approve_setpoint_change", params)
+        .confirm_action(&supervisor(), first.inbox_id.as_deref().unwrap())
         .unwrap();
     assert_eq!(first.decision_record_id, second.decision_record_id);
     assert_eq!(first.created_ids, second.created_ids);
@@ -835,20 +833,17 @@ fn does_append_versions_and_read_history_as_of() {
     assert_eq!(spans_seed.len(), 1, "funnel seed is the first version");
     assert!(spans_seed[0].is_open());
 
-    let first = engine
-        .submit_action(
-            &supervisor(),
-            "approve_setpoint_change",
-            json!({
-                "tank": ids.tank1,
-                "sensor": ids.sensor1,
-                "permit": ids.permit,
-                "target_do": 2.5,
-                "rationale": "first setpoint",
-                "idempotency_key": "setpoint:tank-1:first"
-            }),
-        )
-        .unwrap();
+    let first = commit_setpoint(
+        &engine,
+        json!({
+            "tank": ids.tank1,
+            "sensor": ids.sensor1,
+            "permit": ids.permit,
+            "target_do": 2.5,
+            "rationale": "first setpoint",
+            "idempotency_key": "setpoint:tank-1:first"
+        }),
+    );
     assert_eq!(first.verdict, Verdict::Allow);
     let after_first = engine.now();
     let tank_first = engine
@@ -857,20 +852,17 @@ fn does_append_versions_and_read_history_as_of() {
     assert_eq!(tank_first.properties["target_do"].value, json!(2.5));
 
     engine.set_clock(after_first + 10);
-    let second = engine
-        .submit_action(
-            &supervisor(),
-            "approve_setpoint_change",
-            json!({
-                "tank": ids.tank1,
-                "sensor": ids.sensor1,
-                "permit": ids.permit,
-                "target_do": 3.0,
-                "rationale": "second setpoint",
-                "idempotency_key": "setpoint:tank-1:second"
-            }),
-        )
-        .unwrap();
+    let second = commit_setpoint(
+        &engine,
+        json!({
+            "tank": ids.tank1,
+            "sensor": ids.sensor1,
+            "permit": ids.permit,
+            "target_do": 3.0,
+            "rationale": "second setpoint",
+            "idempotency_key": "setpoint:tank-1:second"
+        }),
+    );
     assert_eq!(second.verdict, Verdict::Allow);
 
     let spans = engine.object_spans(&ids.tank1).unwrap();
@@ -1297,20 +1289,17 @@ fn does_count_filtered_set_not_whole_type() {
 fn does_compensate_allow_as_inverse_action_not_rollback() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
-    let approved = engine
-        .submit_action(
-            &supervisor(),
-            "approve_setpoint_change",
-            json!({
-                "tank": ids.tank1,
-                "sensor": ids.sensor1,
-                "permit": ids.permit,
-                "target_do": 2.5,
-                "rationale": "approve then compensate",
-                "idempotency_key": "setpoint:tank-1:approve"
-            }),
-        )
-        .unwrap();
+    let approved = commit_setpoint(
+        &engine,
+        json!({
+            "tank": ids.tank1,
+            "sensor": ids.sensor1,
+            "permit": ids.permit,
+            "target_do": 2.5,
+            "rationale": "approve then compensate",
+            "idempotency_key": "setpoint:tank-1:approve"
+        }),
+    );
     assert_eq!(approved.verdict, Verdict::Allow);
     let original_id = approved
         .decision_record_id
@@ -1420,20 +1409,17 @@ fn does_error_if_compensation_name_is_missing() {
 fn does_not_double_apply_if_compensate_key_repeats() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
-    let approved = engine
-        .submit_action(
-            &supervisor(),
-            "approve_setpoint_change",
-            json!({
-                "tank": ids.tank1,
-                "sensor": ids.sensor1,
-                "permit": ids.permit,
-                "target_do": 2.5,
-                "rationale": "idempotent compensate",
-                "idempotency_key": "setpoint:tank-1:comp-src"
-            }),
-        )
-        .unwrap();
+    let approved = commit_setpoint(
+        &engine,
+        json!({
+            "tank": ids.tank1,
+            "sensor": ids.sensor1,
+            "permit": ids.permit,
+            "target_do": 2.5,
+            "rationale": "idempotent compensate",
+            "idempotency_key": "setpoint:tank-1:comp-src"
+        }),
+    );
     let original_id = approved.decision_record_id.clone().expect("original");
     engine.set_clock(engine.now() + 10);
     let overlay = json!({
@@ -1467,8 +1453,8 @@ fn does_refuse_compensate_if_verdict_is_deny() {
     let ids = install(&engine).unwrap();
     let denied = engine
         .submit_action(
-            &supervisor(),
-            "approve_setpoint_change",
+            &operator(),
+            "propose_setpoint_change",
             json!({
                 "tank": ids.tank1,
                 "sensor": ids.sensor1,
@@ -1489,7 +1475,7 @@ fn does_refuse_compensate_if_verdict_is_deny() {
     );
     let still = engine.get_decision_record(&operator(), &rec_id).unwrap();
     assert_eq!(still.verdict, Verdict::Deny);
-    assert_eq!(still.action_name, "approve_setpoint_change");
+    assert_eq!(still.action_name, "propose_setpoint_change");
 }
 
 fn setpoint_params(ids: &WastewaterIds, target_do: f64, rationale: &str) -> serde_json::Value {
@@ -1500,6 +1486,16 @@ fn setpoint_params(ids: &WastewaterIds, target_do: f64, rationale: &str) -> serd
         "target_do": target_do,
         "rationale": rationale
     })
+}
+
+fn commit_setpoint(engine: &Engine, params: serde_json::Value) -> ActionOutcome {
+    let proposed = engine
+        .submit_action(&operator(), "propose_setpoint_change", params)
+        .unwrap();
+    assert_eq!(proposed.verdict, Verdict::Allow);
+    engine
+        .confirm_action(&supervisor(), proposed.inbox_id.as_deref().unwrap())
+        .unwrap()
 }
 
 #[test]

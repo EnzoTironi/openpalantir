@@ -2,6 +2,7 @@ use crate::bitemporal::AsOf;
 use crate::engine::Engine;
 use crate::error::{OntoError, Result};
 use crate::functions::FunctionSpec;
+use crate::oss::ObjectSetSpec;
 use crate::security::PolicySpec;
 use crate::tiers::{self, RiskBand};
 #[allow(clippy::wildcard_imports)] // surface is the syscall match over types
@@ -103,6 +104,12 @@ fn dispatch_builder(engine: &Engine, session: &Session, tool: &str, args: &Value
                 "name": engine.create_function(session, str_arg(args, "branch")?, spec)?
             }))
         }
+        "create_object_set" => {
+            let spec: ObjectSetSpec = serde_json::from_value(require(args, "spec")?)?;
+            Ok(json!({
+                "name": engine.create_object_set(session, str_arg(args, "branch")?, spec)?
+            }))
+        }
         "create_policy" => {
             let spec: PolicySpec = serde_json::from_value(require(args, "spec")?)?;
             Ok(json!({
@@ -137,6 +144,7 @@ fn dispatch_builder(engine: &Engine, session: &Session, tool: &str, args: &Value
     }
 }
 
+#[allow(clippy::too_many_lines)] // consumer syscall match is the surface
 fn dispatch_consumer(
     engine: &Engine,
     session: &Session,
@@ -163,7 +171,10 @@ fn dispatch_consumer(
                 type_name,
                 equals,
                 limit,
-                set_name: None,
+                set_name: args
+                    .get("set_name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             };
             Ok(serde_json::to_value(engine.search_objects(session, q)?)?)
         }
@@ -225,6 +236,14 @@ fn dispatch_consumer(
             engine.get_decision_record(session, str_arg(args, "id")?)?,
         )?),
         "get_rejection" => engine.get_rejection(session, str_arg(args, "id")?),
+        "compensate_action" => {
+            let overlay = args.get("overlay").cloned().unwrap_or(json!({}));
+            Ok(serde_json::to_value(engine.compensate_action(
+                session,
+                str_arg(args, "decision_record_id")?,
+                overlay,
+            )?)?)
+        }
         "funnel_ingest" => {
             let records: Vec<IngestRecord> = serde_json::from_value(require(args, "records")?)?;
             Ok(json!({ "ids": engine.funnel_ingest(session, records)? }))

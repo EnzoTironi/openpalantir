@@ -244,6 +244,15 @@ pub fn filter_view(grants: &[PolicySpec], session: &Session, mut view: ObjectVie
         )
         .is_allow()
     });
+    if let Some(title) = &view.title {
+        let visible = view
+            .properties
+            .values()
+            .any(|p| p.value.as_str() == Some(title.as_str()));
+        if !visible {
+            view.title = None;
+        }
+    }
     view
 }
 

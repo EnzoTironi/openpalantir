@@ -229,9 +229,11 @@ pub fn define_highered(engine: &Engine, s: &Session, branch: &str) -> Result<()>
         branch,
         ActionTypeSpec {
             name: "approve_enroll".into(),
-            mode: ExecutionMode::Auto,
+            mode: ExecutionMode::Approve,
             parameters: enroll_params.clone(),
             guards: json!([
+                { "gt": 0, "param": "claim" },
+                { "gt_field": 0, "object": "seat", "field": "slots" },
                 { "lte_field": "claim", "object": "seat", "field": "slots" }
             ]),
             required_roles: vec!["supervisor".into()],
@@ -268,10 +270,16 @@ pub fn define_highered(engine: &Engine, s: &Session, branch: &str) -> Result<()>
             guards: json!([]),
             required_roles: vec!["supervisor".into()],
             required_tier: AgentTier::T3,
-            effects: json!([{
-                "update": "seat",
-                "properties": { "occupant": "", "slots": 1 }
-            }]),
+            effects: json!([
+                {
+                    "update": "seat",
+                    "properties": { "occupant": "", "slots": 1 }
+                },
+                {
+                    "close_link": "occupies",
+                    "from": "student"
+                }
+            ]),
             compensation: None,
             side_effects: json!({ "registrar": "release_seat", "idempotent": true }),
             on_review: None,

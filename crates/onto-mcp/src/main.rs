@@ -33,38 +33,17 @@ struct RpcResponse {
     error: Option<Value>,
 }
 
-fn session_from_key(key: KeyKind, params: &Value) -> Session {
-    let meta = params.get("_meta").cloned().unwrap_or(json!({}));
-    let id = meta
-        .get("actor")
-        .and_then(Value::as_str)
-        .unwrap_or(match key {
-            KeyKind::Builder => "builder",
-            KeyKind::Consumer => "consumer",
-        });
-    let roles: Vec<String> = meta.get("roles").and_then(Value::as_array).map_or_else(
-        || match key {
-            KeyKind::Builder => vec!["modeler".into(), "reviewer".into()],
-            KeyKind::Consumer => vec!["operator".into(), "supervisor".into()],
-        },
-        |a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        },
-    );
-    let tier = meta
-        .get("tier")
-        .and_then(Value::as_u64)
-        .and_then(|n| u8::try_from(n).ok())
-        .and_then(|n| AgentTier::try_from(n).ok())
-        .unwrap_or(AgentTier::T3);
-    let refs: Vec<&str> = roles.iter().map(String::as_str).collect();
-    let actor = match key {
-        KeyKind::Builder => Actor::builder(id, &refs),
-        KeyKind::Consumer => Actor::consumer(id, &refs, tier),
-    };
-    Session::new(actor, "mcp")
+fn session_from_key(key: KeyKind, _params: &Value) -> Session {
+    match key {
+        KeyKind::Builder => Session::new(
+            Actor::builder("mcp.builder", &["modeler", "reviewer"]),
+            "mcp",
+        ),
+        KeyKind::Consumer => Session::new(
+            Actor::consumer("mcp.consumer", &["operator"], AgentTier::T2),
+            "mcp",
+        ),
+    }
 }
 
 fn handle(engine: &Engine, key: KeyKind, req: RpcRequest) -> RpcResponse {
@@ -207,7 +186,7 @@ async fn main() {
         let app = Router::new()
             .route("/mcp", post(http_rpc))
             .with_state(App { engine, key });
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:43177")
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:43177")
             .await
             .expect("bind 43177");
         eprintln!(

@@ -140,9 +140,12 @@ pub fn evidence_gaps(
             None => gaps.push(EvidenceGap::Missing(prop.clone())),
             Some(pv) if pv.value.is_null() => gaps.push(EvidenceGap::Missing(prop.clone())),
             Some(pv) => {
-                if let (Some(budget), Some(stamp)) = (object_type.freshness_budget_secs, &pv.as_of)
-                {
-                    if let Ok(ts) = stamp.parse::<i64>() {
+                let Some(budget) = object_type.freshness_budget_secs else {
+                    continue;
+                };
+                match pv.as_of.as_deref().map(str::parse::<i64>) {
+                    None | Some(Err(_)) => gaps.push(EvidenceGap::Missing(prop.clone())),
+                    Some(Ok(ts)) => {
                         let age = now - ts;
                         if age > budget {
                             gaps.push(EvidenceGap::Stale {
@@ -306,7 +309,7 @@ fn kernel_read_policies() -> Vec<PolicySpec> {
 
 fn put_spec(db: &Connection, table: &str, branch: &str, name: &str, spec: &Value) -> Result<()> {
     db.execute(
-        &format!("INSERT OR REPLACE INTO {table}(branch, name, spec) VALUES (?1, ?2, ?3)"),
+        &format!("INSERT OR IGNORE INTO {table}(branch, name, spec) VALUES (?1, ?2, ?3)"),
         params![branch, name, spec.to_string()],
     )?;
     Ok(())

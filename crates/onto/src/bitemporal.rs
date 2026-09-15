@@ -49,10 +49,16 @@ impl VersionSpan {
     /// First (or successor) current version: open `valid_to` and open `tx_to`.
     #[must_use]
     pub fn current(at: i64) -> Self {
+        Self::recorded(at, at)
+    }
+
+    /// Independent valid and transaction clocks (Zhang 2026, §7.2).
+    #[must_use]
+    pub fn recorded(valid_from: i64, tx_from: i64) -> Self {
         Self {
-            valid_from: at,
+            valid_from,
             valid_to: None,
-            tx_from: at,
+            tx_from,
             tx_to: None,
         }
     }
@@ -75,27 +81,34 @@ impl VersionSpan {
     /// instant as `valid_from` yields a zero-width closed span that covers
     /// no valid time; the successor owns that instant.
     pub fn close_and_succeed(self, at: i64) -> Result<(Self, Self)> {
+        self.close_and_succeed_at(at, at)
+    }
+
+    /// Close valid time and transaction time on independent clocks.
+    pub fn close_and_succeed_at(self, valid_at: i64, tx_at: i64) -> Result<(Self, Self)> {
         if !self.is_open() {
             return Err(OntoError::Conflict(
                 "cannot succeed a closed version".into(),
             ));
         }
-        let cut = at.max(self.valid_from);
+        let valid_cut = valid_at.max(self.valid_from);
+        let tx_cut = tx_at.max(self.tx_from);
         let closed = VersionSpan {
             valid_from: self.valid_from,
-            valid_to: Some(cut),
+            valid_to: Some(valid_cut),
             tx_from: self.tx_from,
-            tx_to: Some(cut),
+            tx_to: Some(tx_cut),
         };
         debug_assert!(
             !closed.is_open(),
             "close_and_succeed must not leave the predecessor open"
         );
         debug_assert!(
-            !closed.covers_valid(cut) || cut > closed.valid_from && closed.covers_valid(cut - 1),
-            "closed and successor must not both cover `cut`"
+            !closed.covers_valid(valid_cut)
+                || valid_cut > closed.valid_from && closed.covers_valid(valid_cut - 1),
+            "closed and successor must not both cover `valid_cut`"
         );
-        Ok((closed, VersionSpan::current(cut)))
+        Ok((closed, VersionSpan::recorded(valid_cut, tx_cut)))
     }
 }
 
@@ -136,13 +149,25 @@ pub fn append_version(
     title: Option<&str>,
     at: i64,
 ) -> Result<String> {
+    append_version_recorded(conn, object_id, properties, title, at, at)
+}
+
+/// Append with independent valid and recorded clocks.
+pub fn append_version_recorded(
+    conn: &Connection,
+    object_id: &str,
+    properties: &str,
+    title: Option<&str>,
+    valid_at: i64,
+    tx_at: i64,
+) -> Result<String> {
     match load_open_row(conn, object_id)? {
         None => {
-            let span = VersionSpan::current(at);
+            let span = VersionSpan::recorded(valid_at, tx_at);
             insert_open_version(conn, object_id, title, properties, span)
         }
         Some(open) => {
-            let (closed, next) = open.span.close_and_succeed(at)?;
+            let (closed, next) = open.span.close_and_succeed_at(valid_at, tx_at)?;
             conn.execute(
                 "UPDATE object_versions SET valid_to = ?1, tx_to = ?2 WHERE version_id = ?3",
                 params![closed.valid_to, closed.tx_to, open.version_id],
@@ -151,6 +176,30 @@ pub fn append_version(
             insert_open_version(conn, object_id, title, properties, next)
         }
     }
+}
+
+/// Insert identity then an open version with independent clocks.
+pub fn insert_object_recorded(
+    conn: &Connection,
+    id: &str,
+    type_name: &str,
+    title: Option<&str>,
+    properties: &str,
+    valid_at: i64,
+    tx_at: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO objects(id, type_name, created_at) VALUES (?1, ?2, ?3)",
+        params![id, type_name, tx_at],
+    )?;
+    insert_open_version(
+        conn,
+        id,
+        title,
+        properties,
+        VersionSpan::recorded(valid_at, tx_at),
+    )?;
+    Ok(())
 }
 
 pub fn load(conn: &Connection, id: &str, as_of: AsOf) -> Result<LoadedVersion> {

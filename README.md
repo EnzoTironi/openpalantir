@@ -12,7 +12,7 @@ Inspirado em Zhang, *Operational Ontology: From Business Mirror to Decision Runt
 - **Interfaces são contratos (Zhang 2026, Ch. 4–5):** `Reviewable` num ActionType em modo Propose cria objeto de inbox; `Evidenced` num ObjectType faz o submit que o lê falhar Complete (Review) se a evidência obrigatória falta ou está velha. Attach não mergeado não vale no `main`.
 - **Chave consumer:** consultar o mundo e executar Actions pré-definidas. Não edita schema. Instâncias são deny-by-default em quatro níveis (Zhang 2026, Ch. 10): plataforma (consumer vs builder), tipo, instância, propriedade. Sem grant é `Deny`. Propriedade `Deny` some na leitura (`get_object` e object sets), não só `rationale`.
 - **Chave builder:** edita schema num branch. Não lê nem escreve instâncias de produção.
-- Toda escrita de negócio passa por Action no write path de 7 passos (`WritePathStep`): submit → param+permission → submission criteria → staged edits (all-or-discard) → commit atômico → selar `DecisionRecord` → declarar side effects com chave de idempotência. Funnel não sobrescreve propriedade `ActionWritten`. `create_link` não é API pública; links nascem por Action (`assert_link`) ou Funnel.
+- Toda escrita de negócio passa por Action no write path de 7 passos (`WritePathStep`): submit → param+permission → submission criteria → staged edits (all-or-discard) → commit atômico da unidade de decisão → selar `DecisionRecord` → declarar side effects com chave de idempotência. `Allow`/committed não é entrega externa. Funnel não sobrescreve propriedade `ActionWritten`. `create_link` não é API pública; links nascem por Action (`assert_link`) ou Funnel.
 - Compensação de um `Allow` submete a Action nomeada em `ActionTypeSpec.compensation` pelo mesmo write path (`Engine::compensate_action`). Sela um `DecisionRecord` novo. O original permanece. Versões de objeto só acrescentam (Zhang 2026, Ch. 9: compensate forward). Sem nome de compensação é `OntoError::NoCompensation`, não sucesso silencioso. Retry com a mesma chave de idempotência não aplica de novo.
 - Instâncias são versionadas (Zhang 2026, Ch. 5): cada escrita de propriedades **acrescenta** um `VersionSpan` (valid time + transaction time). `get_object(id)` lê a versão aberta; `get_object(id, as_of)` reconstrói o objeto no tempo válido. Ponta aberta é `None`. Não há overwrite in-place na tabela `objects`.
 - `DecisionRecord.data_snapshot` pina os objetos lidos nos guards, mais `rule_version`, `function_version` (digest das funções invocadas) e `engine_version`.
@@ -34,8 +34,10 @@ Clippy pedantic está em deny no workspace. `SQLite` é o backend de ensino; [`S
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D clippy::pedantic -D warnings
-cargo test --workspace -- --test-threads=1
+cargo test --locked --workspace -- --test-threads=1
 ```
+
+O Engine Rust é o escritor canônico. [`CONTRATO.md`](CONTRATO.md) nomeia o dono da transação (`Store`) e o dono do efeito (host; `Allow` não é entrega).
 
 ## Utilidade (comprador)
 

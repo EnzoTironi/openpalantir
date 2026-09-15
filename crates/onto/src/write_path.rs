@@ -44,9 +44,17 @@ pub enum StagedOp {
         proposed_by: String,
         params: String,
         created_at: i64,
+        status: String,
+        rule_pin: String,
+        apply_action: String,
     },
     ConfirmInbox {
         id: String,
+    },
+    CloseLink {
+        type_name: String,
+        from_id: String,
+        to_id: Option<String>,
     },
 }
 
@@ -344,16 +352,22 @@ mod tests {
             id: "tank-1".into(),
             type_name: "AerationTank".into(),
             properties: BTreeMap::new(),
+            as_of: BTreeMap::new(),
+            provenance: BTreeMap::new(),
         };
         let later = SnapshotObject {
             id: "tank-1".into(),
             type_name: "AerationTank".into(),
             properties: BTreeMap::new(),
+            as_of: BTreeMap::new(),
+            provenance: BTreeMap::new(),
         };
         let sensor = SnapshotObject {
             id: "sensor-1".into(),
             type_name: "DO_Sensor".into(),
             properties: BTreeMap::new(),
+            as_of: BTreeMap::new(),
+            provenance: BTreeMap::new(),
         };
         let path = WritePath::begin("k".into()).param_and_permission(vec![tank, later, sensor]);
         let snap = path.data_snapshot("rule:1".into(), "fn:1".into(), "0.1.0".into());

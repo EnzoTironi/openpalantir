@@ -522,7 +522,7 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
         branch,
         ActionTypeSpec {
             name: "approve_setpoint_change".into(),
-            mode: ExecutionMode::Auto,
+            mode: ExecutionMode::Approve,
             parameters: vec![
                 ParamSpec {
                     name: "tank".into(),

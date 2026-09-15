@@ -123,10 +123,7 @@ impl ObjectSetSpec {
 
 /// Strip properties the actor is not allowed to see. Runs before the caller
 /// receives the view, and before equals-match on that view.
-pub fn apply_permission(session: &Session, mut view: ObjectView) -> ObjectView {
-    if session.actor.has_role("restricted") {
-        view.properties.retain(|name, _| name != "rationale");
-    }
+pub fn apply_permission(_session: &Session, view: ObjectView) -> ObjectView {
     view
 }
 
@@ -140,6 +137,9 @@ pub fn evaluate_members<F>(
 where
     F: FnMut(&str) -> Result<ObjectView>,
 {
+    if set.limit == 0 {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     for id in ids {
         let view = match load_permitted(&id) {
@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn does_strip_rationale_if_restricted() {
+    fn does_leave_rationale_for_policy_filter() {
         let session = Session::new(
             Actor::consumer("ops.restricted", &["restricted"], AgentTier::T2),
             "test",
@@ -252,7 +252,20 @@ mod tests {
             &[("value", json!(1.0)), ("rationale", json!("secret"))],
         );
         let stripped = apply_permission(&session, raw);
-        assert!(!stripped.properties.contains_key("rationale"));
+        assert!(
+            stripped.properties.contains_key("rationale"),
+            "OSS must not hide domain fields; Policy is the authority"
+        );
         assert!(stripped.properties.contains_key("value"));
+    }
+
+    #[test]
+    fn does_return_no_members_if_limit_is_zero() {
+        let set = ObjectSet::inline(Some("AerationTank".into()), ObjectSetFilter::default(), 0);
+        let out = evaluate_members(&set, vec!["tank-1".into()], |_| {
+            panic!("limit 0 must not load candidates")
+        })
+        .unwrap();
+        assert!(out.is_empty());
     }
 }
