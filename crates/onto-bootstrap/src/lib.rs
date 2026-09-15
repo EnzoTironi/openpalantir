@@ -1,7 +1,15 @@
-//! Install the wastewater teaching case (Zhang 2026) via live OMS builder APIs.
+//! Install teaching cases by calling live OMS builder Actions, then Funnel.
+//!
+//! [`install`] is wastewater. [`install_healthcare`] is the instructional
+//! healthcare case (Zhang 2026). Both use the same builder APIs; neither is a
+//! second OMS. Healthcare never computes a prescribed quantity.
 //!
 //! Schema is created on a branch and merged. Instances arrive through Funnel.
 //! `AerationTank.target_do` is `ActionWritten`: Funnel must not overwrite it.
+
+mod healthcare;
+
+pub use healthcare::{define_healthcare, install_healthcare, HealthcareIds};
 
 use onto::{
     ActionTypeSpec, Actor, AgentTier, AuthzDecision, AuthzLevel, AuthzOp, Engine, ExecutionMode,

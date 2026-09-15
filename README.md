@@ -24,7 +24,7 @@ Inspirado em Zhang, *Operational Ontology: From Business Mirror to Decision Runt
 - `crates/onto` — motor
 - `crates/onto-sdk` — cliente + CLI `onto`
 - `crates/onto-mcp` — MCP stdio e HTTP em `:43177/mcp`
-- `crates/onto-bootstrap` — caso wastewater via as mesmas APIs de builder
+- `crates/onto-bootstrap` — casos wastewater e healthcare via as mesmas APIs de builder
 
 ## Rodar
 
@@ -75,3 +75,14 @@ Testes nomeados (`crates/onto-bootstrap/tests/wastewater_case.rs`):
 - override sela `DecisionRecord` replayável; confirmer ≠ proposer
 - Funnel não sobrescreve `AerationTank.target_do` (`ActionWritten`)
 - schema em branch não mesclado não altera instâncias de produção
+
+## Loop healthcare
+
+Caso de ensino Zhang 2026 (cite; não copie o texto). Instalação em runtime via `onto_bootstrap::install_healthcare`. Sem YAML. Instrucional: o motor **não calcula quantidade prescrita**.
+
+1. Builder cria Patient, Order, Observation, DecisionRecord no branch e faz merge.
+2. Funnel ingere paciente, pedido e observações (completa, evidência ausente, flag de contraindicação).
+3. Consumer `propose_order` com evidência completa → item de inbox.
+4. Observação sem `last_reading_at` (ou stale) → `Review` + `request_observation`. Não é Allow.
+5. Flag de contraindicação (`coded_clearance = 0`) → `Deny` no mesmo molde do permit.
+6. Supervisor `confirm_action` grava `DecisionRecord`.
