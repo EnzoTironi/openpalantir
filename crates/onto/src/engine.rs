@@ -1165,6 +1165,7 @@ impl Engine {
     }
 
     /// T4 unsupervised auto. Bound starts empty, so every claim is denied.
+    #[allow(clippy::needless_pass_by_value)] // params is the public JSON card
     pub fn auto_action(
         &self,
         session: &Session,

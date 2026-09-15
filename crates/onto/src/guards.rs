@@ -166,30 +166,8 @@ fn parse_one(value: &Value) -> Result<Guard> {
                 let object = required_str(obj, "object")?;
                 Ok(Guard::MaxDaysSinceCalibration { object, days })
             }
-            "eq_field" => {
-                let param = obj
-                    .get("eq_field")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| OntoError::Invalid("eq_field needs a param".into()))?
-                    .to_string();
-                let object = required_str(obj, "object")?;
-                let field = required_str(obj, "field")?;
-                Ok(Guard::EqField {
-                    param,
-                    object,
-                    field,
-                })
-            }
-            "linked" => {
-                let link = obj
-                    .get("linked")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| OntoError::Invalid("linked needs a link type".into()))?
-                    .to_string();
-                let from = required_str(obj, "from")?;
-                let to = required_str(obj, "to")?;
-                Ok(Guard::Linked { link, from, to })
-            }
+            "eq_field" => parse_eq_field(obj),
+            "linked" => parse_linked(obj),
             other => {
                 let _ = other;
                 Err(OntoError::Invalid("unrecognized guard".into()))
@@ -203,6 +181,32 @@ fn required_str(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Strin
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| OntoError::Invalid(format!("guard needs {key}")))
+}
+
+fn parse_eq_field(obj: &serde_json::Map<String, Value>) -> Result<Guard> {
+    let param = obj
+        .get("eq_field")
+        .and_then(Value::as_str)
+        .ok_or_else(|| OntoError::Invalid("eq_field needs a param".into()))?
+        .to_string();
+    Ok(Guard::EqField {
+        param,
+        object: required_str(obj, "object")?,
+        field: required_str(obj, "field")?,
+    })
+}
+
+fn parse_linked(obj: &serde_json::Map<String, Value>) -> Result<Guard> {
+    let link = obj
+        .get("linked")
+        .and_then(Value::as_str)
+        .ok_or_else(|| OntoError::Invalid("linked needs a link type".into()))?
+        .to_string();
+    Ok(Guard::Linked {
+        link,
+        from: required_str(obj, "from")?,
+        to: required_str(obj, "to")?,
+    })
 }
 
 /// Evaluate parsed guards. Empty set is an intentional pass.

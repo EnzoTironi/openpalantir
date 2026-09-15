@@ -251,6 +251,7 @@ pub trait Store: Send + Sync {
     fn claim_effect(&self, decision_record_id: &str) -> Result<()>;
     fn ack_effect(&self, decision_record_id: &str) -> Result<()>;
     fn reconcile_effects(&self) -> Result<Vec<EffectIntention>>;
+    #[allow(clippy::too_many_arguments)] // one Store txn for schema + admin + audit
     fn publish_main(
         &self,
         from: &str,

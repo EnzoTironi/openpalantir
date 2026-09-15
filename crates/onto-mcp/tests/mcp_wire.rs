@@ -4,8 +4,12 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
+fn onto_mcp_bin() -> &'static str {
+    option_env!("CARGO_BIN_EXE_onto_mcp").unwrap_or("onto-mcp")
+}
+
 fn spawn_stdio() -> std::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_onto_mcp"))
+    Command::new(onto_mcp_bin())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

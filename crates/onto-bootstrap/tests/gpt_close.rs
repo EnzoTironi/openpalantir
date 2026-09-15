@@ -65,7 +65,7 @@ fn does_reject_funnel_if_field_is_undeclared() {
         )
         .unwrap_err();
     assert!(
-        matches!(err, onto::OntoError::Invalid(msg) if msg.contains("undeclared")),
+        matches!(err, onto::OntoError::Invalid(ref msg) if msg.contains("undeclared")),
         "{err}"
     );
 }
@@ -93,7 +93,7 @@ fn does_reject_funnel_if_value_type_is_wrong() {
         )
         .unwrap_err();
     assert!(
-        matches!(err, onto::OntoError::Invalid(msg) if msg.contains("number")),
+        matches!(err, onto::OntoError::Invalid(ref msg) if msg.contains("number")),
         "{err}"
     );
 }
@@ -317,7 +317,7 @@ fn does_deny_override_if_source_action_has_no_override() {
         )
         .unwrap_err();
     assert!(
-        matches!(err, onto::OntoError::Invalid(msg) if msg.contains("override")),
+        matches!(err, onto::OntoError::Invalid(ref msg) if msg.contains("override")),
         "{err}"
     );
 }
@@ -334,7 +334,7 @@ fn does_deny_t4_submit_if_bound_is_empty() {
         )
         .unwrap_err();
     assert!(
-        matches!(err, onto::OntoError::Denied(msg) if msg.contains("auto_action")),
+        matches!(err, onto::OntoError::Denied(ref msg) if msg.contains("auto_action")),
         "{err}"
     );
 }
@@ -407,12 +407,14 @@ fn does_dispatch_each_listed_tool() {
     install(&engine).unwrap();
     for session in [operator(), modeller()] {
         for tool in engine.list_tools(&session).unwrap() {
-            match dispatch(&engine, &session, &tool.name, json!({})) {
-                Ok(_) => {}
-                Err(onto::OntoError::NotFound(msg)) if msg.contains("unknown") => {
-                    panic!("{} listed but unknown to dispatch: {msg}", tool.name);
-                }
-                Err(_) => {}
+            if let Err(onto::OntoError::NotFound(msg)) =
+                dispatch(&engine, &session, &tool.name, json!({}))
+            {
+                assert!(
+                    !msg.contains("unknown"),
+                    "{} listed but unknown to dispatch: {msg}",
+                    tool.name
+                );
             }
         }
     }

@@ -350,6 +350,7 @@ pub struct SnapshotObject {
     pub delegated: bool,
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde skip_serializing_if needs &T
 fn is_false(flag: &bool) -> bool {
     !*flag
 }

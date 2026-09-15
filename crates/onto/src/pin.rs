@@ -7,6 +7,7 @@ use crate::write_path::pin_version;
 ///
 /// This is evaluator identity, not cryptographic tamper-evidence.
 #[must_use]
+#[allow(clippy::module_name_repetitions)] // public pin entry
 pub fn apply_pin(apply_name: &str, spec: &ActionTypeSpec, schema_revision: &str) -> String {
     let body = format!(
         "{}|{schema_revision}",

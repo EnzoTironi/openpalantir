@@ -14,7 +14,7 @@ pub fn declared_property<'a>(spec: &'a ObjectTypeSpec, name: &str) -> Result<&'a
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{PropertySource, Typology};
+    use crate::types::Typology;
 
     #[test]
     fn does_reject_undeclared_field() {
