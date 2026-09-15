@@ -246,6 +246,7 @@ fn unauthorized_deny() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // dossier replay is one end-to-end teaching case
 fn override_dossier_replay_confirmer_not_executor() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
@@ -431,7 +432,7 @@ fn unmerged_branch_schema_zero_effect_on_production_instances() {
         )
         .unwrap()
         .len();
-    let tank_before = engine
+    let instance_before = engine
         .get_object(&operator(), &ids.tank1, AsOf::Current)
         .unwrap();
 
@@ -483,12 +484,12 @@ fn unmerged_branch_schema_zero_effect_on_production_instances() {
         )
         .unwrap();
     assert_eq!(tanks_before, tanks_after.len());
-    let tank_after = engine
+    let instance_after = engine
         .get_object(&operator(), &ids.tank1, AsOf::Current)
         .unwrap();
     assert_eq!(
-        serde_json::to_value(&tank_before.properties).unwrap(),
-        serde_json::to_value(&tank_after.properties).unwrap()
+        serde_json::to_value(&instance_before.properties).unwrap(),
+        serde_json::to_value(&instance_after.properties).unwrap()
     );
     assert!(engine
         .get_object(&operator(), "ghost-1", AsOf::Current)

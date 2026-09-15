@@ -10,6 +10,9 @@ onto = { path = "../onto" }
 serde.workspace = true
 serde_json.workspace = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "onto"
 path = "src/bin/onto.rs"

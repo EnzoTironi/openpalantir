@@ -8,3 +8,6 @@ description = "Runtime-created wastewater and higher-ed ontologies (same builder
 [dependencies]
 onto = { path = "../onto" }
 serde_json.workspace = true
+
+[lints]
+workspace = true

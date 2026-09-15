@@ -4,9 +4,7 @@
 //! `WritePath<ParamAndPermission>`. There is no method that jumps a successor.
 //! Guard failure at submission criteria discards the stage by never building it.
 
-use crate::types::{
-    DataSnapshot, GuardResult, SnapshotObject, Verdict, WritePathStep,
-};
+use crate::types::{DataSnapshot, GuardResult, SnapshotObject, Verdict, WritePathStep};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -73,10 +71,10 @@ pub struct WritePath<S> {
 
 impl<S> WritePath<S> {
     fn into_successor<T>(mut self, step: WritePathStep) -> WritePath<T> {
-        let current = *self
-            .trace
-            .last()
-            .expect("write path always starts with Submit");
+        let current = match self.trace.last() {
+            Some(step) => *step,
+            None => WritePathStep::Submit,
+        };
         debug_assert_eq!(current.successor(), Some(step));
         self.trace.push(step);
         WritePath {
@@ -260,7 +258,10 @@ mod tests {
             step = next;
         }
         assert_eq!(seen, WritePathStep::ALL.to_vec());
-        assert_eq!(seen.last().copied(), Some(WritePathStep::DeclareSideEffects));
+        assert_eq!(
+            seen.last().copied(),
+            Some(WritePathStep::DeclareSideEffects)
+        );
         assert_eq!(WritePathStep::DeclareSideEffects.successor(), None);
     }
 

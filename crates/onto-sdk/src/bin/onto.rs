@@ -1,5 +1,5 @@
 use onto_sdk::{parse_session, Client, Engine};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::env;
 use std::io::{self, IsTerminal, Read};
 
@@ -25,18 +25,18 @@ fn main() {
                 i += 2;
             }
             "--key" => {
-                key = raw[i + 1].clone();
+                key.clone_from(&raw[i + 1]);
                 i += 2;
             }
             "--id" => {
-                id = raw[i + 1].clone();
+                id.clone_from(&raw[i + 1]);
                 i += 2;
             }
             "--roles" => {
                 roles = raw[i + 1]
                     .split(',')
                     .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
+                    .map(str::to_string)
                     .collect();
                 i += 2;
             }
@@ -54,17 +54,17 @@ fn main() {
     let payload = if rest.len() > 1 {
         serde_json::from_str(&rest[1]).unwrap_or(Value::Null)
     } else if io::stdin().is_terminal() {
-        Value::Object(Default::default())
+        Value::Object(Map::default())
     } else {
         let mut buf = String::new();
         io::stdin().read_to_string(&mut buf).ok();
-        serde_json::from_str(&buf).unwrap_or(Value::Object(Default::default()))
+        serde_json::from_str(&buf).unwrap_or(Value::Object(Map::default()))
     };
     let engine = match db {
         Some(path) => Engine::open(&path).expect("open db"),
         None => Engine::memory().expect("memory db"),
     };
-    let role_refs: Vec<&str> = roles.iter().map(|s| s.as_str()).collect();
+    let role_refs: Vec<&str> = roles.iter().map(String::as_str).collect();
     let client = Client::new(&engine, parse_session(&key, &id, &role_refs, tier));
     match client.call(&tool, payload) {
         Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),

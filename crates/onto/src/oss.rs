@@ -42,6 +42,7 @@ pub struct ObjectSetSpec {
 }
 
 impl ObjectSet {
+    #[must_use]
     pub fn inline(type_name: Option<String>, filter: ObjectSetFilter, limit: usize) -> Self {
         Self {
             type_name,
@@ -53,6 +54,7 @@ impl ObjectSet {
 
     /// Inline `Query` is one way to build a set. A non-empty `set_name` is a
     /// named-set reference; the engine resolves the OMS spec before evaluate.
+    #[must_use]
     pub fn from_query(query: &Query) -> Self {
         if let Some(name) = query
             .set_name
@@ -76,6 +78,7 @@ impl ObjectSet {
         )
     }
 
+    #[must_use]
     pub fn from_spec(spec: &ObjectSetSpec, limit: usize) -> Self {
         Self {
             type_name: spec.type_name.clone(),
@@ -87,6 +90,7 @@ impl ObjectSet {
         }
     }
 
+    #[must_use]
     pub fn unbounded(&self) -> Self {
         let mut next = self.clone();
         next.limit = usize::MAX;
@@ -94,6 +98,7 @@ impl ObjectSet {
     }
 
     /// Match against a permission-filtered view (Zhang 2026, Ch. 6).
+    #[must_use]
     pub fn matches(&self, view: &ObjectView) -> bool {
         if let Some(want) = &self.type_name {
             if view.type_name != *want {
@@ -195,8 +200,6 @@ mod tests {
         assert!(set.name.is_none());
         assert_eq!(set.type_name.as_deref(), Some("AerationTank"));
         assert_eq!(set.filter.equals.get("name"), Some(&json!("Basin 1")));
-        let _ids_are_not_the_type: Option<&ObjectSet> = None;
-        let _ = _ids_are_not_the_type;
     }
 
     #[test]

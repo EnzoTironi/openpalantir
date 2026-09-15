@@ -31,7 +31,7 @@ use std::fmt;
 pub enum AgentTier {
     /// Observe: search, get, traverse, aggregate, missing evidence.
     T1,
-    /// Propose: describe_action, submit_action.
+    /// Propose: `describe_action`, `submit_action`.
     T2,
     /// Confirm: inbox, confirm, override. Confirmer ≠ proposer.
     T3,
@@ -42,6 +42,7 @@ pub enum AgentTier {
 impl AgentTier {
     pub const ALL: [AgentTier; 4] = [Self::T1, Self::T2, Self::T3, Self::T4];
 
+    #[must_use]
     pub fn rank(self) -> u8 {
         match self {
             Self::T1 => 1,
@@ -51,6 +52,7 @@ impl AgentTier {
         }
     }
 
+    #[must_use]
     pub fn allows_syscall(self, tool: &str) -> bool {
         self >= min_tier_for_syscall(tool)
     }
@@ -118,6 +120,7 @@ impl RiskBand {
         }
     }
 
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Low => "low",
@@ -142,12 +145,14 @@ pub struct AutoBound {
 }
 
 impl AutoBound {
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             entries: Vec::new(),
         }
     }
 
+    #[must_use]
     pub fn allows(&self, action_type: &str, object_set: &str, risk_band: RiskBand) -> bool {
         self.entries.iter().any(|e| {
             e.action_type == action_type && e.object_set == object_set && e.risk_band == risk_band
@@ -173,7 +178,6 @@ pub fn min_tier_for_syscall(tool: &str) -> AgentTier {
         | "get_rejection" => AgentTier::T1,
         "describe_action" | "submit_action" | "funnel_ingest" | "create_link" => AgentTier::T2,
         "list_inbox" | "confirm_action" | "override_action" => AgentTier::T3,
-        "auto_action" => AgentTier::T4,
         _ => AgentTier::T4,
     }
 }

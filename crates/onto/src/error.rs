@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[allow(clippy::module_name_repetitions)] // crate error type
 pub enum OntoError {
     #[error("{0}")]
     Denied(String),
@@ -15,7 +16,7 @@ pub enum OntoError {
     /// Action spec has no `compensation` name. Not a silent success.
     #[error("action `{0}` has no named compensation")]
     NoCompensation(String),
-    /// Only an Allow DecisionRecord can be compensated (Zhang 2026, Ch. 9).
+    /// Only an [`Verdict::Allow`] `DecisionRecord` can be compensated (Zhang 2026, Ch. 9).
     #[error("decision `{0}` cannot be compensated (verdict is not allow)")]
     NotCompensable(String),
     #[error("store: {0}")]

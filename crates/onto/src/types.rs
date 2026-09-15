@@ -53,6 +53,27 @@ pub enum Verdict {
     Deny,
 }
 
+impl Verdict {
+    /// Stored column. Unknown rows are Deny (deny-by-default).
+    #[must_use]
+    pub fn from_stored(raw: &str) -> Self {
+        match raw {
+            "allow" => Self::Allow,
+            "review" => Self::Review,
+            _ => Self::Deny,
+        }
+    }
+
+    #[must_use]
+    pub fn as_stored(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Review => "review",
+            Self::Deny => "deny",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
@@ -90,6 +111,7 @@ impl WritePathStep {
         Self::DeclareSideEffects,
     ];
 
+    #[must_use]
     pub fn successor(self) -> Option<Self> {
         match self {
             Self::Submit => Some(Self::ParamAndPermission),
@@ -125,7 +147,7 @@ impl Actor {
         Self {
             id: id.into(),
             key: KeyKind::Builder,
-            roles: roles.iter().map(|s| (*s).to_string()).collect(),
+            roles: roles.iter().copied().map(str::to_string).collect(),
             tier: AgentTier::T1,
         }
     }
@@ -134,11 +156,12 @@ impl Actor {
         Self {
             id: id.into(),
             key: KeyKind::Consumer,
-            roles: roles.iter().map(|s| (*s).to_string()).collect(),
+            roles: roles.iter().copied().map(str::to_string).collect(),
             tier,
         }
     }
 
+    #[must_use]
     pub fn has_role(&self, role: &str) -> bool {
         self.roles.iter().any(|r| r == role)
     }
@@ -364,10 +387,12 @@ impl Default for Query {
     }
 }
 
+#[must_use]
 pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+#[must_use]
 pub fn now_rfc3339() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()

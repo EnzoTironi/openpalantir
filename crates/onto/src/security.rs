@@ -62,6 +62,7 @@ pub enum AuthzDecision {
 }
 
 impl AuthzDecision {
+    #[must_use]
     pub fn is_allow(self) -> bool {
         match self {
             Self::Allow => true,
@@ -172,15 +173,15 @@ fn grant_matches(
     }
     match level {
         AuthzLevel::Platform => true,
-        AuthzLevel::Type => wildcard_match(&grant.type_name, type_name),
+        AuthzLevel::Type => wildcard_match(grant.type_name.as_deref(), type_name),
         AuthzLevel::Instance => {
-            wildcard_match(&grant.type_name, type_name)
-                && wildcard_match(&grant.instance_id, instance_id)
+            wildcard_match(grant.type_name.as_deref(), type_name)
+                && wildcard_match(grant.instance_id.as_deref(), instance_id)
         }
         AuthzLevel::Property => {
-            wildcard_match(&grant.type_name, type_name)
-                && wildcard_match(&grant.instance_id, instance_id)
-                && wildcard_match(&grant.property, property)
+            wildcard_match(grant.type_name.as_deref(), type_name)
+                && wildcard_match(grant.instance_id.as_deref(), instance_id)
+                && wildcard_match(grant.property.as_deref(), property)
         }
     }
 }
@@ -199,8 +200,8 @@ fn roles_match(roles: &[String], actor: &Actor) -> bool {
     roles.iter().any(|r| actor.has_role(r))
 }
 
-fn wildcard_match(grant_val: &Option<String>, actual: Option<&str>) -> bool {
-    match grant_val.as_deref() {
+fn wildcard_match(grant_val: Option<&str>, actual: Option<&str>) -> bool {
+    match grant_val {
         None | Some("*") => true,
         Some(want) => actual == Some(want),
     }
@@ -272,6 +273,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // policy grant test fixture
     fn grant(
         name: &str,
         level: AuthzLevel,
@@ -289,15 +291,16 @@ mod tests {
             level,
             op,
             key,
-            type_name: type_name.map(|s| s.into()),
-            instance_id: instance_id.map(|s| s.into()),
-            property: property.map(|s| s.into()),
-            roles: roles.iter().map(|s| (*s).to_string()).collect(),
+            type_name: type_name.map(str::to_string),
+            instance_id: instance_id.map(str::to_string),
+            property: property.map(str::to_string),
+            roles: roles.iter().copied().map(str::to_string).collect(),
             min_tier,
             decision,
         }
     }
 
+    #[allow(clippy::too_many_lines)] // four-level grant fixture
     fn seeded() -> Vec<PolicySpec> {
         vec![
             grant(

@@ -1,5 +1,7 @@
 //! Thin typed client. Humans, agents, tests, and the MCP server share `dispatch`.
 
+#![allow(clippy::missing_errors_doc)] // OntoError is the public contract
+
 use onto::{dispatch, ActionOutcome, Result, SchemaSnapshot, ToolSpec};
 use serde_json::{json, Value};
 
@@ -31,6 +33,7 @@ impl<'a> Client<'a> {
         Ok(serde_json::from_value(self.call("get_schema", args)?)?)
     }
 
+    #[allow(clippy::needless_pass_by_value)] // params is the public JSON card
     pub fn submit_action(&self, action: &str, params: Value) -> Result<ActionOutcome> {
         Ok(serde_json::from_value(self.call(
             "submit_action",
@@ -39,6 +42,7 @@ impl<'a> Client<'a> {
     }
 }
 
+#[must_use]
 pub fn parse_session(key: &str, id: &str, roles: &[&str], tier: u8) -> Session {
     let tier = AgentTier::try_from(tier).unwrap_or(AgentTier::T2);
     match key {

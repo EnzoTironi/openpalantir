@@ -5,6 +5,9 @@
 //! Schema is created on a branch and merged. Instances arrive through Funnel.
 //! `AerationTank.target_do` is `ActionWritten`: Funnel must not overwrite it.
 
+#![allow(clippy::missing_errors_doc)] // OntoError is the public contract
+#![allow(clippy::too_many_lines)] // teaching-case install is one schema dump
+
 mod highered;
 
 pub use highered::{define_highered, install_highered, HigheredIds};
@@ -79,7 +82,7 @@ fn vt(
         base: base.into(),
         min,
         max,
-        unit: unit.map(|s| s.into()),
+        unit: unit.map(str::to_string),
     }
 }
 
@@ -115,7 +118,7 @@ fn obj(
         name: name.into(),
         typology,
         title_prop: Some(title.into()),
-        interfaces: interfaces.iter().map(|s| (*s).to_string()).collect(),
+        interfaces: interfaces.iter().copied().map(str::to_string).collect(),
         freshness_budget_secs: budget,
         properties,
     }
@@ -1031,6 +1034,7 @@ fn seed_policies(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // policy grant fixture matches PolicySpec columns
 fn grant(
     name: &str,
     level: AuthzLevel,
@@ -1048,10 +1052,10 @@ fn grant(
         level,
         op,
         key,
-        type_name: type_name.map(|s| s.into()),
-        instance_id: instance_id.map(|s| s.into()),
-        property: property.map(|s| s.into()),
-        roles: roles.iter().map(|s| (*s).to_string()).collect(),
+        type_name: type_name.map(str::to_string),
+        instance_id: instance_id.map(str::to_string),
+        property: property.map(str::to_string),
+        roles: roles.iter().copied().map(str::to_string).collect(),
         min_tier,
         decision,
     }

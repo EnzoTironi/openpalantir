@@ -75,8 +75,7 @@ impl Compensation {
 pub fn require_allow(original: &DecisionRecordView) -> Result<()> {
     match original.verdict {
         Verdict::Allow => Ok(()),
-        Verdict::Review => Err(OntoError::NotCompensable(original.id.clone())),
-        Verdict::Deny => Err(OntoError::NotCompensable(original.id.clone())),
+        Verdict::Review | Verdict::Deny => Err(OntoError::NotCompensable(original.id.clone())),
     }
 }
 
@@ -84,6 +83,7 @@ pub fn require_allow(original: &DecisionRecordView) -> Result<()> {
 ///
 /// Overlay wins. If overlay omits `target_do`, a numeric snapshot value on
 /// the tank is used. Default key is `compensate:{original.id}`.
+#[must_use]
 pub fn inverse_params(original: &DecisionRecordView, overlay: &Value) -> Value {
     let mut params = match &original.params {
         Value::Object(map) => Value::Object(map.clone()),
@@ -111,8 +111,7 @@ pub fn inverse_params(original: &DecisionRecordView, overlay: &Value) -> Value {
     let has_key = params
         .get("idempotency_key")
         .and_then(|v| v.as_str())
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
+        .is_some_and(|s| !s.is_empty());
     if !has_key {
         params["idempotency_key"] = json!(format!("compensate:{}", original.id));
     }
@@ -121,6 +120,7 @@ pub fn inverse_params(original: &DecisionRecordView, overlay: &Value) -> Value {
 }
 
 /// Property value pinned on the object named by `object_param` in the snapshot.
+#[must_use]
 pub fn previous_written(
     original: &DecisionRecordView,
     object_param: &str,
@@ -128,7 +128,9 @@ pub fn previous_written(
 ) -> Option<Value> {
     let id = original.params.get(object_param)?.as_str()?;
     let objects = original.data_snapshot.get("objects")?.as_array()?;
-    let obj = objects.iter().find(|o| o.get("id").and_then(|v| v.as_str()) == Some(id))?;
+    let obj = objects
+        .iter()
+        .find(|o| o.get("id").and_then(|v| v.as_str()) == Some(id))?;
     obj.get("properties")?.get(property).cloned()
 }
 
@@ -136,7 +138,7 @@ pub fn previous_written(
 mod tests {
     use super::*;
     use crate::tiers::AgentTier;
-    use crate::types::{ENGINE_VERSION, ExecutionMode};
+    use crate::types::{ExecutionMode, ENGINE_VERSION};
 
     fn spec_with(compensation: Option<&str>) -> ActionTypeSpec {
         ActionTypeSpec {
@@ -147,7 +149,7 @@ mod tests {
             required_roles: vec![],
             required_tier: AgentTier::T3,
             effects: json!([]),
-            compensation: compensation.map(|s| s.into()),
+            compensation: compensation.map(str::to_string),
             side_effects: json!({}),
             on_review: None,
         }
@@ -215,7 +217,10 @@ mod tests {
             Err(OntoError::NotCompensable(id)) if id == "d1"
         ));
         rec.verdict = Verdict::Review;
-        assert!(matches!(require_allow(&rec), Err(OntoError::NotCompensable(_))));
+        assert!(matches!(
+            require_allow(&rec),
+            Err(OntoError::NotCompensable(_))
+        ));
         rec.verdict = Verdict::Allow;
         assert!(require_allow(&rec).is_ok());
     }

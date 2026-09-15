@@ -18,7 +18,7 @@
 //!
 //! # Relations
 //! [`crate::Engine::create_function`] stores the spec. [`crate::PropertySpec::function`]
-//! names it. DecisionRecord `function_version` is [`digest`] of invoked pins.
+//! names it. `DecisionRecord` `function_version` is [`digest`] of invoked pins.
 
 use crate::types::{PropertySource, PropertyView};
 use crate::write_path::pin_version;
@@ -45,9 +45,13 @@ pub struct FunctionSpec {
 }
 
 impl FunctionSpec {
-    /// Stable pin `name:hash` over kind + inputs. Used on DecisionRecord.
+    /// Stable pin `name:hash` over kind + inputs. Used on `DecisionRecord`.
+    #[must_use]
     pub fn pin(&self) -> String {
-        pin_version(&self.name, &format!("{}:{}", kind_key(self.kind), self.inputs.join(",")))
+        pin_version(
+            &self.name,
+            &format!("{}:{}", kind_key(self.kind), self.inputs.join(",")),
+        )
     }
 }
 
