@@ -39,6 +39,7 @@
 //!     compensation: Some("revert_setpoint_change".into()),
 //!     side_effects: json!({}),
 //!     on_review: None,
+//!     interfaces: vec![],
 //! };
 //! let plan = Compensation::from_spec(&spec).unwrap();
 //! let Compensation::Inverse { action } = plan;
@@ -128,7 +129,9 @@ pub fn previous_written(
 ) -> Option<Value> {
     let id = original.params.get(object_param)?.as_str()?;
     let objects = original.data_snapshot.get("objects")?.as_array()?;
-    let obj = objects.iter().find(|o| o.get("id").and_then(|v| v.as_str()) == Some(id))?;
+    let obj = objects
+        .iter()
+        .find(|o| o.get("id").and_then(|v| v.as_str()) == Some(id))?;
     obj.get("properties")?.get(property).cloned()
 }
 
@@ -136,7 +139,7 @@ pub fn previous_written(
 mod tests {
     use super::*;
     use crate::tiers::AgentTier;
-    use crate::types::{ENGINE_VERSION, ExecutionMode};
+    use crate::types::{ExecutionMode, ENGINE_VERSION};
 
     fn spec_with(compensation: Option<&str>) -> ActionTypeSpec {
         ActionTypeSpec {
@@ -150,6 +153,7 @@ mod tests {
             compensation: compensation.map(|s| s.into()),
             side_effects: json!({}),
             on_review: None,
+            interfaces: vec![],
         }
     }
 
@@ -215,7 +219,10 @@ mod tests {
             Err(OntoError::NotCompensable(id)) if id == "d1"
         ));
         rec.verdict = Verdict::Review;
-        assert!(matches!(require_allow(&rec), Err(OntoError::NotCompensable(_))));
+        assert!(matches!(
+            require_allow(&rec),
+            Err(OntoError::NotCompensable(_))
+        ));
         rec.verdict = Verdict::Allow;
         assert!(require_allow(&rec).is_ok());
     }

@@ -1,6 +1,8 @@
 use onto::{
-    dispatch, ActionOutcome, Actor, AgentTier, AsOf, Engine, IngestRecord, KeyKind, ObjectSet,
-    ObjectSetFilter, ObjectSetSpec, Query, Result, RiskBand, Session, Verdict, WritePathStep,
+    dispatch, ActionOutcome, ActionTypeSpec, Actor, AgentTier, AsOf, Engine, ExecutionMode,
+    IngestRecord, KeyKind, ObjectSet, ObjectSetFilter, ObjectSetSpec, ObjectTypeSpec, ParamSpec,
+    PropertySource, PropertySpec, Query, Result, RiskBand, Session, Typology, Verdict,
+    WritePathStep,
 };
 use onto_bootstrap::{install, WastewaterIds};
 use serde_json::json;
@@ -1281,7 +1283,10 @@ fn compensate_allow_is_inverse_action_not_rollback() {
         )
         .unwrap();
     assert_eq!(approved.verdict, Verdict::Allow);
-    let original_id = approved.decision_record_id.clone().expect("original record");
+    let original_id = approved
+        .decision_record_id
+        .clone()
+        .expect("original record");
     let original = engine
         .get_decision_record(&operator(), &original_id)
         .unwrap();
@@ -1653,4 +1658,235 @@ fn t4_auto_denied_on_empty_bound() {
         }),
     )
     .is_err());
+}
+
+fn merge_branch(engine: &Engine, branch: &str) {
+    let proposal = engine.submit_proposal(&modeller(), branch).unwrap();
+    engine
+        .review_proposal(&reviewer(), &proposal, true)
+        .unwrap();
+    engine.merge_to_main(&reviewer(), &proposal).unwrap();
+}
+
+fn propose_action(name: &str, interfaces: Vec<String>) -> ActionTypeSpec {
+    ActionTypeSpec {
+        name: name.into(),
+        mode: ExecutionMode::Propose,
+        parameters: vec![],
+        guards: json!([]),
+        required_roles: vec!["operator".into()],
+        required_tier: AgentTier::T2,
+        effects: json!([]),
+        compensation: None,
+        side_effects: json!({}),
+        on_review: None,
+        interfaces,
+    }
+}
+
+#[test]
+fn kernel_types_are_queryable_objecttype_records() {
+    let engine = Engine::memory().unwrap();
+    let found = engine
+        .search_objects(
+            &intern(),
+            Query {
+                type_name: Some("ObjectType".into()),
+                ..Query::default()
+            },
+        )
+        .unwrap();
+    let names: Vec<String> = found
+        .iter()
+        .map(|v| {
+            v.properties
+                .get("name")
+                .and_then(|p| p.value.as_str())
+                .unwrap_or(&v.id)
+                .to_string()
+        })
+        .collect();
+    for k in Engine::kernel_types() {
+        assert!(
+            names.iter().any(|n| n == k),
+            "kernel type {k} must be a queryable ObjectType record after Engine::memory, got {names:?}"
+        );
+    }
+}
+
+#[test]
+fn reviewable_propose_creates_inbox_unmerged_attach_is_noop() {
+    let engine = Engine::memory().unwrap();
+    let b = engine
+        .open_branch(&modeller(), "kernel-reviewable")
+        .unwrap();
+    engine
+        .create_object_type(
+            &modeller(),
+            &b,
+            ObjectTypeSpec {
+                name: "SampleAsset".into(),
+                typology: Typology::Entity,
+                title_prop: Some("name".into()),
+                interfaces: vec![],
+                freshness_budget_secs: None,
+                properties: vec![PropertySpec {
+                    name: "name".into(),
+                    value_type: "Text".into(),
+                    source: PropertySource::Mapped,
+                    nullable: true,
+                    function: None,
+                }],
+            },
+        )
+        .unwrap();
+    engine
+        .create_action_type(&modeller(), &b, propose_action("propose_sample", vec![]))
+        .unwrap();
+    engine
+        .attach_interface(&modeller(), &b, "propose_sample", "Reviewable")
+        .unwrap();
+    engine
+        .create_action_type(&modeller(), &b, propose_action("propose_plain", vec![]))
+        .unwrap();
+    merge_branch(&engine, &b);
+
+    let with_iface = engine
+        .submit_action(&operator(), "propose_sample", json!({}))
+        .unwrap();
+    assert_eq!(with_iface.verdict, Verdict::Allow);
+    let inbox = with_iface
+        .inbox_id
+        .expect("Reviewable Propose must create an inbox object");
+    let pending = engine.list_inbox(&supervisor()).unwrap();
+    assert!(
+        pending.iter().any(|i| i.id == inbox),
+        "inbox object must be listable"
+    );
+
+    let before = engine
+        .submit_action(&operator(), "propose_plain", json!({ "n": 1 }))
+        .unwrap();
+    assert!(
+        before.inbox_id.is_none(),
+        "Propose without Reviewable on main must not mint inbox, got {:?}",
+        before.inbox_id
+    );
+
+    let pending_b = engine
+        .open_branch(&modeller(), "unmerged-reviewable")
+        .unwrap();
+    engine
+        .attach_interface(&modeller(), &pending_b, "propose_plain", "Reviewable")
+        .unwrap();
+    let still = engine
+        .submit_action(&operator(), "propose_plain", json!({ "n": 2 }))
+        .unwrap();
+    assert!(
+        still.inbox_id.is_none(),
+        "unmerged Reviewable attach must have zero effect on main, got {:?}",
+        still.inbox_id
+    );
+}
+
+#[test]
+fn evidenced_submit_reviews_when_evidence_missing() {
+    let engine = Engine::memory().unwrap();
+    install(&engine).unwrap();
+    let b = engine.open_branch(&modeller(), "kernel-evidenced").unwrap();
+    engine
+        .create_object_type(
+            &modeller(),
+            &b,
+            ObjectTypeSpec {
+                name: "LabNote".into(),
+                typology: Typology::Entity,
+                title_prop: Some("name".into()),
+                interfaces: vec!["Evidenced".into()],
+                freshness_budget_secs: None,
+                properties: vec![
+                    PropertySpec {
+                        name: "name".into(),
+                        value_type: "Text".into(),
+                        source: PropertySource::Mapped,
+                        nullable: false,
+                        function: None,
+                    },
+                    PropertySpec {
+                        name: "rationale".into(),
+                        value_type: "Text".into(),
+                        source: PropertySource::Mapped,
+                        nullable: true,
+                        function: None,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+    engine
+        .create_action_type(
+            &modeller(),
+            &b,
+            ActionTypeSpec {
+                name: "inspect_note".into(),
+                mode: ExecutionMode::Auto,
+                parameters: vec![ParamSpec {
+                    name: "note".into(),
+                    value_type: "Text".into(),
+                    object_type: Some("LabNote".into()),
+                    required: true,
+                }],
+                guards: json!([]),
+                required_roles: vec!["operator".into()],
+                required_tier: AgentTier::T2,
+                effects: json!([]),
+                compensation: None,
+                side_effects: json!({}),
+                on_review: None,
+                interfaces: vec![],
+            },
+        )
+        .unwrap();
+    merge_branch(&engine, &b);
+
+    engine
+        .funnel_ingest(
+            &operator(),
+            vec![IngestRecord {
+                type_name: "LabNote".into(),
+                id: Some("note-1".into()),
+                properties: [("name".into(), json!("lab"))].into_iter().collect(),
+                as_of: None,
+                provenance: Some("test".into()),
+            }],
+        )
+        .unwrap();
+
+    let missing = engine.list_missing_evidence(&operator(), "note-1").unwrap();
+    let missing_fields = missing
+        .get("missing")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        missing_fields
+            .iter()
+            .any(|v| v.as_str() == Some("rationale")),
+        "Evidenced required property must show in list_missing_evidence, got {missing}"
+    );
+
+    let out = engine
+        .submit_action(&operator(), "inspect_note", json!({ "note": "note-1" }))
+        .unwrap();
+    assert_eq!(
+        out.verdict,
+        Verdict::Review,
+        "submit that reads Evidenced object with missing rationale must Complete-fail, got {:?}",
+        out
+    );
+    assert!(
+        out.reason.contains("Complete fail"),
+        "expected Complete fail, got {}",
+        out.reason
+    );
 }

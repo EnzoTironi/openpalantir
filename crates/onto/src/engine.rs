@@ -2,8 +2,10 @@ use crate::bitemporal::{self, AsOf};
 use crate::compensation::{self, Compensation};
 use crate::error::{OntoError, Result};
 use crate::functions::{self, FunctionSpec};
+use crate::kernel::{self, KernelInterface};
 use crate::oss::{
-    apply_permission, evaluate_members, ObjectSet, ObjectSetFilter, ObjectSetSpec, OBJECT_SETS_TABLE,
+    apply_permission, evaluate_members, ObjectSet, ObjectSetFilter, ObjectSetSpec,
+    OBJECT_SETS_TABLE,
 };
 use crate::security::{authorize, filter_view, AuthzDecision, AuthzOp, PolicySpec, POLICIES_TABLE};
 use crate::tiers::{self, AutoBound, RiskBand};
@@ -176,6 +178,7 @@ impl Engine {
             "INSERT OR IGNORE INTO branches(name, status, created_by, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![MAIN_BRANCH, "merged", "kernel", 0],
         )?;
+        crate::kernel::install(&db, 1_700_000_000)?;
         Ok(())
     }
 
@@ -493,19 +496,38 @@ impl Engine {
     ) -> Result<()> {
         Self::require_builder(session)?;
         self.require_open_branch(branch)?;
-        let mut spec = self.load_object_type(branch, type_name)?;
-        if !spec.interfaces.iter().any(|i| i == interface) {
-            spec.interfaces.push(interface.to_string());
+        match self.load_object_type(branch, type_name) {
+            Ok(mut spec) => {
+                if !spec.interfaces.iter().any(|i| i == interface) {
+                    spec.interfaces.push(interface.to_string());
+                }
+                let db = self.db.lock().expect("db");
+                Self::put_spec(
+                    &db,
+                    "schema_object_types",
+                    branch,
+                    type_name,
+                    &serde_json::to_value(&spec)?,
+                )?;
+                Ok(())
+            }
+            Err(OntoError::NotFound(_)) => {
+                let mut spec = self.load_action_type(branch, type_name)?;
+                if !spec.interfaces.iter().any(|i| i == interface) {
+                    spec.interfaces.push(interface.to_string());
+                }
+                let db = self.db.lock().expect("db");
+                Self::put_spec(
+                    &db,
+                    "schema_action_types",
+                    branch,
+                    type_name,
+                    &serde_json::to_value(&spec)?,
+                )?;
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
-        let db = self.db.lock().expect("db");
-        Self::put_spec(
-            &db,
-            "schema_object_types",
-            branch,
-            type_name,
-            &serde_json::to_value(&spec)?,
-        )?;
-        Ok(())
     }
 
     pub fn create_action_type(
@@ -702,6 +724,19 @@ impl Engine {
             )
             .optional()?
             .ok_or_else(|| OntoError::NotFound(format!("object type {name} on {branch}")))?;
+        Ok(serde_json::from_str(&spec)?)
+    }
+
+    fn load_interface(&self, branch: &str, name: &str) -> Result<InterfaceSpec> {
+        let db = self.db.lock().expect("db");
+        let spec: String = db
+            .query_row(
+                "SELECT spec FROM schema_interfaces WHERE branch = ?1 AND name = ?2",
+                params![branch, name],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| OntoError::NotFound(format!("interface {name} on {branch}")))?;
         Ok(serde_json::from_str(&spec)?)
     }
 
@@ -979,8 +1014,8 @@ impl Engine {
         }
         let mut missing = Vec::new();
         let mut stale = Vec::new();
-        if let Some(spec) = spec {
-            for prop in spec.properties {
+        if let Some(spec) = &spec {
+            for prop in &spec.properties {
                 if !properties.contains_key(&prop.name) && !prop.nullable {
                     missing.push(prop.name.clone());
                 }
@@ -988,21 +1023,44 @@ impl Engine {
                     if let (Some(budget), Some(stamp)) = (spec.freshness_budget_secs, &pv.as_of) {
                         if let Ok(ts) = stamp.parse::<i64>() {
                             if clock - ts > budget {
-                                stale.push(prop.name);
+                                stale.push(prop.name.clone());
                             }
                         }
                     }
                 }
             }
         }
-        Ok(ObjectView {
+        let mut view = ObjectView {
             id: id.to_string(),
             type_name: loaded.type_name,
             title: loaded.title,
             properties,
             missing,
             stale,
-        })
+        };
+        if let Some(spec) = spec {
+            if kernel::attached(&spec.interfaces, KernelInterface::Evidenced) {
+                if let Ok(iface) =
+                    self.load_interface(MAIN_BRANCH, KernelInterface::Evidenced.as_str())
+                {
+                    for gap in kernel::evidence_gaps(&spec, &iface, &view, clock) {
+                        match gap {
+                            kernel::EvidenceGap::Missing(p) => {
+                                if !view.missing.contains(&p) {
+                                    view.missing.push(p);
+                                }
+                            }
+                            kernel::EvidenceGap::Stale { property, .. } => {
+                                if !view.stale.contains(&property) {
+                                    view.stale.push(property);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(view)
     }
 
     pub fn traverse_links(
@@ -1430,7 +1488,8 @@ impl Engine {
             }
             Ok(Ok(param_reads)) => {
                 let path = path.param_and_permission(param_reads);
-                let (guards, guard_reads) = self.evaluate_guards(&spec.guards, &params)?;
+                let (mut guards, guard_reads) = self.evaluate_guards(&spec.guards, &params)?;
+                guards.extend(self.evidenced_guards(spec, &params)?);
                 let worst = worst_verdict(&guards);
                 let path = path.submission_criteria(guards, guard_reads, worst);
                 match worst {
@@ -1624,7 +1683,23 @@ impl Engine {
         confirmer_inbox: Option<&str>,
     ) -> Result<(Vec<StagedOp>, Option<String>)> {
         match spec.mode {
-            ExecutionMode::Propose | ExecutionMode::Shadow => {
+            ExecutionMode::Propose => {
+                if !kernel::require_inbox(spec) {
+                    return Ok((Vec::new(), None));
+                }
+                let inbox_id = new_id();
+                Ok((
+                    vec![StagedOp::InsertInbox {
+                        id: inbox_id.clone(),
+                        action_name: spec.name.clone(),
+                        proposed_by: session.actor.id.clone(),
+                        params: params.to_string(),
+                        created_at: self.now(),
+                    }],
+                    Some(inbox_id),
+                ))
+            }
+            ExecutionMode::Shadow => {
                 let inbox_id = new_id();
                 Ok((
                     vec![StagedOp::InsertInbox {
@@ -1646,6 +1721,32 @@ impl Engine {
                 Ok((ops, inbox_id))
             }
         }
+    }
+
+    fn evidenced_guards(&self, spec: &ActionTypeSpec, params: &Value) -> Result<Vec<GuardResult>> {
+        let mut out = Vec::new();
+        for p in &spec.parameters {
+            let Some(ot) = &p.object_type else {
+                continue;
+            };
+            let type_spec = match self.load_object_type(MAIN_BRANCH, ot) {
+                Ok(s) => s,
+                Err(OntoError::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            if !kernel::attached(&type_spec.interfaces, KernelInterface::Evidenced) {
+                continue;
+            }
+            let iface = self.load_interface(MAIN_BRANCH, KernelInterface::Evidenced.as_str())?;
+            let Some(id) = params.get(&p.name).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let view = self.load_object_view(id, AsOf::Current)?;
+            if let Some(g) = kernel::evidenced_guard(&type_spec, &iface, &view, self.now()) {
+                out.push(g);
+            }
+        }
+        Ok(out)
     }
 
     fn snapshot_object(&self, id: &str) -> Result<SnapshotObject> {
@@ -2198,7 +2299,10 @@ fn builder_tools() -> Vec<ToolSpec> {
         ("create_link_type", "Create a link type on a branch"),
         ("alter_link_type", "Alter a link type on a branch"),
         ("create_interface", "Create an interface on a branch"),
-        ("attach_interface", "Attach an interface to an object type"),
+        (
+            "attach_interface",
+            "Attach an interface to an object or action type",
+        ),
         ("create_action_type", "Create an action type on a branch"),
         ("alter_action_type", "Alter an action type on a branch"),
         ("create_function", "Create a function record on a branch"),

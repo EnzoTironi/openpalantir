@@ -224,6 +224,9 @@ pub struct ActionTypeSpec {
     pub compensation: Option<String>,
     pub side_effects: Value,
     pub on_review: Option<String>,
+    /// Kernel interfaces attached on a branch (Zhang 2026, Ch. 4). Empty until merge.
+    #[serde(default)]
+    pub interfaces: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
