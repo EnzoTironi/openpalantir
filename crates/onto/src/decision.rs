@@ -8,11 +8,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Host-visible status of a declared side effect. The kernel never marks
-/// delivery; Allow/committed is ontology-internal.
+/// delivery; Allow/committed is ontology-internal. Claim/ack are host
+/// custody, not a mail loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectStatus {
     Declared,
+    Claimed,
+    Acked,
 }
 
 impl EffectStatus {
@@ -20,6 +23,19 @@ impl EffectStatus {
     pub fn as_stored(self) -> &'static str {
         match self {
             Self::Declared => "declared",
+            Self::Claimed => "claimed",
+            Self::Acked => "acked",
+        }
+    }
+
+    pub fn from_stored(raw: &str) -> crate::error::Result<Self> {
+        match raw {
+            "declared" => Ok(Self::Declared),
+            "claimed" => Ok(Self::Claimed),
+            "acked" => Ok(Self::Acked),
+            other => Err(crate::error::OntoError::Invalid(format!(
+                "unknown effect status {other}"
+            ))),
         }
     }
 }
@@ -52,6 +68,19 @@ mod tests {
     #[test]
     fn does_declare_effect_without_claiming_delivery() {
         assert_eq!(EffectStatus::Declared.as_stored(), "declared");
+        assert_eq!(
+            EffectStatus::from_stored("declared").unwrap(),
+            EffectStatus::Declared
+        );
+        assert_eq!(
+            EffectStatus::from_stored("claimed").unwrap(),
+            EffectStatus::Claimed
+        );
+        assert_eq!(
+            EffectStatus::from_stored("acked").unwrap(),
+            EffectStatus::Acked
+        );
+        assert!(EffectStatus::from_stored("delivered").is_err());
         assert_eq!(
             chosen_integration(),
             IntegrationModel::EngineCanonicalWriter

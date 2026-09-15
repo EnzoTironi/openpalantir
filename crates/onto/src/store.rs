@@ -6,7 +6,7 @@
 
 use crate::bitemporal::{self, AsOf, LoadedVersion, VersionSpan};
 use crate::command::{DecisionApply, IdempotencyRow};
-use crate::decision::EffectStatus;
+use crate::decision::{EffectIntention, EffectStatus};
 use crate::error::{OntoError, Result};
 use crate::oss::OBJECT_SETS_TABLE;
 use crate::security::POLICIES_TABLE;
@@ -235,6 +235,14 @@ pub trait Store: Send + Sync {
         tx_at: i64,
     ) -> Result<()>;
     fn object_type_of(&self, id: &str) -> Result<String>;
+    fn link_sources(&self, to_id: &str, link_type: &str) -> Result<Vec<String>>;
+    fn list_empty_apply_inbox(&self) -> Result<Vec<String>>;
+    fn list_unpinned_branches(&self) -> Result<Vec<String>>;
+    fn reject_proposals_on_branch(&self, branch: &str) -> Result<()>;
+    fn list_effect_intentions(&self, status: Option<EffectStatus>) -> Result<Vec<EffectIntention>>;
+    fn claim_effect(&self, decision_record_id: &str) -> Result<()>;
+    fn ack_effect(&self, decision_record_id: &str) -> Result<()>;
+    fn reconcile_effects(&self) -> Result<Vec<EffectIntention>>;
 }
 
 /// Inbox row including the pinned apply Action and rule digest.
@@ -464,6 +472,82 @@ fn check_read_set(tx: &Transaction<'_>, read_set: &[(String, String)]) -> Result
         }
     }
     Ok(())
+}
+
+fn transition_effect(
+    db: &Connection,
+    id: &str,
+    from: EffectStatus,
+    to: EffectStatus,
+) -> Result<()> {
+    let n = db.execute(
+        "UPDATE effect_intentions SET status = ?1 WHERE decision_record_id = ?2 AND status = ?3",
+        params![to.as_stored(), id, from.as_stored()],
+    )?;
+    if n == 1 {
+        return Ok(());
+    }
+    let exists: Option<String> = db
+        .query_row(
+            "SELECT status FROM effect_intentions WHERE decision_record_id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match exists {
+        None => Err(OntoError::NotFound(format!("effect {id}"))),
+        Some(_) => Err(OntoError::Conflict(format!(
+            "effect {id} is not {}",
+            from.as_stored()
+        ))),
+    }
+}
+
+fn load_effect_rows(db: &Connection, filter: Option<EffectStatus>) -> Result<Vec<EffectIntention>> {
+    let mut out = Vec::new();
+    match filter {
+        Some(status) => {
+            let mut stmt = db.prepare(
+                "SELECT decision_record_id, declaration, status FROM effect_intentions
+                 WHERE status = ?1 ORDER BY created_at, decision_record_id",
+            )?;
+            let mapped = stmt.query_map(params![status.as_stored()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in mapped {
+                out.push(effect_from_row(row?)?);
+            }
+        }
+        None => {
+            let mut stmt = db.prepare(
+                "SELECT decision_record_id, declaration, status FROM effect_intentions
+                 ORDER BY created_at, decision_record_id",
+            )?;
+            let mapped = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in mapped {
+                out.push(effect_from_row(row?)?);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn effect_from_row((id, declaration, status): (String, String, String)) -> Result<EffectIntention> {
+    Ok(EffectIntention {
+        decision_record_id: id,
+        declaration: serde_json::from_str(&declaration).unwrap_or(Value::Null),
+        status: EffectStatus::from_stored(&status)?,
+    })
 }
 
 fn unique_violation(err: &rusqlite::Error) -> bool {
@@ -1066,6 +1150,86 @@ impl Store for SqliteStore {
             rusqlite::Error::QueryReturnedNoRows => OntoError::NotFound(format!("object {id}")),
             other => OntoError::Store(other.to_string()),
         })
+    }
+
+    fn link_sources(&self, to_id: &str, link_type: &str) -> Result<Vec<String>> {
+        let db = self.conn()?;
+        let mut stmt =
+            db.prepare("SELECT from_id FROM links WHERE to_id = ?1 AND type_name = ?2")?;
+        let sources: Vec<String> = stmt
+            .query_map(params![to_id, link_type], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(sources)
+    }
+
+    fn list_empty_apply_inbox(&self) -> Result<Vec<String>> {
+        let db = self.conn()?;
+        let mut stmt = db.prepare(
+            "SELECT id FROM inbox
+             WHERE COALESCE(apply_action, '') = ''
+               AND status NOT IN ('cancelled', 'confirmed')
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    fn list_unpinned_branches(&self) -> Result<Vec<String>> {
+        let db = self.conn()?;
+        let mut stmt = db.prepare(
+            "SELECT name FROM branches
+             WHERE name != ?1
+               AND COALESCE(base_revision, '') = ''
+               AND status IN ('open', 'proposed')
+             ORDER BY name",
+        )?;
+        let rows = stmt.query_map(params![MAIN_BRANCH], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    fn reject_proposals_on_branch(&self, branch: &str) -> Result<()> {
+        self.conn()?.execute(
+            "UPDATE proposals SET status = 'rejected'
+             WHERE branch = ?1 AND status IN ('under_review', 'approved')",
+            params![branch],
+        )?;
+        Ok(())
+    }
+
+    fn list_effect_intentions(&self, status: Option<EffectStatus>) -> Result<Vec<EffectIntention>> {
+        let db = self.conn()?;
+        load_effect_rows(&db, status)
+    }
+
+    fn claim_effect(&self, decision_record_id: &str) -> Result<()> {
+        let db = self.conn()?;
+        transition_effect(
+            &db,
+            decision_record_id,
+            EffectStatus::Declared,
+            EffectStatus::Claimed,
+        )
+    }
+
+    fn ack_effect(&self, decision_record_id: &str) -> Result<()> {
+        let db = self.conn()?;
+        transition_effect(
+            &db,
+            decision_record_id,
+            EffectStatus::Claimed,
+            EffectStatus::Acked,
+        )
+    }
+
+    fn reconcile_effects(&self) -> Result<Vec<EffectIntention>> {
+        let db = self.conn()?;
+        let mut declared = load_effect_rows(&db, Some(EffectStatus::Declared))?;
+        let mut claimed = load_effect_rows(&db, Some(EffectStatus::Claimed))?;
+        declared.append(&mut claimed);
+        declared.sort_by(|a, b| a.decision_record_id.cmp(&b.decision_record_id));
+        Ok(declared)
     }
 }
 

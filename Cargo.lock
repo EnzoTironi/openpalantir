@@ -359,6 +359,7 @@ name = "onto-bootstrap"
 version = "0.1.0"
 dependencies = [
  "onto",
+ "rusqlite",
  "serde_json",
 ]
 

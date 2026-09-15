@@ -9,6 +9,9 @@ description = "Runtime-created wastewater, higher-ed, and healthcare ontologies 
 onto = { path = "../onto" }
 serde_json.workspace = true
 
+[dev-dependencies]
+rusqlite.workspace = true
+
 [lints]
 workspace = true
 

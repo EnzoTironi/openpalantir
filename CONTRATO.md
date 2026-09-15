@@ -10,11 +10,13 @@ Modelo escolhido: **Engine Rust escritor canônico**. Não há segunda ontologia
 
 ## Dono do efeito
 
-O kernel declara a intenção (`effect_intentions.status = declared`) no mesmo commit da decisão. **Allow / committed é estado interno da ontologia, não entrega externa.** O host despacha, tenta, acusa e reconcilia. O kernel não marca delivered.
+O kernel declara a intenção (`effect_intentions.status = declared`) no mesmo commit da decisão. **Allow / committed é estado interno da ontologia, não entrega externa.** O host lista, reclama, acusa e reconcilia por `list_effect_intentions` / `claim_effect` / `ack_effect` / `reconcile_effects` (T3). O kernel não marca delivered e não executa correio/ERP.
 
 ## Autoridade
 
-Sessão vem do host autenticado. Argumentos do modelo não escolhem `roles` nem `tier`. O adaptador MCP local tem três chaves de processo (`--key builder|consumer|reviewer`). Consumer é T2 leitura/proposta. Reviewer é T3 confirmação, separado. Política em quatro níveis acompanha leitura, write-set, snapshot, metadados e título.
+Sessão vem do host autenticado. Argumentos do modelo não escolhem `roles` nem `tier`. O adaptador MCP local tem três chaves de processo (`--key builder|consumer|reviewer`). Consumer é T2 leitura/proposta. Reviewer é T3 confirmação, separado. HTTP em `/mcp` exige `Origin` na allowlist (`http://127.0.0.1:43177`, `http://localhost:43177`, mais `ONTO_MCP_ORIGINS`). Ausente ou errada → 403. Identidade continua `session_from_role`. Política em quatro níveis acompanha leitura, write-set, snapshot, metadados e título.
+
+`Engine::migrate_legacy` (chave builder) cancela inbox sem `apply_action` e rejeita branches sem `base_revision`. Não re-pina no main corrente. Linhas não migradas continuam fail-closed.
 
 ## Tempo
 

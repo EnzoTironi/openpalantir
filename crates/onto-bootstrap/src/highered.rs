@@ -195,6 +195,7 @@ pub fn define_highered(engine: &Engine, s: &Session, branch: &str) -> Result<()>
             object_type: None,
             required: true,
         },
+        // Caller card keeps `enrolled`. Commit writes the occupies count.
         ParamSpec {
             name: "enrolled".into(),
             value_type: "Count".into(),
@@ -244,13 +245,15 @@ pub fn define_highered(engine: &Engine, s: &Session, branch: &str) -> Result<()>
                     "properties": { "occupant": "$student", "slots": 0 }
                 },
                 {
-                    "update": "section",
-                    "properties": { "enrolled": "$enrolled" }
-                },
-                {
                     "link": "occupies",
                     "from": "student",
                     "to": "seat"
+                },
+                {
+                    "count_links": "occupies",
+                    "update": "section",
+                    "property": "enrolled",
+                    "via": "section_has_seat"
                 }
             ]),
             compensation: Some("release_seat".into()),
@@ -279,6 +282,12 @@ pub fn define_highered(engine: &Engine, s: &Session, branch: &str) -> Result<()>
                     "close_link": "occupies",
                     "from": "student",
                     "to": "seat"
+                },
+                {
+                    "count_links": "occupies",
+                    "update": "section",
+                    "property": "enrolled",
+                    "via": "section_has_seat"
                 }
             ]),
             compensation: None,

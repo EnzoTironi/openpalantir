@@ -2,11 +2,14 @@ use crate::bitemporal::{self, AsOf};
 use crate::clock::Clock;
 use crate::command::{self, payload_digest, DecisionApply};
 use crate::compensation::{self, Compensation};
+use crate::decision::{EffectIntention, EffectStatus};
 use crate::disclosure;
+use crate::effects::{self, Cardinality, EffectOp};
 use crate::error::{OntoError, Result};
 use crate::functions::{self, FunctionSpec};
 use crate::guards;
 use crate::kernel::{self, KernelInterface};
+use crate::migrate::MigrateReport;
 use crate::oss::{
     apply_permission, evaluate_members, ObjectSet, ObjectSetFilter, ObjectSetSpec,
     OBJECT_SETS_TABLE,
@@ -342,6 +345,22 @@ impl Engine {
         Self::require_builder(session)?;
         self.require_open_branch(branch)?;
         guards::parse_guards(&spec.guards)?;
+        let plan = effects::parse_plan(&spec.effects, &spec.parameters)?;
+        for op in &plan {
+            if let EffectOp::CountLinks { link, via, .. } = op {
+                for name in [link.as_str(), via.as_str()] {
+                    if self
+                        .store
+                        .load_spec("schema_link_types", branch, name)?
+                        .is_none()
+                    {
+                        return Err(OntoError::Invalid(format!(
+                            "count_links unknown link type {name}"
+                        )));
+                    }
+                }
+            }
+        }
         self.put_spec(
             "schema_action_types",
             branch,
@@ -410,6 +429,11 @@ impl Engine {
             .store
             .branch_base_revision(&branch)?
             .ok_or_else(|| OntoError::NotFound(format!("branch {branch}")))?;
+        if expected.is_empty() {
+            return Err(OntoError::Invalid(
+                "branch has no pinned base revision".into(),
+            ));
+        }
         self.store.replace_main_schema_if_base(&branch, &expected)?;
         self.store.set_proposal(proposal_id, "merged", None)?;
         self.store.set_branch_status(&branch, "merged")?;
@@ -419,6 +443,26 @@ impl Engine {
             &json!({ "proposal": proposal_id, "branch": branch }),
         )?;
         Ok(())
+    }
+
+    /// Cancel unpinned inbox rows and reject unpinned schema branches.
+    ///
+    /// Unmigrated rows stay fail-closed. Does not re-pin a stale branch onto
+    /// current main.
+    pub fn migrate_legacy(&self, session: &Session) -> Result<MigrateReport> {
+        Self::require_builder(session)?;
+        let mut report = MigrateReport::default();
+        for id in self.store.list_empty_apply_inbox()? {
+            self.store.set_inbox_status(&id, "cancelled")?;
+            report.cancelled_inbox.push(id);
+        }
+        for name in self.store.list_unpinned_branches()? {
+            self.store.set_branch_status(&name, "rejected")?;
+            self.store.reject_proposals_on_branch(&name)?;
+            report.rejected_branches.push(name);
+        }
+        self.audit(&session.actor.id, "migrate_legacy", &json!({}))?;
+        Ok(report)
     }
 
     pub fn get_schema(&self, session: &Session, branch: Option<&str>) -> Result<SchemaSnapshot> {
@@ -985,6 +1029,34 @@ impl Engine {
         self.execute_action(session, &spec, &params, None)
     }
 
+    pub fn list_effect_intentions(
+        &self,
+        session: &Session,
+        status: Option<EffectStatus>,
+    ) -> Result<Vec<EffectIntention>> {
+        Self::require_consumer(session)?;
+        tiers::require_syscall(session.actor.tier, "list_effect_intentions")?;
+        self.store.list_effect_intentions(status)
+    }
+
+    pub fn claim_effect(&self, session: &Session, decision_record_id: &str) -> Result<()> {
+        Self::require_consumer(session)?;
+        tiers::require_syscall(session.actor.tier, "claim_effect")?;
+        self.store.claim_effect(decision_record_id)
+    }
+
+    pub fn ack_effect(&self, session: &Session, decision_record_id: &str) -> Result<()> {
+        Self::require_consumer(session)?;
+        tiers::require_syscall(session.actor.tier, "ack_effect")?;
+        self.store.ack_effect(decision_record_id)
+    }
+
+    pub fn reconcile_effects(&self, session: &Session) -> Result<Vec<EffectIntention>> {
+        Self::require_consumer(session)?;
+        tiers::require_syscall(session.actor.tier, "reconcile_effects")?;
+        self.store.reconcile_effects()
+    }
+
     pub fn confirm_action(&self, session: &Session, inbox_id: &str) -> Result<ActionOutcome> {
         Self::require_consumer(session)?;
         tiers::require_syscall(session.actor.tier, "confirm_action")?;
@@ -1319,7 +1391,18 @@ impl Engine {
         path: WritePath<crate::write_path::SubmissionCriteria>,
         digest: &str,
     ) -> Result<ActionOutcome> {
-        let (staged, inbox_id) = self.build_stage(session, spec, params, confirmer_inbox)?;
+        let (staged, inbox_id) = match self.build_stage(session, spec, params, confirmer_inbox) {
+            Ok(v) => v,
+            Err(OntoError::Denied(reason)) => {
+                let path = path.deny_stage(GuardResult {
+                    name: "cardinality".into(),
+                    verdict: Verdict::Deny,
+                    reason: reason.clone(),
+                });
+                return self.finish_abort(session, spec, params, &path, reason, None, digest);
+            }
+            Err(e) => return Err(e),
+        };
         let path = path.stage(staged);
         let created: Vec<String> = path
             .staged
@@ -1466,7 +1549,7 @@ impl Engine {
                 ))
             }
             ExecutionMode::Auto | ExecutionMode::Approve => {
-                let mut ops = self.stage_effects(&spec.effects, params, &session.actor.id)?;
+                let mut ops = self.stage_effects(spec, params, &session.actor.id)?;
                 let inbox_id = confirmer_inbox.map(str::to_string);
                 if let Some(id) = &inbox_id {
                     ops.push(StagedOp::ConfirmInbox { id: id.clone() });
@@ -1588,141 +1671,303 @@ impl Engine {
         })
     }
 
-    #[allow(clippy::too_many_lines)] // create/update/link/close_link stay one write-set builder
-    fn stage_effects(&self, effects: &Value, params: &Value, actor: &str) -> Result<Vec<StagedOp>> {
+    #[allow(clippy::too_many_lines)] // typed plan apply stays one write-set builder
+    fn stage_effects(
+        &self,
+        spec: &ActionTypeSpec,
+        params: &Value,
+        actor: &str,
+    ) -> Result<Vec<StagedOp>> {
+        let plan = effects::parse_plan(&spec.effects, &spec.parameters)?;
         let mut staged = Vec::new();
         let mut created_ids = Vec::new();
         let mut created_types: BTreeMap<String, String> = BTreeMap::new();
         let mut pending: BTreeMap<String, BTreeMap<String, PropertyView>> = BTreeMap::new();
-        let Some(arr) = effects.as_array() else {
-            return Ok(staged);
-        };
-        for effect in arr {
-            let obj = effect
-                .as_object()
-                .ok_or_else(|| OntoError::Invalid("effect must be object".into()))?;
-            if let Some(type_name) = obj.get("create").and_then(Value::as_str) {
-                if self.load_object_type(MAIN_BRANCH, type_name).is_err() {
-                    return Err(OntoError::Invalid(format!(
-                        "cannot create unknown type {type_name}"
-                    )));
-                }
-                let mut props = BTreeMap::new();
-                if let Some(fields) = obj.get("properties").and_then(Value::as_object) {
-                    for (k, v) in fields {
-                        let value = resolve_value(v, params);
-                        props.insert(
-                            k.clone(),
-                            PropertyView {
-                                value,
-                                source: PropertySource::ActionWritten,
-                                as_of: Some(self.now().to_string()),
-                                provenance: Some(format!("actor:{actor}")),
-                            },
-                        );
-                    }
-                }
-                let id = new_id();
-                let title = props
-                    .get("title")
-                    .or_else(|| props.get("name"))
-                    .and_then(|p| p.value.as_str().map(str::to_string));
-                pending.insert(id.clone(), props.clone());
-                staged.push(StagedOp::InsertObject {
-                    id: id.clone(),
-                    type_name: type_name.into(),
-                    title,
-                    properties: serde_json::to_string(&props)?,
-                    created_at: self.now(),
-                });
-                created_ids.push(id.clone());
-                created_types.insert(id, type_name.into());
-            }
-            if let Some(target_param) = obj.get("update").and_then(Value::as_str) {
-                let id = param_str(params, target_param)?;
-                let mut view_props = if let Some(existing) = pending.get(&id) {
-                    existing.clone()
-                } else {
-                    let raw = self.store.current_properties(&id)?;
-                    serde_json::from_str::<BTreeMap<String, PropertyView>>(&raw)?
-                };
-                if let Some(fields) = obj.get("properties").and_then(Value::as_object) {
-                    for (k, v) in fields {
-                        let value = resolve_value(v, params);
-                        view_props.insert(
-                            k.clone(),
-                            PropertyView {
-                                value,
-                                source: PropertySource::ActionWritten,
-                                as_of: Some(self.now().to_string()),
-                                provenance: Some(format!("actor:{actor}")),
-                            },
-                        );
-                    }
-                }
-                pending.insert(id.clone(), view_props.clone());
-                staged.retain(|op| match op {
-                    StagedOp::UpdateObject { id: sid, .. } => sid != &id,
-                    _ => true,
-                });
-                staged.push(StagedOp::UpdateObject {
-                    id,
-                    properties: serde_json::to_string(&view_props)?,
-                });
-            }
-            if obj.get("link").is_some() {
-                let link = match resolve_value(obj.get("link").unwrap_or(&Value::Null), params) {
-                    Value::String(s) if !s.is_empty() => s,
-                    _ => {
-                        return Err(OntoError::Invalid("link effect needs a link type".into()));
-                    }
-                };
-                let from = param_str(
-                    params,
-                    obj.get("from").and_then(Value::as_str).unwrap_or("from"),
-                )?;
-                let to = if let Some(to_param) = obj.get("to").and_then(Value::as_str) {
-                    param_str(params, to_param)?
-                } else if let Some(last) = created_ids.last() {
-                    last.clone()
-                } else {
-                    return Err(OntoError::Invalid("link effect needs to".into()));
-                };
-                self.validate_link(&link, &from, &to, &created_types)?;
-                staged.push(StagedOp::InsertLink {
-                    id: new_id(),
-                    type_name: link,
-                    from_id: from,
-                    to_id: to,
-                });
-            }
-            if let Some(link) = obj.get("close_link") {
-                let type_name = match resolve_value(link, params) {
-                    Value::String(s) if !s.is_empty() => s,
-                    _ => {
-                        return Err(OntoError::Invalid(
-                            "close_link effect needs a link type".into(),
-                        ));
-                    }
-                };
-                let from = param_str(
-                    params,
-                    obj.get("from").and_then(Value::as_str).unwrap_or("from"),
-                )?;
-                let to = param_str(
-                    params,
-                    obj.get("to").and_then(Value::as_str).ok_or_else(|| {
-                        OntoError::Invalid("close_link needs both endpoints".into())
-                    })?,
-                )?;
-                staged.push(StagedOp::CloseLink {
+        let mut counts = Vec::new();
+        for op in plan {
+            match op {
+                EffectOp::Create {
                     type_name,
-                    from_id: from,
-                    to_id: to,
-                });
+                    properties,
+                } => {
+                    if self.load_object_type(MAIN_BRANCH, &type_name).is_err() {
+                        return Err(OntoError::Invalid(format!(
+                            "cannot create unknown type {type_name}"
+                        )));
+                    }
+                    let mut props = BTreeMap::new();
+                    for (k, v) in properties {
+                        props.insert(
+                            k,
+                            PropertyView {
+                                value: resolve_value(&v, params),
+                                source: PropertySource::ActionWritten,
+                                as_of: Some(self.now().to_string()),
+                                provenance: Some(format!("actor:{actor}")),
+                            },
+                        );
+                    }
+                    let id = new_id();
+                    let title = props
+                        .get("title")
+                        .or_else(|| props.get("name"))
+                        .and_then(|p| p.value.as_str().map(str::to_string));
+                    pending.insert(id.clone(), props.clone());
+                    staged.push(StagedOp::InsertObject {
+                        id: id.clone(),
+                        type_name: type_name.clone(),
+                        title,
+                        properties: serde_json::to_string(&props)?,
+                        created_at: self.now(),
+                    });
+                    created_ids.push(id.clone());
+                    created_types.insert(id, type_name);
+                }
+                EffectOp::Update { target, properties } => {
+                    let id = param_str(params, &target)?;
+                    let fields = properties
+                        .into_iter()
+                        .map(|(k, v)| (k, resolve_value(&v, params)))
+                        .collect();
+                    self.stage_property_map(&mut staged, &mut pending, &id, fields, actor)?;
+                }
+                EffectOp::Link { link, from, to } => {
+                    let link = match resolve_value(&link, params) {
+                        Value::String(s) if !s.is_empty() => s,
+                        _ => {
+                            return Err(OntoError::Invalid("link effect needs a link type".into()));
+                        }
+                    };
+                    let from = param_str(params, &from)?;
+                    let to = if let Some(to_param) = to {
+                        param_str(params, &to_param)?
+                    } else if let Some(last) = created_ids.last() {
+                        last.clone()
+                    } else {
+                        return Err(OntoError::Invalid("link effect needs to".into()));
+                    };
+                    self.validate_link(&link, &from, &to, &created_types)?;
+                    self.require_cardinality(&staged, &link, &from, &to)?;
+                    staged.push(StagedOp::InsertLink {
+                        id: new_id(),
+                        type_name: link,
+                        from_id: from,
+                        to_id: to,
+                    });
+                }
+                EffectOp::CloseLink { link, from, to } => {
+                    let type_name = match resolve_value(&link, params) {
+                        Value::String(s) if !s.is_empty() => s,
+                        _ => {
+                            return Err(OntoError::Invalid(
+                                "close_link effect needs a link type".into(),
+                            ));
+                        }
+                    };
+                    staged.push(StagedOp::CloseLink {
+                        type_name,
+                        from_id: param_str(params, &from)?,
+                        to_id: param_str(params, &to)?,
+                    });
+                }
+                EffectOp::CountLinks {
+                    link,
+                    update,
+                    property,
+                    via,
+                } => counts.push((link, update, property, via)),
             }
         }
+        for (link, update, property, via) in counts {
+            let id = param_str(params, &update)?;
+            let seats = self.seats_via(&staged, &via, &id)?;
+            let mut n: i64 = 0;
+            for seat in seats {
+                let add = i64::try_from(self.occupant_count(&staged, &link, &seat)?)
+                    .map_err(|_| OntoError::Invalid("link count overflow".into()))?;
+                n = n.saturating_add(add);
+            }
+            let mut fields = BTreeMap::new();
+            fields.insert(property, json!(n));
+            self.stage_property_map(&mut staged, &mut pending, &id, fields, actor)?;
+        }
         Ok(staged)
+    }
+
+    fn stage_property_map(
+        &self,
+        staged: &mut Vec<StagedOp>,
+        pending: &mut BTreeMap<String, BTreeMap<String, PropertyView>>,
+        id: &str,
+        fields: BTreeMap<String, Value>,
+        actor: &str,
+    ) -> Result<()> {
+        let mut view_props = if let Some(existing) = pending.get(id) {
+            existing.clone()
+        } else {
+            let raw = self.store.current_properties(id)?;
+            serde_json::from_str::<BTreeMap<String, PropertyView>>(&raw)?
+        };
+        for (k, value) in fields {
+            view_props.insert(
+                k,
+                PropertyView {
+                    value,
+                    source: PropertySource::ActionWritten,
+                    as_of: Some(self.now().to_string()),
+                    provenance: Some(format!("actor:{actor}")),
+                },
+            );
+        }
+        pending.insert(id.to_string(), view_props.clone());
+        staged.retain(|op| match op {
+            StagedOp::UpdateObject { id: sid, .. } => sid != id,
+            StagedOp::InsertObject { .. }
+            | StagedOp::InsertLink { .. }
+            | StagedOp::InsertInbox { .. }
+            | StagedOp::ConfirmInbox { .. }
+            | StagedOp::CloseLink { .. } => true,
+        });
+        staged.push(StagedOp::UpdateObject {
+            id: id.to_string(),
+            properties: serde_json::to_string(&view_props)?,
+        });
+        Ok(())
+    }
+
+    fn require_cardinality(
+        &self,
+        staged: &[StagedOp],
+        link: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<()> {
+        let spec: LinkTypeSpec = self.load_named("schema_link_types", MAIN_BRANCH, link, || {
+            format!("link type {link}")
+        })?;
+        let card = Cardinality::parse(&spec.cardinality);
+        if effects::breaks_cardinality(
+            card,
+            self.outgoing_taken(staged, link, from)?,
+            self.incoming_taken(staged, link, to)?,
+        ) {
+            return Err(OntoError::Denied(format!("link {link} breaks cardinality")));
+        }
+        Ok(())
+    }
+
+    fn outgoing_taken(&self, staged: &[StagedOp], link: &str, from: &str) -> Result<bool> {
+        let live = !self.store.link_targets(from, link)?.is_empty();
+        let closed = staged.iter().any(|op| {
+            matches!(
+                op,
+                StagedOp::CloseLink {
+                    type_name,
+                    from_id,
+                    ..
+                } if type_name == link && from_id == from
+            )
+        });
+        let added = staged.iter().any(|op| {
+            matches!(
+                op,
+                StagedOp::InsertLink {
+                    type_name,
+                    from_id,
+                    ..
+                } if type_name == link && from_id == from
+            )
+        });
+        Ok((live && !closed) || added)
+    }
+
+    fn incoming_taken(&self, staged: &[StagedOp], link: &str, to: &str) -> Result<bool> {
+        let live = !self.store.link_sources(to, link)?.is_empty();
+        let closed = staged.iter().any(|op| {
+            matches!(
+                op,
+                StagedOp::CloseLink {
+                    type_name,
+                    to_id,
+                    ..
+                } if type_name == link && to_id == to
+            )
+        });
+        let added = staged.iter().any(|op| {
+            matches!(
+                op,
+                StagedOp::InsertLink {
+                    type_name,
+                    to_id,
+                    ..
+                } if type_name == link && to_id == to
+            )
+        });
+        Ok((live && !closed) || added)
+    }
+
+    fn seats_via(&self, staged: &[StagedOp], via: &str, from: &str) -> Result<Vec<String>> {
+        let mut seats = self.store.link_targets(from, via)?;
+        for op in staged {
+            match op {
+                StagedOp::InsertLink {
+                    type_name,
+                    from_id,
+                    to_id,
+                    ..
+                } if type_name == via && from_id == from => {
+                    if !seats.contains(to_id) {
+                        seats.push(to_id.clone());
+                    }
+                }
+                StagedOp::CloseLink {
+                    type_name,
+                    from_id,
+                    to_id,
+                } if type_name == via && from_id == from => {
+                    seats.retain(|s| s != to_id);
+                }
+                StagedOp::InsertObject { .. }
+                | StagedOp::UpdateObject { .. }
+                | StagedOp::InsertLink { .. }
+                | StagedOp::InsertInbox { .. }
+                | StagedOp::ConfirmInbox { .. }
+                | StagedOp::CloseLink { .. } => {}
+            }
+        }
+        Ok(seats)
+    }
+
+    fn occupant_count(&self, staged: &[StagedOp], link: &str, seat: &str) -> Result<usize> {
+        let mut occupants = self.store.link_sources(seat, link)?;
+        for op in staged {
+            match op {
+                StagedOp::InsertLink {
+                    type_name,
+                    from_id,
+                    to_id,
+                    ..
+                } if type_name == link && to_id == seat => {
+                    if !occupants.contains(from_id) {
+                        occupants.push(from_id.clone());
+                    }
+                }
+                StagedOp::CloseLink {
+                    type_name,
+                    from_id,
+                    to_id,
+                } if type_name == link && to_id == seat => {
+                    occupants.retain(|s| s != from_id);
+                }
+                StagedOp::InsertObject { .. }
+                | StagedOp::UpdateObject { .. }
+                | StagedOp::InsertLink { .. }
+                | StagedOp::InsertInbox { .. }
+                | StagedOp::ConfirmInbox { .. }
+                | StagedOp::CloseLink { .. } => {}
+            }
+        }
+        Ok(occupants.len())
     }
 
     fn load_cached_outcome(&self, key: &str, digest: &str) -> Result<Option<ActionOutcome>> {
@@ -1748,40 +1993,48 @@ impl Engine {
         spec: &ActionTypeSpec,
         params: &Value,
     ) -> Result<()> {
-        let Some(arr) = spec.effects.as_array() else {
-            return Ok(());
-        };
-        for effect in arr {
-            if let Some(target) = effect.get("update").and_then(Value::as_str) {
-                let id = param_str(params, target)?;
-                let type_name = self.store.object_type_of(&id)?;
-                self.require_write(session, &type_name, &id)?;
-                if let Some(fields) = effect.get("properties").and_then(Value::as_object) {
-                    for name in fields.keys() {
+        let plan = effects::parse_plan(&spec.effects, &spec.parameters)?;
+        for op in plan {
+            match op {
+                EffectOp::Update { target, properties } => {
+                    let id = param_str(params, &target)?;
+                    let type_name = self.store.object_type_of(&id)?;
+                    self.require_write(session, &type_name, &id)?;
+                    for name in properties.keys() {
                         self.require_write_property(session, &type_name, &id, Some(name))?;
                     }
                 }
-            }
-            if let Some(type_name) = effect.get("create").and_then(Value::as_str) {
-                self.require_write(session, type_name, "*")?;
-            }
-            if effect.get("link").is_some() || effect.get("close_link").is_some() {
-                let from = param_str(
-                    params,
-                    effect.get("from").and_then(Value::as_str).unwrap_or("from"),
-                )?;
-                if self.store.identity_exists(&from)? {
-                    let from_type = self.store.object_type_of(&from)?;
-                    self.require_write(session, &from_type, &from)?;
+                EffectOp::Create { type_name, .. } => {
+                    self.require_write(session, &type_name, "*")?;
                 }
-                if let Some(to_param) = effect.get("to").and_then(Value::as_str) {
-                    if let Ok(to) = param_str(params, to_param) {
-                        if self.store.identity_exists(&to)? {
-                            let to_type = self.store.object_type_of(&to)?;
-                            self.require_write(session, &to_type, &to)?;
-                        }
+                EffectOp::Link { from, to, .. } => {
+                    self.authorize_link_end(session, params, &from)?;
+                    if let Some(to) = to {
+                        self.authorize_link_end(session, params, &to)?;
                     }
                 }
+                EffectOp::CloseLink { from, to, .. } => {
+                    self.authorize_link_end(session, params, &from)?;
+                    self.authorize_link_end(session, params, &to)?;
+                }
+                EffectOp::CountLinks {
+                    update, property, ..
+                } => {
+                    let id = param_str(params, &update)?;
+                    let type_name = self.store.object_type_of(&id)?;
+                    self.require_write(session, &type_name, &id)?;
+                    self.require_write_property(session, &type_name, &id, Some(&property))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn authorize_link_end(&self, session: &Session, params: &Value, name: &str) -> Result<()> {
+        if let Ok(id) = param_str(params, name) {
+            if self.store.identity_exists(&id)? {
+                let type_name = self.store.object_type_of(&id)?;
+                self.require_write(session, &type_name, &id)?;
             }
         }
         Ok(())
@@ -1939,6 +2192,10 @@ fn builder_tools() -> Vec<ToolSpec> {
         ("review_proposal", "Approve or reject a proposal"),
         ("merge_to_main", "Merge an approved proposal into main"),
         (
+            "migrate_legacy",
+            "Cancel inbox without apply_action; reject branches without base_revision",
+        ),
+        (
             "get_schema",
             "Read schema of a branch (never production instances)",
         ),
@@ -1989,6 +2246,22 @@ fn consumer_base_tools() -> Vec<ToolSpec> {
         (
             "compensate_action",
             "Submit the named inverse Action of an Allow DecisionRecord",
+        ),
+        (
+            "list_effect_intentions",
+            "List durable effect intentions; Allow is not delivery",
+        ),
+        (
+            "claim_effect",
+            "Host claims a declared effect intention (not delivery)",
+        ),
+        (
+            "ack_effect",
+            "Host acks a claimed effect intention (not delivery)",
+        ),
+        (
+            "reconcile_effects",
+            "List declared and claimed effect intentions still in custody",
         ),
     ]
     .into_iter()

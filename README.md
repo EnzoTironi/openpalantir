@@ -12,7 +12,7 @@ Inspirado em Zhang, *Operational Ontology: From Business Mirror to Decision Runt
 - **Interfaces são contratos (Zhang 2026, Ch. 4–5):** `Reviewable` num ActionType em modo Propose cria objeto de inbox; `Evidenced` num ObjectType faz o submit que o lê falhar Complete (Review) se a evidência obrigatória falta ou está velha. Attach não mergeado não vale no `main`.
 - **Chave consumer:** consultar o mundo e executar Actions pré-definidas. Não edita schema. Instâncias são deny-by-default em quatro níveis (Zhang 2026, Ch. 10): plataforma (consumer vs builder), tipo, instância, propriedade. Sem grant é `Deny`. Propriedade `Deny` some na leitura (`get_object` e object sets), não só `rationale`.
 - **Chave builder:** edita schema num branch. Não lê nem escreve instâncias de produção.
-- Toda escrita de negócio passa por Action no write path de 7 passos (`WritePathStep`): submit → param+permission → submission criteria → staged edits (all-or-discard) → commit atômico da unidade de decisão → selar `DecisionRecord` → declarar side effects com chave de idempotência. `Allow`/committed não é entrega externa. Funnel não sobrescreve propriedade `ActionWritten`. `create_link` não é API pública; links nascem por Action (`assert_link`) ou Funnel.
+- Toda escrita de negócio passa por Action no write path de 7 passos (`WritePathStep`): submit → param+permission → submission criteria → staged edits (all-or-discard) → commit atômico da unidade de decisão → selar `DecisionRecord` → declarar side effects com chave de idempotência. `Allow`/committed não é entrega externa. O plano de efeitos é tipado na publicação; cardinalidade de Link vale no commit (segundo `occupies` em 1:1 é `Deny`). Em ensino superior, `enrolled` deriva de `occupies`, nunca do parâmetro do caller. Funnel não sobrescreve propriedade `ActionWritten`. `create_link` não é API pública; links nascem por Action (`assert_link`) ou Funnel.
 - Compensação de um `Allow` submete a Action nomeada em `ActionTypeSpec.compensation` pelo mesmo write path (`Engine::compensate_action`). Sela um `DecisionRecord` novo. O original permanece. Versões de objeto só acrescentam (Zhang 2026, Ch. 9: compensate forward). Sem nome de compensação é `OntoError::NoCompensation`, não sucesso silencioso. Retry com a mesma chave de idempotência não aplica de novo.
 - Instâncias são versionadas (Zhang 2026, Ch. 5): cada escrita de propriedades **acrescenta** um `VersionSpan` (valid time + transaction time). `get_object(id)` lê a versão aberta; `get_object(id, as_of)` reconstrói o objeto no tempo válido. Ponta aberta é `None`. Não há overwrite in-place na tabela `objects`.
 - `DecisionRecord.data_snapshot` pina os objetos lidos nos guards, mais `rule_version`, `function_version` (digest das funções invocadas) e `engine_version`.
@@ -65,11 +65,13 @@ MCP reviewer (T3, chave de processo separada):
 cargo run -p onto-mcp -- --key reviewer --db onto.db
 ```
 
-HTTP (porta 43177):
+HTTP (porta 43177). `Origin` obrigatório na allowlist (`http://127.0.0.1:43177`, `http://localhost:43177`, ou `ONTO_MCP_ORIGINS`). Ausente ou errada → 403. Identidade continua da chave de processo, não do request.
 
 ```bash
 cargo run -p onto-mcp -- --key consumer --bootstrap --http
 ```
+
+`Engine::migrate_legacy` cancela inbox sem `apply_action` e rejeita branches sem `base_revision`. Linhas não migradas continuam fail-closed. Host T3: `list_effect_intentions` / `claim_effect` / `ack_effect` / `reconcile_effects`. Allow não é entrega.
 
 CLI de debug (não é produto):
 

@@ -1,7 +1,12 @@
 #![allow(clippy::missing_errors_doc)] // OntoError is the public contract
 #![allow(clippy::missing_panics_doc)] // process entry: bind/open failures abort
 
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    http::{header, HeaderMap, StatusCode},
+    routing::post,
+    Json, Router,
+};
 use onto::{dispatch, Actor, AgentTier, Engine, Session};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -154,11 +159,43 @@ fn rpc_err(id: Option<Value>, msg: &str) -> RpcResponse {
     }
 }
 
+fn default_origins() -> Vec<String> {
+    vec![
+        "http://127.0.0.1:43177".into(),
+        "http://localhost:43177".into(),
+    ]
+}
+
+#[must_use]
+fn origin_allowed(origin: Option<&str>) -> bool {
+    let Some(origin) = origin else {
+        return false;
+    };
+    let mut allowed = default_origins();
+    if let Ok(extra) = std::env::var("ONTO_MCP_ORIGINS") {
+        for part in extra.split(',') {
+            let part = part.trim();
+            if !part.is_empty() {
+                allowed.push(part.to_string());
+            }
+        }
+    }
+    allowed.iter().any(|o| o == origin)
+}
+
 async fn http_rpc(
     State(app): State<App>,
+    headers: HeaderMap,
     Json(req): Json<RpcRequest>,
-) -> Json<Option<RpcResponse>> {
-    Json(handle(&app.engine, app.role, req))
+) -> (StatusCode, Json<Option<RpcResponse>>) {
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    if !origin_allowed(origin) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(Some(rpc_err(req.id, "origin missing or not allowed"))),
+        );
+    }
+    (StatusCode::OK, Json(handle(&app.engine, app.role, req)))
 }
 
 fn parse_role() -> HostRole {
@@ -275,5 +312,73 @@ mod tests {
         assert_eq!(session.actor.key, KeyKind::Consumer);
         assert_eq!(session.actor.tier, AgentTier::T3);
         assert!(session.actor.has_role("supervisor"));
+    }
+
+    #[test]
+    fn does_reject_origin_if_missing_or_wrong() {
+        assert!(!origin_allowed(None));
+        assert!(!origin_allowed(Some("https://evil.example")));
+        assert!(!origin_allowed(Some("http://127.0.0.1:1")));
+        assert!(origin_allowed(Some("http://127.0.0.1:43177")));
+        assert!(origin_allowed(Some("http://localhost:43177")));
+    }
+
+    #[tokio::test]
+    async fn does_reject_http_if_origin_is_missing() {
+        let addr = spawn_mcp().await;
+        let (status, body) = post_mcp(addr, "", INIT).await;
+        assert_eq!(status, 403, "{body}");
+        assert!(body.contains("origin missing or not allowed"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn does_reject_http_if_origin_is_wrong() {
+        let addr = spawn_mcp().await;
+        let (status, body) = post_mcp(addr, "Origin: https://evil.example\r\n", INIT).await;
+        assert_eq!(status, 403, "{body}");
+    }
+
+    #[tokio::test]
+    async fn does_accept_http_if_origin_is_allowlisted() {
+        let addr = spawn_mcp().await;
+        let (status, body) = post_mcp(addr, "Origin: http://127.0.0.1:43177\r\n", INIT).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("onto-consumer"), "{body}");
+        assert!(!body.contains("mcp.builder"));
+    }
+
+    const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+
+    async fn spawn_mcp() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::memory().unwrap());
+        let app = Router::new().route("/mcp", post(http_rpc)).with_state(App {
+            engine,
+            role: HostRole::Consumer,
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        addr
+    }
+
+    async fn post_mcp(addr: std::net::SocketAddr, extra: &str, body: &str) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let raw = String::from_utf8_lossy(&buf);
+        let status = raw
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, raw.into_owned())
     }
 }

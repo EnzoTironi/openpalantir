@@ -1,4 +1,5 @@
 use crate::bitemporal::AsOf;
+use crate::decision::EffectStatus;
 use crate::engine::Engine;
 use crate::error::{OntoError, Result};
 use crate::functions::FunctionSpec;
@@ -133,6 +134,7 @@ fn dispatch_builder(engine: &Engine, session: &Session, tool: &str, args: &Value
             engine.merge_to_main(session, str_arg(args, "proposal_id")?)?;
             Ok(json!({ "ok": true }))
         }
+        "migrate_legacy" => Ok(serde_json::to_value(engine.migrate_legacy(session)?)?),
         "get_schema" => {
             let branch = args.get("branch").and_then(|v| v.as_str());
             Ok(serde_json::to_value(engine.get_schema(session, branch)?)?)
@@ -253,6 +255,24 @@ fn dispatch_consumer(
                 overlay,
             )?)?)
         }
+        "list_effect_intentions" => {
+            let status = match args.get("status").and_then(Value::as_str) {
+                Some(raw) => Some(EffectStatus::from_stored(raw)?),
+                None => None,
+            };
+            Ok(serde_json::to_value(
+                engine.list_effect_intentions(session, status)?,
+            )?)
+        }
+        "claim_effect" => {
+            engine.claim_effect(session, str_arg(args, "decision_record_id")?)?;
+            Ok(json!({ "ok": true }))
+        }
+        "ack_effect" => {
+            engine.ack_effect(session, str_arg(args, "decision_record_id")?)?;
+            Ok(json!({ "ok": true }))
+        }
+        "reconcile_effects" => Ok(serde_json::to_value(engine.reconcile_effects(session)?)?),
         "funnel_ingest" => {
             let records: Vec<IngestRecord> = serde_json::from_value(require(args, "records")?)?;
             Ok(json!({ "ids": engine.funnel_ingest(session, records)? }))

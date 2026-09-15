@@ -460,7 +460,11 @@ fn r12_compensation_must_close_the_active_occupies_relation() {
         e.submit_action(
             &ops(),
             "assert_link",
-            json!({ "link_type": "occupies", "from": ids.ana, "to": "seat-other" })
+            json!({
+                "link_type": "section_has_seat",
+                "from": ids.section,
+                "to": "seat-other"
+            })
         )
         .unwrap()
         .verdict,
@@ -474,9 +478,19 @@ fn r12_compensation_must_close_the_active_occupies_relation() {
         )
         .unwrap();
     assert_eq!(compensated.verdict, Verdict::Allow);
-    let left = e.traverse_links(&ops(), &ids.ana, "occupies").unwrap();
-    assert_eq!(left.len(), 1, "unrelated occupancy must survive");
-    assert_eq!(left[0].id, "seat-other");
+    let occupies = e.traverse_links(&ops(), &ids.ana, "occupies").unwrap();
+    assert!(
+        occupies.is_empty(),
+        "targeted release must close the 1:1 occupies edge"
+    );
+    let seats = e
+        .traverse_links(&ops(), &ids.section, "section_has_seat")
+        .unwrap();
+    assert!(
+        seats.iter().any(|o| o.id == "seat-other"),
+        "unrelated 1:n section_has_seat must survive"
+    );
+    assert!(seats.iter().any(|o| o.id == ids.seat));
 }
 
 #[test]

@@ -196,6 +196,25 @@ impl WritePath<SubmissionCriteria> {
         next.trace.push(WritePathStep::SealDecisionRecord);
         next
     }
+
+    /// Cardinality or other post-criteria Deny: no write-set, verdict is Deny.
+    pub fn deny_stage(self, guard: GuardResult) -> WritePath<SealDecisionRecord> {
+        let mut guards = self.guards;
+        guards.push(guard);
+        let mut next = WritePath::<SealDecisionRecord> {
+            trace: self.trace,
+            reads: self.reads,
+            staged: Vec::new(),
+            guards,
+            verdict: Verdict::Deny,
+            idempotency_key: self.idempotency_key,
+            created_ids: Vec::new(),
+            side_effect: None,
+            _s: PhantomData,
+        };
+        next.trace.push(WritePathStep::SealDecisionRecord);
+        next
+    }
 }
 
 impl WritePath<StagedEdits> {
