@@ -187,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_compensation_name_is_typed_error() {
+    fn does_return_typed_error_if_compensation_name_is_missing() {
         match Compensation::from_spec(&spec_with(None)) {
             Err(OntoError::NoCompensation(name)) => {
                 assert_eq!(name, "approve_setpoint_change");
@@ -201,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn named_compensation_is_inverse_action() {
+    fn does_name_inverse_action_if_compensation_is_set() {
         let plan = Compensation::from_spec(&spec_with(Some("revert_setpoint_change"))).unwrap();
         match plan {
             Compensation::Inverse { action } => {
@@ -211,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn deny_and_review_are_not_compensable() {
+    fn does_refuse_compensate_if_verdict_is_not_allow() {
         let mut rec = allow_record("d1", "tank-1", "k");
         rec.verdict = Verdict::Deny;
         assert!(matches!(
@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn inverse_params_drop_original_key_and_default_compensate_key() {
+    fn does_drop_original_key_and_default_compensate_key() {
         let rec = allow_record("rec-1", "tank-1", "setpoint:tank-1:2.5");
         let params = inverse_params(&rec, &json!({}));
         assert_eq!(params["idempotency_key"], "compensate:rec-1");
@@ -242,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_target_do_and_key_win() {
+    fn does_prefer_overlay_target_do_and_key() {
         let rec = allow_record("rec-1", "tank-1", "old-key");
         let params = inverse_params(
             &rec,

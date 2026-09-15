@@ -425,24 +425,24 @@ mod tests {
     }
 
     #[test]
-    fn propose_without_reviewable_does_not_require_inbox() {
+    fn does_not_require_inbox_if_propose_lacks_reviewable() {
         assert!(!require_inbox(&propose(&[])));
     }
 
     #[test]
-    fn propose_with_reviewable_requires_inbox() {
+    fn does_require_inbox_if_propose_has_reviewable() {
         assert!(require_inbox(&propose(&["Reviewable"])));
     }
 
     #[test]
-    fn auto_reviewable_does_not_require_inbox() {
+    fn does_not_require_inbox_if_mode_is_auto() {
         let mut spec = propose(&["Reviewable"]);
         spec.mode = ExecutionMode::Auto;
         assert!(!require_inbox(&spec));
     }
 
     #[test]
-    fn evidenced_missing_is_complete_fail() {
+    fn does_fail_complete_if_evidenced_property_is_missing() {
         let spec = evidenced_type(&["Evidenced"], None);
         let iface = KernelInterface::Evidenced.spec();
         let view = view_with(&[]);
@@ -452,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn evidenced_stale_is_current_fail() {
+    fn does_fail_current_if_evidenced_property_is_stale() {
         let spec = evidenced_type(&["Evidenced"], Some(60));
         let iface = KernelInterface::Evidenced.spec();
         let view = view_with(&[("rationale", json!("ok"), Some("100"))]);
@@ -462,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn unattached_evidenced_has_no_gaps() {
+    fn does_report_no_gaps_if_evidenced_is_unattached() {
         let spec = evidenced_type(&[], None);
         let iface = KernelInterface::Evidenced.spec();
         let view = view_with(&[]);
@@ -470,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_types_are_queryable_objecttype_records() {
+    fn does_expose_kernel_types_as_objecttype_records() {
         let engine = Engine::memory().unwrap();
         let intern = Session::new(Actor::consumer("ops.intern", &[], AgentTier::T1), "test");
         let found = engine

@@ -54,7 +54,7 @@ fn forbidden_needles() -> [String; 3] {
 }
 
 #[test]
-fn healthcare_source_has_no_prescribed_quantity_calculator() {
+fn does_omit_prescribed_quantity_calculator() {
     let root = env!("CARGO_MANIFEST_DIR");
     let src = std::fs::read_to_string(format!("{root}/src/healthcare.rs")).unwrap();
     let tests = std::fs::read_to_string(format!("{root}/tests/healthcare.rs")).unwrap();
@@ -69,7 +69,7 @@ fn healthcare_source_has_no_prescribed_quantity_calculator() {
 }
 
 #[test]
-fn missing_observation_goes_review_not_allow() {
+fn does_review_and_not_allow_if_observation_is_missing() {
     let engine = Engine::memory().unwrap();
     let ids = install_healthcare(&engine).unwrap();
     let view = engine
@@ -145,7 +145,72 @@ fn missing_observation_goes_review_not_allow() {
 }
 
 #[test]
-fn complete_evidence_propose_order_goes_inbox() {
+fn does_review_and_request_observation_if_observation_is_stale() {
+    let engine = Engine::memory().unwrap();
+    let ids = install_healthcare(&engine).unwrap();
+    engine.set_clock(engine.now() + 10_000);
+    let evidence = engine
+        .list_missing_evidence(&operator(), &ids.observation_complete)
+        .unwrap();
+    assert!(
+        evidence["stale"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n == "last_reading_at"),
+        "stale last_reading_at must surface as missing evidence, got {evidence}"
+    );
+
+    let out = engine
+        .submit_action(
+            &operator(),
+            "propose_order",
+            order_params(&ids.patient, &ids.observation_complete, &ids.order),
+        )
+        .unwrap();
+    assert_eq!(
+        out.verdict,
+        Verdict::Review,
+        "stale observation must Review, not Allow"
+    );
+    assert_ne!(out.verdict, Verdict::Allow);
+    assert!(
+        out.inbox_id.is_none(),
+        "Review discards the stage; inbox is the complete-evidence Propose path"
+    );
+    assert_eq!(
+        out.alternative.as_deref(),
+        Some("request_observation"),
+        "Review must name the replacement proposal"
+    );
+    assert!(
+        out.guard_results
+            .iter()
+            .any(|g| g.name == "freshness" && g.verdict == Verdict::Review),
+        "stale path must be the freshness guard, got {:?}",
+        out.guard_results
+    );
+    assert!(
+        search_type(&engine, "DecisionRecord").is_empty(),
+        "Review must not write a DecisionRecord"
+    );
+
+    let alt = engine
+        .submit_action(
+            &operator(),
+            "request_observation",
+            json!({ "observation": ids.observation_complete }),
+        )
+        .unwrap();
+    assert_eq!(alt.verdict, Verdict::Allow);
+    assert!(
+        !search_type(&engine, "ObservationRequest").is_empty(),
+        "replacement proposal must create an ObservationRequest, not a stub Allow"
+    );
+}
+
+#[test]
+fn does_open_inbox_if_order_evidence_is_complete() {
     let engine = Engine::memory().unwrap();
     let ids = install_healthcare(&engine).unwrap();
     let proposed = engine
@@ -176,7 +241,7 @@ fn complete_evidence_propose_order_goes_inbox() {
 }
 
 #[test]
-fn confirm_records_decision_record() {
+fn does_record_decision_record_if_order_is_confirmed() {
     let engine = Engine::memory().unwrap();
     let ids = install_healthcare(&engine).unwrap();
     let proposed = engine
@@ -220,7 +285,7 @@ fn confirm_records_decision_record() {
 }
 
 #[test]
-fn contraindication_flag_denies() {
+fn does_deny_if_contraindication_flag_is_set() {
     let engine = Engine::memory().unwrap();
     let ids = install_healthcare(&engine).unwrap();
     let order_before = engine
@@ -260,7 +325,7 @@ fn contraindication_flag_denies() {
 }
 
 #[test]
-fn consumer_cannot_create_object_type() {
+fn does_deny_consumer_create_object_type() {
     let engine = Engine::memory().unwrap();
     install_healthcare(&engine).unwrap();
     let denied = dispatch(
@@ -283,7 +348,7 @@ fn consumer_cannot_create_object_type() {
 }
 
 #[test]
-fn unmerged_healthcare_does_not_affect_wastewater() {
+fn does_leave_wastewater_unchanged_if_healthcare_is_unmerged() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
     let tanks_before = search_type(&engine, "AerationTank").len();
@@ -312,7 +377,7 @@ fn unmerged_healthcare_does_not_affect_wastewater() {
 }
 
 #[test]
-fn merged_healthcare_after_wastewater_keeps_both() {
+fn does_keep_both_if_healthcare_merges_after_wastewater() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
     install_healthcare(&engine).unwrap();

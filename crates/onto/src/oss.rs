@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn set_is_spec_not_id_list() {
+    fn does_treat_object_set_as_spec_not_id_list() {
         let set = ObjectSet::inline(
             Some("AerationTank".into()),
             ObjectSetFilter {
@@ -203,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_type_and_equals() {
+    fn does_match_type_and_equals_filter() {
         let set = ObjectSet::inline(
             Some("AerationTank".into()),
             ObjectSetFilter {
@@ -220,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_empty_is_ok_empty() {
+    fn does_return_empty_vec_if_set_matches_nothing() {
         let set = ObjectSet::inline(Some("Ghost".into()), ObjectSetFilter::default(), 50);
         let out = evaluate_members(&set, Vec::<String>::new(), |_| {
             Err(OntoError::NotFound("x".into()))
@@ -230,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn query_set_name_builds_named_ref() {
+    fn does_build_named_ref_if_query_has_set_name() {
         let q = Query {
             set_name: Some("aeration_tanks".into()),
             ..Query::default()
@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn restricted_permission_strips_rationale() {
+    fn does_strip_rationale_if_restricted() {
         let session = Session::new(
             Actor::consumer("ops.restricted", &["restricted"], AgentTier::T2),
             "test",

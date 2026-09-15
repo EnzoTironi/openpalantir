@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_grant_is_deny() {
+    fn does_deny_if_grant_is_missing() {
         let d = authorize(
             &[],
             &intern(),
@@ -429,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn intern_write_denied_at_type() {
+    fn does_deny_write_if_intern_lacks_type_grant() {
         let d = authorize(
             &seeded(),
             &intern(),
@@ -442,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_write_allowed() {
+    fn does_allow_write_if_operator_has_type_grant() {
         let d = authorize(
             &seeded(),
             &operator(),
@@ -455,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn restricted_property_deny_hides_more_than_rationale() {
+    fn does_hide_denied_properties_if_restricted() {
         let grants = seeded();
         let mut properties = BTreeMap::new();
         for (k, v) in [
@@ -491,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn levels_run_in_platform_type_instance_property_order() {
+    fn does_order_levels_platform_type_instance_property() {
         assert_eq!(
             AuthzLevel::ORDER,
             [

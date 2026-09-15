@@ -247,9 +247,11 @@ fn dedupe_reads(reads: &[SnapshotObject]) -> Vec<SnapshotObject> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[test]
-    fn successor_chain_is_exactly_seven() {
+    fn does_chain_exactly_seven_successors() {
         assert_eq!(WritePathStep::ALL.len(), 7);
         let mut step = WritePathStep::Submit;
         let mut seen = vec![step];
@@ -266,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn typestate_happy_path_records_all_steps() {
+    fn does_record_all_seven_steps_on_happy_path() {
         let done = WritePath::begin("k".into())
             .param_and_permission(vec![])
             .submission_criteria(vec![], vec![], Verdict::Allow)
@@ -278,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn guard_fail_trace_skips_stage_and_commit() {
+    fn does_skip_stage_and_commit_if_guard_fails() {
         let sealed = WritePath::begin("k".into())
             .param_and_permission(vec![])
             .submission_criteria(
@@ -301,5 +303,89 @@ mod tests {
             ]
         );
         assert!(sealed.staged.is_empty());
+        assert_eq!(sealed.verdict, Verdict::Deny);
+        assert_eq!(sealed.created_ids, Vec::<String>::new());
+        assert!(sealed.side_effect.is_none());
+        assert!(!sealed.trace.contains(&WritePathStep::StagedEdits));
+        assert!(!sealed.trace.contains(&WritePathStep::Commit));
+        assert!(!sealed.trace.contains(&WritePathStep::DeclareSideEffects));
+    }
+
+    #[test]
+    fn does_leave_stage_empty_if_abort_seals() {
+        let sealed = WritePath::begin("k".into())
+            .param_and_permission(vec![])
+            .abort_seal(
+                vec![GuardResult {
+                    name: "authorization".into(),
+                    verdict: Verdict::Deny,
+                    reason: "no role".into(),
+                }],
+                Verdict::Deny,
+            );
+        assert_eq!(
+            sealed.trace,
+            vec![
+                WritePathStep::Submit,
+                WritePathStep::ParamAndPermission,
+                WritePathStep::SealDecisionRecord,
+            ]
+        );
+        assert!(sealed.staged.is_empty());
+        assert_eq!(sealed.verdict, Verdict::Deny);
+        assert!(!sealed.trace.contains(&WritePathStep::SubmissionCriteria));
+        assert!(!sealed.trace.contains(&WritePathStep::StagedEdits));
+        assert!(!sealed.trace.contains(&WritePathStep::Commit));
+    }
+
+    #[test]
+    fn does_dedupe_snapshot_reads_by_object_id() {
+        let tank = SnapshotObject {
+            id: "tank-1".into(),
+            type_name: "AerationTank".into(),
+            properties: BTreeMap::new(),
+        };
+        let later = SnapshotObject {
+            id: "tank-1".into(),
+            type_name: "AerationTank".into(),
+            properties: BTreeMap::new(),
+        };
+        let sensor = SnapshotObject {
+            id: "sensor-1".into(),
+            type_name: "DO_Sensor".into(),
+            properties: BTreeMap::new(),
+        };
+        let path = WritePath::begin("k".into()).param_and_permission(vec![tank, later, sensor]);
+        let snap = path.data_snapshot("rule:1".into(), "fn:1".into(), "0.1.0".into());
+        let ids: Vec<&str> = snap.objects.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(ids, vec!["tank-1", "sensor-1"]);
+        assert_eq!(snap.rule_version, "rule:1");
+        assert_eq!(snap.function_version, "fn:1");
+        assert_eq!(snap.engine_version, "0.1.0");
+    }
+
+    #[test]
+    fn does_use_explicit_idempotency_key_if_present() {
+        let key = resolve_idempotency_key(
+            "approve_setpoint_change",
+            "ops.chen",
+            &json!({ "idempotency_key": "setpoint:tank-1:once", "target_do": 2.5 }),
+        );
+        assert_eq!(key, "setpoint:tank-1:once");
+    }
+
+    #[test]
+    fn does_derive_idempotency_key_if_absent() {
+        let a = resolve_idempotency_key("approve_setpoint_change", "ops.chen", &json!({ "n": 1 }));
+        let b = resolve_idempotency_key("approve_setpoint_change", "ops.chen", &json!({ "n": 2 }));
+        let empty = resolve_idempotency_key(
+            "approve_setpoint_change",
+            "ops.chen",
+            &json!({ "idempotency_key": "" }),
+        );
+        assert_ne!(a, b);
+        assert!(!a.is_empty());
+        assert_ne!(empty, "");
+        assert!(a.starts_with("approve_setpoint_change:ops.chen:"));
     }
 }

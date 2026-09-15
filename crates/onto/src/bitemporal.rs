@@ -324,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn current_span_is_open() {
+    fn does_leave_current_span_open() {
         let s = VersionSpan::current(10);
         assert!(s.is_open());
         assert!(s.covers_valid(10));
@@ -333,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn close_and_succeed_splits_valid_time_without_overlap() {
+    fn does_split_valid_time_without_overlap_if_closed() {
         let open = VersionSpan::current(10);
         let (closed, next) = open.close_and_succeed(20).unwrap();
         assert!(!closed.is_open());
@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn append_closes_previous_open_so_a_second_open_cannot_exist() {
+    fn does_close_previous_open_if_appending() {
         let conn = mem();
         insert_object(&conn, "tank-1", "AerationTank", Some("Basin 1"), "{}", 10).unwrap();
         append_version(&conn, "tank-1", "{\"n\":1}", None, 20).unwrap();
@@ -366,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn unique_index_rejects_a_second_open_row() {
+    fn does_reject_second_open_row() {
         let conn = mem();
         insert_object(&conn, "tank-1", "AerationTank", None, "{}", 1).unwrap();
         let err = conn.execute(

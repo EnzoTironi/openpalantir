@@ -673,7 +673,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sqlite_store_implements_the_seam() {
+    fn does_implement_store_seam() {
         fn is_store<T: Store>(_: &T) {}
         let store = SqliteStore::memory().unwrap();
         is_store(&store);
@@ -695,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_schema_table_is_invalid_not_sql() {
+    fn does_reject_unknown_schema_table_as_invalid_not_sql() {
         let store = SqliteStore::memory().unwrap();
         let err = store
             .put_spec("objects; drop table objects", MAIN_BRANCH, "x", "{}")

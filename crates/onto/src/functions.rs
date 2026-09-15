@@ -138,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn days_since_timestamp_uses_clock_not_property_name() {
+    fn does_compute_days_since_from_clock_not_property_name() {
         let spec = FunctionSpec {
             name: "age_days".into(),
             inputs: vec!["when".into()],
@@ -153,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn double_integer_doubles_named_input() {
+    fn does_double_named_integer_input() {
         let spec = FunctionSpec {
             name: "double_of".into(),
             inputs: vec!["n".into()],
@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_input_yields_none() {
+    fn does_yield_none_if_input_is_missing() {
         let spec = FunctionSpec {
             name: "double_of".into(),
             inputs: vec!["n".into()],
@@ -176,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn digest_sorts_and_dedups_pins() {
+    fn does_sort_and_dedup_pins_in_digest() {
         assert_eq!(digest(&[]), "none");
         assert_eq!(
             digest(&["b:1".into(), "a:1".into(), "b:1".into()]),
@@ -185,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn pin_changes_when_kind_or_inputs_change() {
+    fn does_change_pin_if_kind_or_inputs_change() {
         let a = FunctionSpec {
             name: "f".into(),
             inputs: vec!["x".into()],

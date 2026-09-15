@@ -59,7 +59,7 @@ fn seed_sensor_without_reading(engine: &Engine, id: &str) -> Result<()> {
 }
 
 #[test]
-fn stale_sensor_review_with_replacement_proposal() {
+fn does_review_and_name_calibration_if_sensor_is_stale() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     engine.set_clock(engine.now() + 10_000);
@@ -120,7 +120,7 @@ fn stale_sensor_review_with_replacement_proposal() {
 }
 
 #[test]
-fn missing_sensor_review_with_replacement_proposal() {
+fn does_review_and_name_calibration_if_sensor_reading_is_missing() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     seed_sensor_without_reading(&engine, "sensor-missing").unwrap();
@@ -179,7 +179,7 @@ fn missing_sensor_review_with_replacement_proposal() {
 }
 
 #[test]
-fn permit_limit_deny() {
+fn does_deny_if_target_do_exceeds_permit() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let tank_before = engine
@@ -218,7 +218,7 @@ fn permit_limit_deny() {
 }
 
 #[test]
-fn unauthorized_deny() {
+fn does_deny_if_actor_lacks_role() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let no_role = Session::new(Actor::consumer("ops.norole", &[], AgentTier::T2), "case");
@@ -247,7 +247,7 @@ fn unauthorized_deny() {
 
 #[test]
 #[allow(clippy::too_many_lines)] // dossier replay is one end-to-end teaching case
-fn override_dossier_replay_confirmer_not_executor() {
+fn does_replay_override_dossier_if_confirmer_is_not_executor() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let proposed = engine
@@ -357,7 +357,7 @@ fn override_dossier_replay_confirmer_not_executor() {
 }
 
 #[test]
-fn funnel_ingest_does_not_overwrite_action_written_target_do() {
+fn does_keep_action_written_target_do_if_funnel_ingests() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let proposed = engine
@@ -418,7 +418,7 @@ fn funnel_ingest_does_not_overwrite_action_written_target_do() {
 }
 
 #[test]
-fn unmerged_branch_schema_zero_effect_on_production_instances() {
+fn does_leave_production_instances_unchanged_if_schema_is_unmerged() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let modeller = Session::new(Actor::builder("human.modeler", &["modeler"]), "case");

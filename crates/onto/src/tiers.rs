@@ -224,7 +224,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_ranks_are_t1_through_t4() {
+    fn does_rank_tiers_t1_through_t4() {
         assert_eq!(
             AgentTier::ALL,
             [AgentTier::T1, AgentTier::T2, AgentTier::T3, AgentTier::T4]
@@ -237,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn illegal_u8_does_not_become_a_tier() {
+    fn does_reject_illegal_u8_tier() {
         assert!(AgentTier::try_from(0u8).is_err());
         assert!(AgentTier::try_from(5u8).is_err());
         assert_eq!(AgentTier::try_from(1u8).unwrap(), AgentTier::T1);
@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn t1_cannot_confirm_t2_cannot_override() {
+    fn does_hide_syscalls_above_tier() {
         assert!(!AgentTier::T1.allows_syscall("confirm_action"));
         assert!(!AgentTier::T1.allows_syscall("submit_action"));
         assert!(AgentTier::T1.allows_syscall("get_object"));
@@ -262,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn action_prefix_is_submit() {
+    fn does_treat_action_prefix_as_submit() {
         assert_eq!(
             min_tier_for_syscall("action.propose_setpoint_change"),
             AgentTier::T2
@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_bound_denies_t4_auto() {
+    fn does_deny_t4_auto_if_bound_is_empty() {
         let bound = AutoBound::empty();
         assert!(!bound.allows(
             "request_sensor_calibration",
@@ -297,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn populated_bound_allows_matching_claim_only() {
+    fn does_allow_t4_auto_if_claim_matches() {
         let bound = AutoBound {
             entries: vec![AutoClaim {
                 action_type: "request_sensor_calibration".into(),
@@ -327,13 +327,13 @@ mod tests {
     }
 
     #[test]
-    fn confirmer_must_differ_from_proposer() {
+    fn does_refuse_confirm_if_confirmer_is_proposer() {
         require_distinct_confirmer("ops.chen", "ops.maya").unwrap();
         assert!(require_distinct_confirmer("ops.chen", "ops.chen").is_err());
     }
 
     #[test]
-    fn serde_roundtrip_is_rank_u8() {
+    fn does_serde_tier_as_rank_u8() {
         let raw = serde_json::to_string(&AgentTier::T2).unwrap();
         assert_eq!(raw, "2");
         let back: AgentTier = serde_json::from_str("3").unwrap();

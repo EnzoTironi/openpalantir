@@ -63,14 +63,14 @@ fn merge_object_set(engine: &Engine, branch: &str, spec: ObjectSetSpec) {
 }
 
 #[test]
-fn kernel_types_exist_before_user_work() {
+fn does_expose_kernel_types_before_user_work() {
     assert!(Engine::kernel_types().contains(&"ObjectType"));
     assert!(Engine::kernel_types().contains(&"OntologyProposal"));
     assert!(Engine::kernel_types().contains(&"FunctionType"));
 }
 
 #[test]
-fn runtime_create_type_then_consumer_tools_update() {
+fn does_project_consumer_tools_after_merge() {
     let engine = Engine::memory().unwrap();
     let before = engine.list_tools(&operator()).unwrap();
     assert!(
@@ -87,7 +87,7 @@ fn runtime_create_type_then_consumer_tools_update() {
 }
 
 #[test]
-fn branch_alter_invisible_until_merge() {
+fn does_hide_branch_alter_until_merge() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
     let main_before = engine
@@ -149,7 +149,7 @@ fn branch_alter_invisible_until_merge() {
 }
 
 #[test]
-fn key_isolation() {
+fn does_isolate_builder_and_consumer_keys() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
     let builder = modeller();
@@ -180,7 +180,7 @@ fn key_isolation() {
 }
 
 #[test]
-fn wastewater_happy_path() {
+fn does_confirm_setpoint_and_seal_decision_record() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let proposed = engine
@@ -219,7 +219,7 @@ fn wastewater_happy_path() {
 }
 
 #[test]
-fn stale_sensor_review_with_alternative() {
+fn does_review_and_name_calibration_if_sensor_is_stale() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     engine.set_clock(engine.now() + 10_000);
@@ -252,7 +252,7 @@ fn stale_sensor_review_with_alternative() {
 }
 
 #[test]
-fn permit_limit_and_unauthorized_deny() {
+fn does_deny_if_permit_exceeded_or_role_missing() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let over = engine
@@ -301,7 +301,7 @@ fn permit_limit_and_unauthorized_deny() {
 }
 
 #[test]
-fn override_replayable_dossier() {
+fn does_seal_replayable_override_dossier() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let proposed = engine
@@ -339,7 +339,7 @@ fn override_replayable_dossier() {
 }
 
 #[test]
-fn funnel_does_not_overwrite_action_written() {
+fn does_keep_action_written_if_funnel_ingests() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let proposed = engine
@@ -380,11 +380,21 @@ fn funnel_does_not_overwrite_action_written() {
         .get_object(&operator(), &ids.tank1, onto::AsOf::Current)
         .unwrap();
     assert_eq!(tank.properties["target_do"].value, json!(3.1));
+    assert_eq!(
+        tank.properties["target_do"].source,
+        onto::PropertySource::ActionWritten,
+        "Funnel must not overwrite ActionWritten target_do"
+    );
     assert_eq!(tank.properties["current_do"].value, json!(1.1));
+    assert_eq!(
+        tank.properties["current_do"].source,
+        onto::PropertySource::Mapped,
+        "Mapped current_do must still update so the skip is not a total no-op"
+    );
 }
 
 #[test]
-fn unmerged_branch_zero_effect_on_production() {
+fn does_leave_production_unchanged_if_branch_is_unmerged() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
     let count_before = engine
@@ -434,7 +444,7 @@ fn unmerged_branch_zero_effect_on_production() {
 }
 
 #[test]
-fn consumer_cannot_read_working_branch_schema() {
+fn does_deny_consumer_working_branch_schema() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
     let b = engine.open_branch(&modeller(), "secret").unwrap();
@@ -443,12 +453,12 @@ fn consumer_cannot_read_working_branch_schema() {
 }
 
 #[test]
-fn builder_and_consumer_keys_are_distinct() {
+fn does_keep_builder_and_consumer_keys_distinct() {
     assert_ne!(KeyKind::Builder, KeyKind::Consumer);
 }
 
 #[test]
-fn write_path_seven_steps_in_order() {
+fn does_walk_write_path_seven_steps_in_order() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let proposed = engine
@@ -465,6 +475,10 @@ fn write_path_seven_steps_in_order() {
         )
         .unwrap();
     assert_eq!(proposed.verdict, Verdict::Allow);
+    assert!(
+        proposed.inbox_id.is_some(),
+        "Reviewable Propose must mint an inbox on the write path"
+    );
     let rec = engine
         .get_decision_record(&operator(), proposed.decision_record_id.as_deref().unwrap())
         .unwrap();
@@ -481,10 +495,23 @@ fn write_path_seven_steps_in_order() {
         ]
     );
     assert_eq!(rec.proof_trace, WritePathStep::ALL.to_vec());
+    assert_eq!(rec.action_name, "propose_setpoint_change");
+    assert_eq!(rec.verdict, Verdict::Allow);
+    assert!(!rec.proof_trace.is_empty());
+    assert_ne!(
+        rec.proof_trace,
+        vec![
+            WritePathStep::Submit,
+            WritePathStep::ParamAndPermission,
+            WritePathStep::SubmissionCriteria,
+            WritePathStep::SealDecisionRecord,
+        ],
+        "Allow must not use the discarded-stage trace"
+    );
 }
 
 #[test]
-fn guard_fail_at_step_three_discards_stage() {
+fn does_discard_stage_if_guard_fails_at_criteria() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let tank_before = engine
@@ -548,7 +575,7 @@ fn guard_fail_at_step_three_discards_stage() {
 }
 
 #[test]
-fn decision_snapshot_pins_reads_and_versions() {
+fn does_pin_reads_and_versions_on_decision_snapshot() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let proposed = engine
@@ -607,7 +634,7 @@ fn decision_snapshot_pins_reads_and_versions() {
 }
 
 #[test]
-fn idempotent_side_effect_key_does_not_double_apply() {
+fn does_not_double_apply_if_idempotency_key_repeats() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let params = json!({
@@ -649,7 +676,7 @@ fn idempotent_side_effect_key_does_not_double_apply() {
 }
 
 #[test]
-fn wastewater_sensor_exposes_days_since_calibration() {
+fn does_derive_days_since_calibration_from_clock() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let schema = engine.get_schema(&operator(), None).unwrap();
@@ -689,7 +716,7 @@ fn wastewater_sensor_exposes_days_since_calibration() {
 
 #[test]
 #[allow(clippy::too_many_lines)] // function registry merge is one teaching case
-fn runtime_registered_function_visible_after_merge() {
+fn does_evaluate_runtime_function_after_merge() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
 
@@ -801,7 +828,7 @@ fn runtime_registered_function_visible_after_merge() {
 }
 
 #[test]
-fn sequential_setpoint_writes_append_versions_and_as_of_reads_history() {
+fn does_append_versions_and_read_history_as_of() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let spans_seed = engine.object_spans(&ids.tank1).unwrap();
@@ -876,7 +903,7 @@ fn sequential_setpoint_writes_append_versions_and_as_of_reads_history() {
 }
 
 #[test]
-fn empty_object_set_is_ok_empty_vec() {
+fn does_return_empty_vec_if_object_set_is_empty() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
     let none = engine
@@ -905,7 +932,7 @@ fn empty_object_set_is_ok_empty_vec() {
 }
 
 #[test]
-fn named_set_invisible_on_main_until_merge() {
+fn does_hide_named_set_until_merge() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
     let b = engine.open_branch(&modeller(), "set-aeration").unwrap();
@@ -952,7 +979,7 @@ fn named_set_invisible_on_main_until_merge() {
 }
 
 #[test]
-fn named_set_includes_new_match_excludes_non_match() {
+fn does_include_new_match_and_exclude_non_match() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     merge_object_set(
@@ -1026,7 +1053,7 @@ fn named_set_includes_new_match_excludes_non_match() {
 }
 
 #[test]
-fn restricted_cannot_see_rationale_in_set_results() {
+fn does_hide_rationale_in_set_results_if_restricted() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
     engine
@@ -1078,7 +1105,7 @@ fn restricted_cannot_see_rationale_in_set_results() {
 }
 
 #[test]
-fn intern_cannot_mutate_except_allowed_actions() {
+fn does_deny_intern_mutations_including_create_link() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let before = engine
@@ -1172,7 +1199,7 @@ fn intern_cannot_mutate_except_allowed_actions() {
 }
 
 #[test]
-fn restricted_does_not_see_denied_properties_in_get_object_or_sets() {
+fn does_hide_denied_properties_on_get_and_sets_if_restricted() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     engine
@@ -1245,7 +1272,7 @@ fn restricted_does_not_see_denied_properties_in_get_object_or_sets() {
 }
 
 #[test]
-fn aggregate_counts_filtered_set_not_whole_type() {
+fn does_count_filtered_set_not_whole_type() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
     let whole = engine.aggregate(&operator(), "AerationTank").unwrap();
@@ -1267,7 +1294,7 @@ fn aggregate_counts_filtered_set_not_whole_type() {
 }
 
 #[test]
-fn compensate_allow_is_inverse_action_not_rollback() {
+fn does_compensate_allow_as_inverse_action_not_rollback() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let approved = engine
@@ -1361,7 +1388,7 @@ fn compensate_allow_is_inverse_action_not_rollback() {
 }
 
 #[test]
-fn missing_compensation_name_is_error_not_silent_success() {
+fn does_error_if_compensation_name_is_missing() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let over = engine
@@ -1390,7 +1417,7 @@ fn missing_compensation_name_is_error_not_silent_success() {
 }
 
 #[test]
-fn compensate_retry_same_key_does_not_double_apply() {
+fn does_not_double_apply_if_compensate_key_repeats() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let approved = engine
@@ -1435,7 +1462,7 @@ fn compensate_retry_same_key_does_not_double_apply() {
 }
 
 #[test]
-fn compensate_deny_is_not_compensable() {
+fn does_refuse_compensate_if_verdict_is_deny() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let denied = engine
@@ -1476,7 +1503,7 @@ fn setpoint_params(ids: &WastewaterIds, target_do: f64, rationale: &str) -> serd
 }
 
 #[test]
-fn intern_t1_can_observe_cannot_submit() {
+fn does_let_t1_observe_and_refuse_submit() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let tools = engine.list_tools(&intern()).unwrap();
@@ -1541,7 +1568,7 @@ fn intern_t1_can_observe_cannot_submit() {
 }
 
 #[test]
-fn operator_t2_can_propose_cannot_confirm_or_override() {
+fn does_let_t2_propose_and_refuse_confirm_or_override() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let tools = engine.list_tools(&operator()).unwrap();
@@ -1585,7 +1612,7 @@ fn operator_t2_can_propose_cannot_confirm_or_override() {
 }
 
 #[test]
-fn supervisor_t3_confirms_other_actor_not_self() {
+fn does_let_t3_confirm_other_actor_not_self() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let tools = engine.list_tools(&supervisor()).unwrap();
@@ -1620,7 +1647,7 @@ fn supervisor_t3_confirms_other_actor_not_self() {
 }
 
 #[test]
-fn t4_auto_denied_on_empty_bound() {
+fn does_deny_t4_auto_if_bound_is_empty() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let tools = engine.list_tools(&automator()).unwrap();
@@ -1687,7 +1714,7 @@ fn propose_action(name: &str, interfaces: Vec<String>) -> ActionTypeSpec {
 }
 
 #[test]
-fn kernel_types_are_queryable_objecttype_records() {
+fn does_expose_kernel_types_as_queryable_objecttype_records() {
     let engine = Engine::memory().unwrap();
     let found = engine
         .search_objects(
@@ -1717,7 +1744,7 @@ fn kernel_types_are_queryable_objecttype_records() {
 }
 
 #[test]
-fn reviewable_propose_creates_inbox_unmerged_attach_is_noop() {
+fn does_create_inbox_if_reviewable_and_ignore_unmerged_attach() {
     let engine = Engine::memory().unwrap();
     let b = engine
         .open_branch(&modeller(), "kernel-reviewable")
@@ -1792,7 +1819,7 @@ fn reviewable_propose_creates_inbox_unmerged_attach_is_noop() {
 }
 
 #[test]
-fn evidenced_submit_reviews_when_evidence_missing() {
+fn does_review_if_evidenced_submit_lacks_evidence() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
     let b = engine.open_branch(&modeller(), "kernel-evidenced").unwrap();

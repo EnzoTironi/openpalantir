@@ -3,7 +3,7 @@ use onto_bootstrap::install;
 use serde_json::json;
 
 #[test]
-fn consumer_tools_projected_from_live_oms() {
+fn does_project_consumer_tools_from_live_oms() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
     let session = Session::new(
@@ -24,7 +24,7 @@ fn consumer_tools_projected_from_live_oms() {
 }
 
 #[test]
-fn builder_tools_exclude_production_reads() {
+fn does_exclude_production_reads_from_builder_tools() {
     let engine = Engine::memory().unwrap();
     let session = Session::new(Actor::builder("ke", &["modeler"]), "mcp");
     let listed = dispatch(&engine, &session, "list_tools", json!({})).unwrap();
@@ -41,7 +41,7 @@ fn builder_tools_exclude_production_reads() {
 }
 
 #[test]
-fn mcp_style_call_propose() {
+fn does_propose_via_mcp_dispatch() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let session = Session::new(
@@ -69,7 +69,7 @@ fn mcp_style_call_propose() {
 }
 
 #[test]
-fn mcp_decision_record_has_write_path_trace() {
+fn does_include_write_path_trace_on_mcp_decision_record() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let session = Session::new(
@@ -121,7 +121,7 @@ fn mcp_decision_record_has_write_path_trace() {
 }
 
 #[test]
-fn mcp_keys_stay_separated_on_write_path() {
+fn does_separate_mcp_keys_on_write_path() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
     let builder = Session::new(Actor::builder("ke", &["modeler"]), "mcp");
@@ -155,7 +155,7 @@ fn supervisor() -> Session {
 }
 
 #[test]
-fn mcp_stale_sensor_is_review_with_calibration_alternative() {
+fn does_review_via_mcp_if_sensor_is_stale() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     engine.set_clock(engine.now() + 10_000);
@@ -181,7 +181,7 @@ fn mcp_stale_sensor_is_review_with_calibration_alternative() {
 }
 
 #[test]
-fn mcp_permit_limit_is_deny() {
+fn does_deny_via_mcp_if_permit_exceeded() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let out = dispatch(
@@ -205,7 +205,7 @@ fn mcp_permit_limit_is_deny() {
 }
 
 #[test]
-fn mcp_override_rejects_self_and_replays_dossier() {
+fn does_reject_self_override_and_replay_dossier_via_mcp() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let proposed = dispatch(
@@ -283,7 +283,7 @@ fn mcp_override_rejects_self_and_replays_dossier() {
 }
 
 #[test]
-fn mcp_funnel_does_not_overwrite_action_written() {
+fn does_keep_action_written_if_mcp_funnel_ingests() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
     let proposed = dispatch(

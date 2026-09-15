@@ -41,7 +41,7 @@ fn search_type(engine: &Engine, type_name: &str) -> Vec<onto::ObjectView> {
 }
 
 #[test]
-fn consumer_can_search_course_section_student_after_install() {
+fn does_search_course_section_student_after_install() {
     let engine = Engine::memory().unwrap();
     let ids = install_highered(&engine).unwrap();
     let courses = search_type(&engine, "Course");
@@ -64,7 +64,7 @@ fn consumer_can_search_course_section_student_after_install() {
 }
 
 #[test]
-fn propose_enroll_on_full_section_goes_review_inbox() {
+fn does_open_review_inbox_if_section_is_full() {
     let engine = Engine::memory().unwrap();
     let ids = install_highered(&engine).unwrap();
     let proposed = engine
@@ -99,7 +99,7 @@ fn propose_enroll_on_full_section_goes_review_inbox() {
 }
 
 #[test]
-fn supervisor_confirm_assigns_seat() {
+fn does_assign_seat_if_supervisor_confirms() {
     let engine = Engine::memory().unwrap();
     let ids = install_highered(&engine).unwrap();
     let proposed = engine
@@ -133,7 +133,7 @@ fn supervisor_confirm_assigns_seat() {
 }
 
 #[test]
-fn second_confirm_same_seat_denies_no_double_book() {
+fn does_deny_second_confirm_if_seat_already_occupied() {
     let engine = Engine::memory().unwrap();
     let ids = install_highered(&engine).unwrap();
     let ana = engine
@@ -171,6 +171,14 @@ fn second_confirm_same_seat_denies_no_double_book() {
         "occupant must stay the first student"
     );
     assert_eq!(seat.properties["slots"].value, json!(0));
+    let section = engine
+        .get_object(&operator(), &ids.section, AsOf::Current)
+        .unwrap();
+    assert_eq!(
+        section.properties["enrolled"].value,
+        json!(1),
+        "second confirm must not increment enrolled"
+    );
     let ana_held = engine
         .traverse_links(&operator(), &ids.ana, "occupies")
         .unwrap();
@@ -182,10 +190,15 @@ fn second_confirm_same_seat_denies_no_double_book() {
         bruno_held.is_empty(),
         "Bruno must not occupy the same seat, got {bruno_held:?}"
     );
+    assert!(
+        second.inbox_id.is_none(),
+        "Deny must not mint a second inbox"
+    );
+    assert!(second.created_ids.is_empty());
 }
 
 #[test]
-fn compensate_releases_seat_instead_of_double_book() {
+fn does_release_seat_on_compensate_instead_of_double_book() {
     let engine = Engine::memory().unwrap();
     let ids = install_highered(&engine).unwrap();
     let proposed = engine
@@ -234,7 +247,7 @@ fn compensate_releases_seat_instead_of_double_book() {
 }
 
 #[test]
-fn consumer_cannot_create_object_type() {
+fn does_deny_consumer_create_object_type() {
     let engine = Engine::memory().unwrap();
     install_highered(&engine).unwrap();
     let denied = dispatch(
@@ -257,7 +270,7 @@ fn consumer_cannot_create_object_type() {
 }
 
 #[test]
-fn unmerged_highered_does_not_affect_wastewater() {
+fn does_leave_wastewater_unchanged_if_highered_is_unmerged() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
     let tanks_before = search_type(&engine, "AerationTank").len();
@@ -288,7 +301,7 @@ fn unmerged_highered_does_not_affect_wastewater() {
 }
 
 #[test]
-fn merged_highered_after_wastewater_keeps_both() {
+fn does_keep_both_if_highered_merges_after_wastewater() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
     install_highered(&engine).unwrap();

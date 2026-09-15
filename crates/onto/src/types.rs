@@ -404,3 +404,38 @@ pub fn now_rfc3339() -> String {
         .unwrap_or(0);
     format!("{secs}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn does_deny_unknown_stored_verdict() {
+        assert_eq!(Verdict::from_stored("allow"), Verdict::Allow);
+        assert_eq!(Verdict::from_stored("review"), Verdict::Review);
+        assert_eq!(Verdict::from_stored("deny"), Verdict::Deny);
+        assert_eq!(Verdict::from_stored(""), Verdict::Deny);
+        assert_eq!(Verdict::from_stored("Allow"), Verdict::Deny);
+        assert_eq!(Verdict::from_stored("unknown"), Verdict::Deny);
+    }
+
+    #[test]
+    fn does_roundtrip_stored_verdicts() {
+        for verdict in [Verdict::Allow, Verdict::Review, Verdict::Deny] {
+            assert_eq!(Verdict::from_stored(verdict.as_stored()), verdict);
+        }
+    }
+
+    #[test]
+    fn does_walk_write_path_successors_in_order() {
+        assert_eq!(WritePathStep::ALL.len(), 7);
+        let mut step = WritePathStep::Submit;
+        let mut seen = vec![step];
+        while let Some(next) = step.successor() {
+            seen.push(next);
+            step = next;
+        }
+        assert_eq!(seen, WritePathStep::ALL.to_vec());
+        assert_eq!(WritePathStep::DeclareSideEffects.successor(), None);
+    }
+}
