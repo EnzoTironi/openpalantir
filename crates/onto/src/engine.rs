@@ -1,3 +1,4 @@
+use crate::bitemporal::{self, AsOf};
 use crate::error::{OntoError, Result};
 use crate::functions::{self, FunctionSpec};
 use crate::types::*;
@@ -102,8 +103,6 @@ impl Engine {
             CREATE TABLE IF NOT EXISTS objects (
                 id TEXT PRIMARY KEY,
                 type_name TEXT NOT NULL,
-                title TEXT,
-                properties TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS links (
@@ -152,6 +151,7 @@ impl Engine {
             );
             "#,
         )?;
+        db.execute_batch(bitemporal::SCHEMA)?;
         let _ = db.execute(
             "ALTER TABLE decision_records ADD COLUMN proof_trace TEXT NOT NULL DEFAULT '[]'",
             [],
@@ -762,7 +762,7 @@ impl Engine {
         drop(db);
         let mut out = Vec::new();
         for id in ids {
-            let view = self.load_object_view(&id)?;
+            let view = self.load_object_view(&id, AsOf::Current)?;
             if self.matches_equals(&view, &query.equals) {
                 out.push(self.filter_view(session, view));
             }
@@ -785,24 +785,31 @@ impl Engine {
         view
     }
 
-    pub fn get_object(&self, session: &Session, id: &str) -> Result<ObjectView> {
+    /// Current version when `as_of` is [`AsOf::Current`]; otherwise the version
+    /// whose valid span covers that time. Missing coverage is [`OntoError::NotFound`],
+    /// not a silent current row.
+    pub fn get_object(&self, session: &Session, id: &str, as_of: AsOf) -> Result<ObjectView> {
         Self::require_consumer(session)?;
-        Ok(self.filter_view(session, self.load_object_view(id)?))
+        Ok(self.filter_view(session, self.load_object_view(id, as_of)?))
     }
 
-    fn load_object_view(&self, id: &str) -> Result<ObjectView> {
+    /// Spans for one identity, oldest valid_from first.
+    pub fn object_spans(&self, id: &str) -> Result<Vec<bitemporal::VersionSpan>> {
         let db = self.db.lock().expect("db");
-        let (type_name, title, props): (String, Option<String>, String) = db
-            .query_row(
-                "SELECT type_name, title, properties FROM objects WHERE id = ?1",
-                params![id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?
-            .ok_or_else(|| OntoError::NotFound(format!("object {id}")))?;
-        drop(db);
-        let raw: BTreeMap<String, PropertyView> = serde_json::from_str(&props)?;
-        let spec = self.load_object_type(MAIN_BRANCH, &type_name).ok();
+        bitemporal::list_spans(&db, id)
+    }
+
+    fn load_object_view(&self, id: &str, as_of: AsOf) -> Result<ObjectView> {
+        let loaded = {
+            let db = self.db.lock().expect("db");
+            bitemporal::load(&db, id, as_of)?
+        };
+        let clock = match as_of {
+            AsOf::Current => self.now(),
+            AsOf::Valid(t) => t,
+        };
+        let raw: BTreeMap<String, PropertyView> = serde_json::from_str(&loaded.properties)?;
+        let spec = self.load_object_type(MAIN_BRANCH, &loaded.type_name).ok();
         let mut properties = raw;
         if let Some(spec) = &spec {
             for prop in &spec.properties {
@@ -815,7 +822,7 @@ impl Engine {
                 let Ok(fspec) = self.load_function(MAIN_BRANCH, fn_name) else {
                     continue;
                 };
-                if let Some(view) = functions::apply(&fspec, &properties, self.now()) {
+                if let Some(view) = functions::apply(&fspec, &properties, clock) {
                     properties.insert(prop.name.clone(), view);
                 }
             }
@@ -828,9 +835,9 @@ impl Engine {
                     missing.push(prop.name.clone());
                 }
                 if let Some(pv) = properties.get(&prop.name) {
-                    if let (Some(budget), Some(as_of)) = (spec.freshness_budget_secs, &pv.as_of) {
-                        if let Ok(ts) = as_of.parse::<i64>() {
-                            if self.now() - ts > budget {
+                    if let (Some(budget), Some(stamp)) = (spec.freshness_budget_secs, &pv.as_of) {
+                        if let Ok(ts) = stamp.parse::<i64>() {
+                            if clock - ts > budget {
                                 stale.push(prop.name);
                             }
                         }
@@ -840,8 +847,8 @@ impl Engine {
         }
         Ok(ObjectView {
             id: id.to_string(),
-            type_name,
-            title,
+            type_name: loaded.type_name,
+            title: loaded.title,
             properties,
             missing,
             stale,
@@ -876,7 +883,7 @@ impl Engine {
             if !allow_cycles && !visited.insert(tid.clone()) {
                 continue;
             }
-            out.push(self.get_object(session, &tid)?);
+            out.push(self.get_object(session, &tid, AsOf::Current)?);
         }
         Ok(out)
     }
@@ -893,7 +900,7 @@ impl Engine {
     }
 
     pub fn list_missing_evidence(&self, session: &Session, id: &str) -> Result<Value> {
-        let view = self.get_object(session, id)?;
+        let view = self.get_object(session, id, AsOf::Current)?;
         Ok(json!({
             "id": view.id,
             "missing": view.missing,
@@ -941,12 +948,11 @@ impl Engine {
         let id = rec.id.clone().unwrap_or_else(new_id);
         let existing = {
             let db = self.db.lock().expect("db");
-            db.query_row(
-                "SELECT properties FROM objects WHERE id = ?1",
-                params![id],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?
+            if bitemporal::identity_exists(&db, &id)? {
+                Some(bitemporal::current_properties(&db, &id)?)
+            } else {
+                None
+            }
         };
         let mut props: BTreeMap<String, PropertyView> = existing
             .as_ref()
@@ -985,17 +991,17 @@ impl Engine {
             .title_prop
             .as_ref()
             .and_then(|t| props.get(t).and_then(|p| p.value.as_str().map(|s| s.to_string())));
+        let encoded = serde_json::to_string(&props)?;
+        let at = rec
+            .as_of
+            .as_ref()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or_else(|| self.now());
         let db = self.db.lock().expect("db");
         if existing.is_some() {
-            db.execute(
-                "UPDATE objects SET properties = ?1, title = ?2 WHERE id = ?3",
-                params![serde_json::to_string(&props)?, title, id],
-            )?;
+            bitemporal::append_version(&db, &id, &encoded, title.as_deref(), at)?;
         } else {
-            db.execute(
-                "INSERT INTO objects(id, type_name, title, properties, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, rec.type_name, title, serde_json::to_string(&props)?, self.now()],
-            )?;
+            bitemporal::insert_object(&db, &id, &rec.type_name, title.as_deref(), &encoded, at)?;
         }
         Ok(id)
     }
@@ -1452,7 +1458,7 @@ impl Engine {
     }
 
     fn snapshot_object(&self, id: &str) -> Result<SnapshotObject> {
-        let view = self.load_object_view(id)?;
+        let view = self.load_object_view(id, AsOf::Current)?;
         Ok(snapshot_from_view(&view))
     }
 
@@ -1488,7 +1494,7 @@ impl Engine {
                 let id = val
                     .as_str()
                     .ok_or_else(|| OntoError::Invalid(format!("{} must be an object id", p.name)))?;
-                let view = self.load_object_view(id)?;
+                let view = self.load_object_view(id, AsOf::Current)?;
                 if view.type_name != *ot {
                     return Err(OntoError::Invalid(format!(
                         "{} must be {ot}, got {}",
@@ -1662,7 +1668,7 @@ impl Engine {
     }
 
     fn read_for_guard(&self, id: &str, reads: &mut Vec<SnapshotObject>) -> Result<ObjectView> {
-        let view = self.load_object_view(id)?;
+        let view = self.load_object_view(id, AsOf::Current)?;
         reads.push(snapshot_from_view(&view));
         Ok(view)
     }
@@ -1716,11 +1722,7 @@ impl Engine {
                 let id = param_str(params, target_param)?;
                 let mut view_props = {
                     let db = self.db.lock().expect("db");
-                    let raw: String = db.query_row(
-                        "SELECT properties FROM objects WHERE id = ?1",
-                        params![id],
-                        |r| r.get(0),
-                    )?;
+                    let raw = bitemporal::current_properties(&db, &id)?;
                     serde_json::from_str::<BTreeMap<String, PropertyView>>(&raw)?
                 };
                 if let Some(fields) = obj.get("properties").and_then(|v| v.as_object()) {
@@ -1766,6 +1768,7 @@ impl Engine {
     }
 
     fn commit_staged(&self, ops: &[StagedOp]) -> Result<Vec<String>> {
+        let at = self.now();
         let mut db = self.db.lock().expect("db");
         let tx = db.transaction()?;
         let mut created = Vec::new();
@@ -1778,17 +1781,18 @@ impl Engine {
                     properties,
                     created_at,
                 } => {
-                    tx.execute(
-                        "INSERT INTO objects(id, type_name, title, properties, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![id, type_name, title, properties, created_at],
+                    bitemporal::insert_object(
+                        &tx,
+                        id,
+                        type_name,
+                        title.as_deref(),
+                        properties,
+                        *created_at,
                     )?;
                     created.push(id.clone());
                 }
                 StagedOp::UpdateObject { id, properties } => {
-                    tx.execute(
-                        "UPDATE objects SET properties = ?1 WHERE id = ?2",
-                        params![properties, id],
-                    )?;
+                    bitemporal::append_version(&tx, id, properties, None, at)?;
                 }
                 StagedOp::InsertLink {
                     id,
@@ -1996,7 +2000,7 @@ fn builder_tools() -> Vec<ToolSpec> {
 fn consumer_base_tools() -> Vec<ToolSpec> {
     [
         ("search_objects", "Permission-first object search"),
-        ("get_object", "Load one object with freshness, provenance, missing fields"),
+        ("get_object", "Load one object with freshness, provenance, missing fields; as_of is valid time"),
         ("traverse_links", "Cycle-aware link traversal"),
         ("aggregate", "Count objects of a type"),
         ("list_missing_evidence", "Missing and stale fields for an object"),

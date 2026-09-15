@@ -1,3 +1,4 @@
+use crate::bitemporal::AsOf;
 use crate::engine::Engine;
 use crate::error::{OntoError, Result};
 use crate::functions::FunctionSpec;
@@ -134,9 +135,20 @@ fn dispatch_consumer(engine: &Engine, session: &Session, tool: &str, args: Value
             }
             Ok(serde_json::to_value(engine.search_objects(session, q)?)?)
         }
-        "get_object" => Ok(serde_json::to_value(
-            engine.get_object(session, str_arg(&args, "id")?)?,
-        )?),
+        "get_object" => {
+            let id = str_arg(&args, "id")?;
+            let as_of = match args.get("as_of") {
+                None => AsOf::Current,
+                Some(v) => {
+                    let t = v
+                        .as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                        .ok_or_else(|| OntoError::Invalid("as_of must be an integer clock".into()))?;
+                    AsOf::Valid(t)
+                }
+            };
+            Ok(serde_json::to_value(engine.get_object(session, id, as_of)?)?)
+        }
         "traverse_links" => Ok(serde_json::to_value(engine.traverse_links(
             session,
             str_arg(&args, "from_id")?,
