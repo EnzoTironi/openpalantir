@@ -754,13 +754,13 @@ impl Engine {
         let ids = match type_name {
             Some(t) => {
                 let mut stmt = db.prepare("SELECT id FROM objects WHERE type_name = ?1")?;
-                stmt.query_map(params![t], |r| r.get(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
+                let rows = stmt.query_map(params![t], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
             }
             None => {
                 let mut stmt = db.prepare("SELECT id FROM objects")?;
-                stmt.query_map([], |r| r.get(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
             }
         };
         Ok(ids)
