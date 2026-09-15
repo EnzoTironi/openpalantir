@@ -504,8 +504,10 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
         compensation: Some("revert_setpoint_change".into()),
         side_effects: json!({}),
         on_review: Some("request_sensor_calibration".into()),
+        interfaces: vec![],
     };
     engine.create_action_type(s, branch, propose)?;
+    engine.attach_interface(s, branch, "propose_setpoint_change", "Reviewable")?;
 
     engine.create_action_type(
         s,
@@ -564,6 +566,7 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
             compensation: Some("revert_setpoint_change".into()),
             side_effects: json!({ "dcs": "apply_setpoint_change", "idempotent": true }),
             on_review: Some("request_sensor_calibration".into()),
+            interfaces: vec![],
         },
     )?;
 
@@ -618,6 +621,7 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
             compensation: None,
             side_effects: json!({ "dcs": "revert_setpoint_change", "idempotent": true }),
             on_review: None,
+            interfaces: vec![],
         },
     )?;
 
@@ -660,6 +664,7 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
             compensation: None,
             side_effects: json!({}),
             on_review: None,
+            interfaces: vec![],
         },
     )?;
 
@@ -700,6 +705,7 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
             compensation: None,
             side_effects: json!({}),
             on_review: None,
+            interfaces: vec![],
         },
     )?;
 
@@ -727,6 +733,7 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
             compensation: None,
             side_effects: json!({}),
             on_review: None,
+            interfaces: vec![],
         },
     )?;
 

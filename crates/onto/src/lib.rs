@@ -8,6 +8,7 @@ mod compensation;
 mod engine;
 mod error;
 mod functions;
+mod kernel;
 mod oss;
 mod security;
 mod surface;
@@ -20,6 +21,7 @@ pub use compensation::{inverse_params, previous_written, require_allow, Compensa
 pub use engine::Engine;
 pub use error::{OntoError, Result};
 pub use functions::{FunctionKind, FunctionSpec};
+pub use kernel::KernelInterface;
 pub use oss::{ObjectSet, ObjectSetFilter, ObjectSetSpec};
 pub use security::{AuthzDecision, AuthzLevel, AuthzOp, PolicySpec};
 pub use surface::dispatch;
