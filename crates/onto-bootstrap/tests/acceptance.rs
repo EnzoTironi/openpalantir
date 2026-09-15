@@ -1,4 +1,4 @@
-use onto::{dispatch, Actor, Engine, KeyKind, Query, Session, Verdict, WritePathStep};
+use onto::{dispatch, Actor, AsOf, Engine, KeyKind, Query, Session, Verdict, WritePathStep};
 use onto_bootstrap::install;
 use serde_json::json;
 
@@ -150,7 +150,7 @@ fn wastewater_happy_path() {
     let inbox = proposed.inbox_id.expect("inbox");
     let confirmed = engine.confirm_action(&supervisor(), &inbox).unwrap();
     assert_eq!(confirmed.verdict, Verdict::Allow);
-    let tank = engine.get_object(&operator(), &ids.tank1).unwrap();
+    let tank = engine.get_object(&operator(), &ids.tank1, onto::AsOf::Current).unwrap();
     assert_eq!(tank.properties["target_do"].value, json!(2.5));
     assert_eq!(
         tank.properties["target_do"].source,
@@ -307,7 +307,7 @@ fn funnel_does_not_overwrite_action_written() {
             }],
         )
         .unwrap();
-    let tank = engine.get_object(&operator(), &ids.tank1).unwrap();
+    let tank = engine.get_object(&operator(), &ids.tank1, onto::AsOf::Current).unwrap();
     assert_eq!(tank.properties["target_do"].value, json!(3.1));
     assert_eq!(tank.properties["current_do"].value, json!(1.1));
 }
@@ -418,7 +418,7 @@ fn write_path_seven_steps_in_order() {
 fn guard_fail_at_step_three_discards_stage() {
     let engine = Engine::memory().unwrap();
     let ids = install(&engine).unwrap();
-    let tank_before = engine.get_object(&operator(), &ids.tank1).unwrap();
+    let tank_before = engine.get_object(&operator(), &ids.tank1, onto::AsOf::Current).unwrap();
     let objects_before = engine
         .search_objects(
             &operator(),
@@ -445,7 +445,7 @@ fn guard_fail_at_step_three_discards_stage() {
     assert!(over.inbox_id.is_none());
     assert!(over.created_ids.is_empty());
     assert!(engine.list_inbox(&operator()).unwrap().is_empty());
-    let tank_after = engine.get_object(&operator(), &ids.tank1).unwrap();
+    let tank_after = engine.get_object(&operator(), &ids.tank1, onto::AsOf::Current).unwrap();
     assert_eq!(
         serde_json::to_value(&tank_before.properties).unwrap(),
         serde_json::to_value(&tank_after.properties).unwrap()
@@ -551,7 +551,7 @@ fn idempotent_side_effect_key_does_not_double_apply() {
         .unwrap();
     assert_eq!(first.decision_record_id, second.decision_record_id);
     assert_eq!(first.created_ids, second.created_ids);
-    let tank = engine.get_object(&operator(), &ids.tank1).unwrap();
+    let tank = engine.get_object(&operator(), &ids.tank1, onto::AsOf::Current).unwrap();
     assert_eq!(tank.properties["target_do"].value, json!(2.6));
     let approvals = engine
         .search_objects(
@@ -574,4 +574,79 @@ fn idempotent_side_effect_key_does_not_double_apply() {
         "setpoint:tank-1:2.6"
     );
     assert_eq!(rec.proof_trace, WritePathStep::ALL.to_vec());
+}
+
+#[test]
+fn sequential_setpoint_writes_append_versions_and_as_of_reads_history() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    let spans_seed = engine.object_spans(&ids.tank1).unwrap();
+    assert_eq!(spans_seed.len(), 1, "funnel seed is the first version");
+    assert!(spans_seed[0].is_open());
+
+    let first = engine
+        .submit_action(
+            &supervisor(),
+            "approve_setpoint_change",
+            json!({
+                "tank": ids.tank1,
+                "sensor": ids.sensor1,
+                "permit": ids.permit,
+                "target_do": 2.5,
+                "rationale": "first setpoint",
+                "idempotency_key": "setpoint:tank-1:first"
+            }),
+        )
+        .unwrap();
+    assert_eq!(first.verdict, Verdict::Allow);
+    let after_first = engine.now();
+    let tank_first = engine
+        .get_object(&operator(), &ids.tank1, AsOf::Current)
+        .unwrap();
+    assert_eq!(tank_first.properties["target_do"].value, json!(2.5));
+
+    engine.set_clock(after_first + 10);
+    let second = engine
+        .submit_action(
+            &supervisor(),
+            "approve_setpoint_change",
+            json!({
+                "tank": ids.tank1,
+                "sensor": ids.sensor1,
+                "permit": ids.permit,
+                "target_do": 3.0,
+                "rationale": "second setpoint",
+                "idempotency_key": "setpoint:tank-1:second"
+            }),
+        )
+        .unwrap();
+    assert_eq!(second.verdict, Verdict::Allow);
+
+    let spans = engine.object_spans(&ids.tank1).unwrap();
+    let action_versions = spans.len() - spans_seed.len();
+    assert_eq!(
+        action_versions, 2,
+        "two sequential approve_setpoint_change writes yield two versions"
+    );
+    assert_eq!(spans.iter().filter(|s| s.is_open()).count(), 1);
+
+    let current = engine
+        .get_object(&operator(), &ids.tank1, AsOf::Current)
+        .unwrap();
+    assert_eq!(current.properties["target_do"].value, json!(3.0));
+
+    let historical = engine
+        .get_object(&operator(), &ids.tank1, AsOf::Valid(after_first))
+        .unwrap();
+    assert_eq!(
+        historical.properties["target_do"].value,
+        json!(2.5),
+        "as_of before the second commit must show the first target_do"
+    );
+
+    let missing = engine.get_object(&operator(), &ids.tank1, AsOf::Valid(0));
+    assert!(
+        matches!(missing, Err(onto::OntoError::NotFound(_))),
+        "missing coverage is NotFound, not a silent current row"
+    );
 }
