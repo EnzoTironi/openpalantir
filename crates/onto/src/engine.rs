@@ -3,7 +3,8 @@ use crate::compensation::{self, Compensation};
 use crate::error::{OntoError, Result};
 use crate::functions::{self, FunctionSpec};
 use crate::oss::{
-    apply_permission, evaluate_members, ObjectSet, ObjectSetFilter, ObjectSetSpec, OBJECT_SETS_TABLE,
+    apply_permission, evaluate_members, ObjectSet, ObjectSetFilter, ObjectSetSpec,
+    OBJECT_SETS_TABLE,
 };
 use crate::security::{authorize, filter_view, AuthzDecision, AuthzOp, PolicySpec, POLICIES_TABLE};
 use crate::tiers::{self, AutoBound, RiskBand};
@@ -1276,19 +1277,22 @@ impl Engine {
         }
         let params = {
             let db = self.db.lock().expect("db");
-            let (action_name, raw, status): (String, String, String) = db.query_row(
-                "SELECT action_name, params, status FROM inbox WHERE id = ?1",
-                params![inbox_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
+            let (action_name, raw, status, proposed_by): (String, String, String, String) = db
+                .query_row(
+                    "SELECT action_name, params, status, proposed_by FROM inbox WHERE id = ?1",
+                    params![inbox_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?;
             if status != "pending" {
                 return Err(OntoError::Conflict(format!("inbox item is {status}")));
             }
+            tiers::require_distinct_confirmer(&session.actor.id, &proposed_by)?;
             let mut p: Value = serde_json::from_str(&raw)?;
             if let Value::Object(map) = &mut p {
                 map.insert("override_category".into(), json!(category));
                 map.insert("override_reason".into(), json!(reason));
                 map.insert("source_action".into(), json!(action_name));
+                map.insert("proposed_by".into(), json!(proposed_by));
             }
             db.execute(
                 "UPDATE inbox SET status = 'overridden' WHERE id = ?1",

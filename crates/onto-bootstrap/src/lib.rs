@@ -1,4 +1,7 @@
-//! Install the wastewater case by calling live OMS builder Actions, then Funnel.
+//! Install the wastewater teaching case (Zhang 2026) via live OMS builder APIs.
+//!
+//! Schema is created on a branch and merged. Instances arrive through Funnel.
+//! `AerationTank.target_do` is `ActionWritten`: Funnel must not overwrite it.
 
 use onto::{
     ActionTypeSpec, Actor, AgentTier, AuthzDecision, AuthzLevel, AuthzOp, Engine, ExecutionMode,
@@ -19,6 +22,29 @@ pub struct WastewaterIds {
     pub permit: String,
 }
 
+/// Install wastewater types, Actions, policies, and seed instances.
+///
+/// # Context
+/// Teaching loop (Zhang 2026): propose setpoint → inbox → confirm or override.
+/// Stale or missing sensor evidence is Review plus `request_sensor_calibration`.
+/// Permit overshoot and missing role are Deny. Override seals a replayable
+/// `DecisionRecord`. Funnel never overwrites `target_do`.
+///
+/// # Inputs
+/// `engine` — live OMS. Types are defined on a working branch and merged to main.
+///
+/// # Outputs
+/// Stable ids for plant, tanks, sensor, blower, doser, and permit.
+///
+/// # Side effects
+/// Writes schema on a branch, merges to main, Funnel-ingests instances, asserts links.
+///
+/// # Example
+/// ```
+/// let engine = onto::Engine::memory().unwrap();
+/// let ids = onto_bootstrap::install(&engine).unwrap();
+/// assert_eq!(ids.tank1, "tank-1");
+/// ```
 pub fn install(engine: &Engine) -> Result<WastewaterIds> {
     let modeller = Session::new(Actor::builder("human.modeler", &["modeler"]), "bootstrap");
     let reviewer = Session::new(Actor::builder("human.reviewer", &["reviewer"]), "bootstrap");
@@ -200,7 +226,12 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
                     PropertySource::Mapped,
                     false,
                 ),
-                prop("last_reading_at", "Timestamp", PropertySource::Mapped, true),
+                prop(
+                    "last_reading_at",
+                    "Timestamp",
+                    PropertySource::Mapped,
+                    false,
+                ),
                 derived(
                     "days_since_calibration",
                     "Timestamp",

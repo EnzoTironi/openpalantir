@@ -58,9 +58,20 @@ cargo run -p onto-sdk --bin onto -- --key builder --id ke --roles modeler,review
 
 ## Loop wastewater
 
+Caso de ensino Zhang 2026 (cite; não copie o texto). Instalação em runtime via `onto_bootstrap::install`. Sem YAML.
+
 1. Builder cria tipos/Actions no branch e faz merge.
 2. Funnel ingere planta, tanques, sensor, permit.
 3. Consumer `propose_setpoint_change` → item de inbox.
-4. Supervisor `confirm_action` ou `override_action`.
+4. Supervisor `confirm_action` ou `override_action` (confirmer ≠ executor).
 5. `get_decision_record` replay do dossier.
 6. Supervisor `compensate_action` no Allow: Action inversa (`revert_setpoint_change`), não rollback.
+
+Testes nomeados (`crates/onto-bootstrap/tests/wastewater_case.rs`):
+
+- sensor stale ou sem `last_reading_at` → `Review` + `request_sensor_calibration`
+- `target_do` acima do permit → `Deny`
+- ator sem papel → `Deny`
+- override sela `DecisionRecord` replayável; confirmer ≠ proposer
+- Funnel não sobrescreve `AerationTank.target_do` (`ActionWritten`)
+- schema em branch não mesclado não altera instâncias de produção
