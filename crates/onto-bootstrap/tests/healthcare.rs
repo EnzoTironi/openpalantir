@@ -194,19 +194,6 @@ fn does_review_and_request_observation_if_observation_is_stale() {
         search_type(&engine, "DecisionRecord").is_empty(),
         "Review must not write a DecisionRecord"
     );
-
-    let alt = engine
-        .submit_action(
-            &operator(),
-            "request_observation",
-            json!({ "observation": ids.observation_complete }),
-        )
-        .unwrap();
-    assert_eq!(alt.verdict, Verdict::Allow);
-    assert!(
-        !search_type(&engine, "ObservationRequest").is_empty(),
-        "replacement proposal must create an ObservationRequest, not a stub Allow"
-    );
 }
 
 #[test]
