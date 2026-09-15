@@ -2,14 +2,40 @@
 
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-fn onto_mcp_bin() -> &'static str {
-    option_env!("CARGO_BIN_EXE_onto_mcp").unwrap_or("onto-mcp")
+fn onto_mcp_bin() -> PathBuf {
+    for key in ["CARGO_BIN_EXE_onto_mcp", "CARGO_BIN_EXE_onto-mcp"] {
+        if let Ok(path) = std::env::var(key) {
+            return PathBuf::from(path);
+        }
+    }
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        return PathBuf::from(dir).join(profile).join("onto-mcp");
+    }
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.pop();
+    path.pop();
+    path.push("target");
+    path.push(profile);
+    path.push("onto-mcp");
+    path
 }
 
 fn spawn_stdio() -> std::process::Child {
-    Command::new(onto_mcp_bin())
+    let bin = onto_mcp_bin();
+    assert!(
+        bin.exists(),
+        "onto-mcp binary missing at {} (build the bin first)",
+        bin.display()
+    );
+    Command::new(bin)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
