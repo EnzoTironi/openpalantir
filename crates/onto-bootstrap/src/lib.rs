@@ -1,9 +1,9 @@
 //! Install the wastewater case by calling live OMS builder Actions, then Funnel.
 
 use onto::{
-    ActionTypeSpec, Actor, Engine, ExecutionMode, InterfaceSpec, IngestRecord, LinkTypeSpec,
-    ObjectTypeSpec, ParamSpec, PropertySource, PropertySpec, Result, Session, Typology,
-    ValueTypeSpec,
+    ActionTypeSpec, Actor, Engine, ExecutionMode, FunctionKind, FunctionSpec, InterfaceSpec,
+    IngestRecord, LinkTypeSpec, ObjectTypeSpec, ParamSpec, PropertySource, PropertySpec, Result,
+    Session, Typology, ValueTypeSpec,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -54,6 +54,17 @@ fn prop(name: &str, value_type: &str, source: PropertySource, nullable: bool) ->
         value_type: value_type.into(),
         source,
         nullable,
+        function: None,
+    }
+}
+
+fn derived(name: &str, value_type: &str, function: &str) -> PropertySpec {
+    PropertySpec {
+        name: name.into(),
+        value_type: value_type.into(),
+        source: PropertySource::Derived,
+        nullable: true,
+        function: Some(function.into()),
     }
 }
 
@@ -149,6 +160,15 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
             ],
         ),
     )?;
+    engine.create_function(
+        s,
+        branch,
+        FunctionSpec {
+            name: "days_since_calibration".into(),
+            inputs: vec!["calibration_date".into()],
+            kind: FunctionKind::DaysSinceTimestamp,
+        },
+    )?;
     engine.create_object_type(
         s,
         branch,
@@ -162,12 +182,7 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
                 prop("name", "Text", PropertySource::Mapped, false),
                 prop("calibration_date", "Timestamp", PropertySource::Mapped, false),
                 prop("last_reading_at", "Timestamp", PropertySource::Mapped, true),
-                prop(
-                    "days_since_calibration",
-                    "Timestamp",
-                    PropertySource::Derived,
-                    true,
-                ),
+                derived("days_since_calibration", "Timestamp", "days_since_calibration"),
             ],
         ),
     )?;

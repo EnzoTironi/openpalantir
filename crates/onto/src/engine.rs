@@ -1,4 +1,5 @@
 use crate::error::{OntoError, Result};
+use crate::functions::{self, FunctionSpec};
 use crate::types::*;
 use crate::write_path::{
     pin_version, resolve_idempotency_key, StagedOp, WritePath,
@@ -79,6 +80,12 @@ impl Engine {
                 PRIMARY KEY (branch, name)
             );
             CREATE TABLE IF NOT EXISTS schema_action_types (
+                branch TEXT NOT NULL,
+                name TEXT NOT NULL,
+                spec TEXT NOT NULL,
+                PRIMARY KEY (branch, name)
+            );
+            CREATE TABLE IF NOT EXISTS schema_functions (
                 branch TEXT NOT NULL,
                 name TEXT NOT NULL,
                 spec TEXT NOT NULL,
@@ -228,6 +235,7 @@ impl Engine {
             "schema_link_types",
             "schema_interfaces",
             "schema_action_types",
+            "schema_functions",
         ];
         let db = self.db.lock().expect("db");
         for table in tables {
@@ -283,6 +291,25 @@ impl Engine {
         Self::put_spec(
             &db,
             "schema_value_types",
+            branch,
+            &spec.name,
+            &serde_json::to_value(&spec)?,
+        )?;
+        Ok(spec.name)
+    }
+
+    pub fn create_function(
+        &self,
+        session: &Session,
+        branch: &str,
+        spec: FunctionSpec,
+    ) -> Result<String> {
+        Self::require_builder(session)?;
+        self.require_open_branch(branch)?;
+        let db = self.db.lock().expect("db");
+        Self::put_spec(
+            &db,
+            "schema_functions",
             branch,
             &spec.name,
             &serde_json::to_value(&spec)?,
@@ -583,6 +610,7 @@ impl Engine {
             "schema_link_types",
             "schema_interfaces",
             "schema_action_types",
+            "schema_functions",
         ];
         let db = self.db.lock().expect("db");
         for table in tables {
@@ -620,6 +648,7 @@ impl Engine {
             link_types: self.load_all(branch, "schema_link_types")?,
             interfaces: self.load_all(branch, "schema_interfaces")?,
             action_types: self.load_all(branch, "schema_action_types")?,
+            functions: self.load_all(branch, "schema_functions")?,
         })
     }
 
@@ -659,6 +688,44 @@ impl Engine {
             .optional()?
             .ok_or_else(|| OntoError::NotFound(format!("action type {name}")))?;
         Ok(serde_json::from_str(&spec)?)
+    }
+
+    fn load_function(&self, branch: &str, name: &str) -> Result<FunctionSpec> {
+        let db = self.db.lock().expect("db");
+        let spec: String = db
+            .query_row(
+                "SELECT spec FROM schema_functions WHERE branch = ?1 AND name = ?2",
+                params![branch, name],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| OntoError::NotFound(format!("function {name} on {branch}")))?;
+        Ok(serde_json::from_str(&spec)?)
+    }
+
+    /// Pins functions whose derived output is present on objects actually read.
+    fn function_version_for_reads(&self, reads: &[SnapshotObject]) -> String {
+        let mut pins = Vec::new();
+        for obj in reads {
+            let Ok(tspec) = self.load_object_type(MAIN_BRANCH, &obj.type_name) else {
+                continue;
+            };
+            for prop in &tspec.properties {
+                if prop.source != PropertySource::Derived {
+                    continue;
+                }
+                let Some(fn_name) = &prop.function else {
+                    continue;
+                };
+                if !obj.properties.contains_key(&prop.name) {
+                    continue;
+                }
+                if let Ok(fspec) = self.load_function(MAIN_BRANCH, fn_name) {
+                    pins.push(fspec.pin());
+                }
+            }
+        }
+        functions::digest(&pins)
     }
 
     fn load_value_type(&self, branch: &str, name: &str) -> Result<Option<ValueTypeSpec>> {
@@ -739,23 +806,17 @@ impl Engine {
         let mut properties = raw;
         if let Some(spec) = &spec {
             for prop in &spec.properties {
-                if prop.source == PropertySource::Derived && prop.name == "days_since_calibration" {
-                    if let Some(cal) = properties.get("calibration_date") {
-                        if let Some(as_of) = cal.value.as_i64().or_else(|| {
-                            cal.value.as_str().and_then(|s| s.parse::<i64>().ok())
-                        }) {
-                            let days = ((self.now() - as_of).max(0)) / 86_400;
-                            properties.insert(
-                                prop.name.clone(),
-                                PropertyView {
-                                    value: json!(days),
-                                    source: PropertySource::Derived,
-                                    as_of: Some(self.now().to_string()),
-                                    provenance: Some("function:days_since_calibration".into()),
-                                },
-                            );
-                        }
-                    }
+                if prop.source != PropertySource::Derived {
+                    continue;
+                }
+                let Some(fn_name) = prop.function.as_deref() else {
+                    continue;
+                };
+                let Ok(fspec) = self.load_function(MAIN_BRANCH, fn_name) else {
+                    continue;
+                };
+                if let Some(view) = functions::apply(&fspec, &properties, self.now()) {
+                    properties.insert(prop.name.clone(), view);
                 }
             }
         }
@@ -1080,7 +1141,7 @@ impl Engine {
             &DataSnapshot {
                 objects: vec![],
                 rule_version: "override_setpoint".into(),
-                function_version: FUNCTION_VERSION.into(),
+                function_version: functions::digest(&[]),
                 engine_version: ENGINE_VERSION.into(),
             },
             &[WritePathStep::Submit, WritePathStep::SealDecisionRecord],
@@ -1245,7 +1306,7 @@ impl Engine {
     ) -> Result<ActionOutcome> {
         let snapshot = path.data_snapshot(
             rule_version(spec),
-            FUNCTION_VERSION.into(),
+            self.function_version_for_reads(&path.reads),
             ENGINE_VERSION.into(),
         );
         let confirmer = match path.verdict {
@@ -1303,7 +1364,7 @@ impl Engine {
 
         let snapshot = path.data_snapshot(
             rule_version(spec),
-            FUNCTION_VERSION.into(),
+            self.function_version_for_reads(&path.reads),
             ENGINE_VERSION.into(),
         );
         let confirmer = match spec.mode {
@@ -1917,6 +1978,7 @@ fn builder_tools() -> Vec<ToolSpec> {
         ("attach_interface", "Attach an interface to an object type"),
         ("create_action_type", "Create an action type on a branch"),
         ("alter_action_type", "Alter an action type on a branch"),
+        ("create_function", "Create a function record on a branch"),
         ("submit_proposal", "Submit a branch for review"),
         ("review_proposal", "Approve or reject a proposal"),
         ("merge_to_main", "Merge an approved proposal into main"),

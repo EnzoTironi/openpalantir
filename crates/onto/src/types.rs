@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+use crate::functions::FunctionSpec;
+
 pub const ENGINE_VERSION: &str = "0.1.0";
-pub const FUNCTION_VERSION: &str = "days_since_calibration:0.1";
 pub const MAIN_BRANCH: &str = "main";
 
 pub const KERNEL_TYPES: &[&str] = &[
@@ -13,6 +14,7 @@ pub const KERNEL_TYPES: &[&str] = &[
     "LinkType",
     "InterfaceType",
     "ActionType",
+    "FunctionType",
     "Policy",
     "OntologyBranch",
     "OntologyProposal",
@@ -171,6 +173,9 @@ pub struct PropertySpec {
     pub value_type: String,
     pub source: PropertySource,
     pub nullable: bool,
+    /// Named [`FunctionSpec`] for [`PropertySource::Derived`]. Looked up, never matched on `name`.
+    #[serde(default)]
+    pub function: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +233,8 @@ pub struct SchemaSnapshot {
     pub link_types: Vec<LinkTypeSpec>,
     pub interfaces: Vec<InterfaceSpec>,
     pub action_types: Vec<ActionTypeSpec>,
+    #[serde(default)]
+    pub functions: Vec<FunctionSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

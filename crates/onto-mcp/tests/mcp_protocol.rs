@@ -31,6 +31,7 @@ fn builder_tools_exclude_production_reads() {
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
     assert!(names.contains(&"create_object_type".into()));
+    assert!(names.contains(&"create_function".into()));
     assert!(names.contains(&"merge_to_main".into()));
     assert!(!names.contains(&"get_object".into()));
 }

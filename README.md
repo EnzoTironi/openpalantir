@@ -7,11 +7,12 @@ Inspirado em Zhang, *Operational Ontology: From Business Mirror to Decision Runt
 ## Regras
 
 - A constituição mora no **OMS**. Tipos de domínio nascem em runtime (`open_branch` → create/alter → `submit_proposal` → `review_proposal` → `merge_to_main`).
-- Só o meta-modelo é compilado: `ObjectType`, `PropertyType`, `ValueType`, `LinkType`, `InterfaceType`, `ActionType`, `Policy`, `OntologyBranch`, `OntologyProposal`.
+- Funções são registros OMS (`create_function` no branch). Propriedades `Derived` nomeiam a função; o motor consulta o registro. Não há `if` no nome da propriedade.
+- Só o meta-modelo é compilado: `ObjectType`, `PropertyType`, `ValueType`, `LinkType`, `InterfaceType`, `ActionType`, `FunctionType`, `Policy`, `OntologyBranch`, `OntologyProposal`.
 - **Chave consumer:** consultar o mundo e executar Actions pré-definidas. Não edita schema.
 - **Chave builder:** edita schema num branch. Não lê nem escreve instâncias de produção.
 - Toda escrita de negócio passa por Action no write path de 7 passos (`WritePathStep`): submit → param+permission → submission criteria → staged edits (all-or-discard) → commit atômico → selar `DecisionRecord` → declarar side effects com chave de idempotência. Funnel não sobrescreve propriedade `ActionWritten`.
-- `DecisionRecord.data_snapshot` pina os objetos lidos nos guards, mais `rule_version`, `function_version` e `engine_version`.
+- `DecisionRecord.data_snapshot` pina os objetos lidos nos guards, mais `rule_version`, `function_version` (digest das funções invocadas) e `engine_version`.
 - Inbox é objeto, não tela. Confirmar/vetar é Action.
 
 ## Crates

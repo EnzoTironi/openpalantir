@@ -1,5 +1,6 @@
 use crate::engine::Engine;
 use crate::error::{OntoError, Result};
+use crate::functions::FunctionSpec;
 use crate::types::*;
 use serde_json::{json, Value};
 
@@ -83,6 +84,12 @@ fn dispatch_builder(engine: &Engine, session: &Session, tool: &str, args: Value)
                 "name": engine.create_action_type(session, str_arg(&args, "branch")?, spec)?
             }))
         }
+        "create_function" => {
+            let spec: FunctionSpec = serde_json::from_value(require(&args, "spec")?)?;
+            Ok(json!({
+                "name": engine.create_function(session, str_arg(&args, "branch")?, spec)?
+            }))
+        }
         "submit_proposal" => Ok(json!({
             "proposal_id": engine.submit_proposal(session, str_arg(&args, "branch")?)?
         })),
@@ -164,7 +171,7 @@ fn dispatch_consumer(engine: &Engine, session: &Session, tool: &str, args: Value
             Ok(json!({ "ids": engine.funnel_ingest(session, records)? }))
         }
         "create_object_type" | "open_branch" | "merge_to_main" | "create_action_type"
-        | "add_property" | "submit_proposal" | "review_proposal" => Err(OntoError::Denied(
+        | "add_property" | "submit_proposal" | "review_proposal" | "create_function" => Err(OntoError::Denied(
             "consumer key cannot mutate schema".into(),
         )),
         "list_tools" => Ok(serde_json::to_value(engine.list_tools(session)?)?),

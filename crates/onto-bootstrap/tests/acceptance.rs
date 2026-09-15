@@ -25,6 +25,7 @@ fn intern() -> Session {
 fn kernel_types_exist_before_user_work() {
     assert!(Engine::kernel_types().contains(&"ObjectType"));
     assert!(Engine::kernel_types().contains(&"OntologyProposal"));
+    assert!(Engine::kernel_types().contains(&"FunctionType"));
 }
 
 #[test]
@@ -67,6 +68,7 @@ fn branch_alter_invisible_until_merge() {
                 value_type: "Text".into(),
                 source: onto::PropertySource::Mapped,
                 nullable: true,
+                function: None,
             },
         )
         .unwrap();
@@ -342,6 +344,7 @@ fn unmerged_branch_zero_effect_on_production() {
                     value_type: "Text".into(),
                     source: onto::PropertySource::Mapped,
                     nullable: false,
+                    function: None,
                 }],
             },
         )
@@ -515,10 +518,16 @@ fn decision_snapshot_pins_reads_and_versions() {
     let permit = by_id(&ids.permit);
     assert_eq!(permit["properties"]["do_max"], 4.0);
     assert_eq!(rec.data_snapshot["engine_version"], onto::ENGINE_VERSION);
-    assert_eq!(
-        rec.data_snapshot["function_version"],
-        onto::FUNCTION_VERSION
-    );
+    let cal = engine
+        .get_schema(&operator(), None)
+        .unwrap()
+        .functions
+        .iter()
+        .find(|f| f.name == "days_since_calibration")
+        .expect("calibration function is an OMS record")
+        .pin();
+    assert_eq!(rec.data_snapshot["function_version"], cal);
+    assert_ne!(cal, "days_since_calibration:0.1");
     let rule = rec.data_snapshot["rule_version"]
         .as_str()
         .expect("rule_version");
@@ -527,7 +536,7 @@ fn decision_snapshot_pins_reads_and_versions() {
         "rule_version pins the action spec, got {rule}"
     );
     assert_eq!(rec.engine_version, onto::ENGINE_VERSION);
-    assert_eq!(rec.function_version, onto::FUNCTION_VERSION);
+    assert_eq!(rec.function_version, cal);
 }
 
 #[test]
@@ -574,4 +583,147 @@ fn idempotent_side_effect_key_does_not_double_apply() {
         "setpoint:tank-1:2.6"
     );
     assert_eq!(rec.proof_trace, WritePathStep::ALL.to_vec());
+}
+
+#[test]
+fn wastewater_sensor_exposes_days_since_calibration() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    let schema = engine.get_schema(&operator(), None).unwrap();
+    let cal = schema
+        .functions
+        .iter()
+        .find(|f| f.name == "days_since_calibration")
+        .expect("function is an OMS record");
+    assert_eq!(cal.inputs, vec!["calibration_date"]);
+    let sensor_type = schema
+        .object_types
+        .iter()
+        .find(|t| t.name == "DO_Sensor")
+        .unwrap();
+    let derived = sensor_type
+        .properties
+        .iter()
+        .find(|p| p.name == "days_since_calibration")
+        .unwrap();
+    assert_eq!(derived.source, onto::PropertySource::Derived);
+    assert_eq!(derived.function.as_deref(), Some("days_since_calibration"));
+
+    let sensor = engine.get_object(&operator(), &ids.sensor1).unwrap();
+    assert_eq!(sensor.properties["days_since_calibration"].value, json!(10));
+    assert_eq!(
+        sensor.properties["days_since_calibration"].source,
+        onto::PropertySource::Derived
+    );
+    engine.set_clock(engine.now() + 86_400);
+    let later = engine.get_object(&operator(), &ids.sensor1).unwrap();
+    assert_eq!(later.properties["days_since_calibration"].value, json!(11));
+}
+
+#[test]
+fn runtime_registered_function_visible_after_merge() {
+    let engine = Engine::memory().unwrap();
+    install(&engine).unwrap();
+
+    let b = engine.open_branch(&modeller(), "fn-double").unwrap();
+    engine
+        .create_function(
+            &modeller(),
+            &b,
+            onto::FunctionSpec {
+                name: "double_of".into(),
+                inputs: vec!["n".into()],
+                kind: onto::FunctionKind::DoubleInteger,
+            },
+        )
+        .unwrap();
+    engine
+        .create_object_type(
+            &modeller(),
+            &b,
+            onto::ObjectTypeSpec {
+                name: "Gauge".into(),
+                typology: onto::Typology::Entity,
+                title_prop: Some("name".into()),
+                interfaces: vec![],
+                freshness_budget_secs: None,
+                properties: vec![
+                    onto::PropertySpec {
+                        name: "name".into(),
+                        value_type: "Text".into(),
+                        source: onto::PropertySource::Mapped,
+                        nullable: false,
+                        function: None,
+                    },
+                    onto::PropertySpec {
+                        name: "n".into(),
+                        value_type: "Text".into(),
+                        source: onto::PropertySource::Mapped,
+                        nullable: false,
+                        function: None,
+                    },
+                    onto::PropertySpec {
+                        name: "twice".into(),
+                        value_type: "Text".into(),
+                        source: onto::PropertySource::Derived,
+                        nullable: true,
+                        function: Some("double_of".into()),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+    let main_mid = engine.get_schema(&operator(), None).unwrap();
+    assert!(
+        !main_mid.functions.iter().any(|f| f.name == "double_of"),
+        "unmerged function must not appear on production schema"
+    );
+    assert!(!main_mid.object_types.iter().any(|t| t.name == "Gauge"));
+    let ingest_denied = engine.funnel_ingest(
+        &operator(),
+        vec![onto::IngestRecord {
+            type_name: "Gauge".into(),
+            id: Some("gauge-1".into()),
+            properties: [("name".into(), json!("g1")), ("n".into(), json!(21))]
+                .into_iter()
+                .collect(),
+            as_of: Some(engine.now().to_string()),
+            provenance: Some("test".into()),
+        }],
+    );
+    assert!(
+        ingest_denied.is_err(),
+        "unmerged type must have zero effect on production writes"
+    );
+
+    let proposal = engine.submit_proposal(&modeller(), &b).unwrap();
+    engine.review_proposal(&reviewer(), &proposal, true).unwrap();
+    engine.merge_to_main(&reviewer(), &proposal).unwrap();
+
+    engine
+        .funnel_ingest(
+            &operator(),
+            vec![onto::IngestRecord {
+                type_name: "Gauge".into(),
+                id: Some("gauge-1".into()),
+                properties: [("name".into(), json!("g1")), ("n".into(), json!(21))]
+                    .into_iter()
+                    .collect(),
+                as_of: Some(engine.now().to_string()),
+                provenance: Some("test".into()),
+            }],
+        )
+        .unwrap();
+    let gauge = engine.get_object(&operator(), "gauge-1").unwrap();
+    assert_eq!(gauge.properties["n"].value, json!(21));
+    assert_eq!(gauge.properties["twice"].value, json!(42));
+    assert_eq!(
+        gauge.properties["twice"].source,
+        onto::PropertySource::Derived
+    );
+    assert_eq!(
+        gauge.properties["twice"].provenance.as_deref(),
+        Some("function:double_of")
+    );
 }
