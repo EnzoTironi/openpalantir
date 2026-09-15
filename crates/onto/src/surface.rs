@@ -180,9 +180,18 @@ fn dispatch_consumer(
         }
         "get_object" => {
             let id = str_arg(args, "id")?;
-            let as_of = match args.get("as_of") {
-                None => AsOf::Current,
-                Some(v) => {
+            let as_of = match (args.get("recorded"), args.get("as_of")) {
+                (Some(v), _) => {
+                    let t = v
+                        .as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                        .ok_or_else(|| {
+                            OntoError::Invalid("recorded must be an integer clock".into())
+                        })?;
+                    AsOf::Recorded(t)
+                }
+                (None, None) => AsOf::Current,
+                (None, Some(v)) => {
                     let t = v
                         .as_i64()
                         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))

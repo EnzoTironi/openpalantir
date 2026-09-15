@@ -423,6 +423,25 @@ pub fn json_schema_type(value_type: &str) -> &'static str {
     }
 }
 
+/// Project a persisted [`ValueTypeSpec`] into the JSON Schema the runtime accepts.
+#[must_use]
+pub fn json_schema_from_value_type(spec: &crate::types::ValueTypeSpec) -> serde_json::Value {
+    let type_name = match spec.base.as_str() {
+        "number" => "number",
+        "boolean" => "boolean",
+        _ => "string",
+    };
+    let mut schema = serde_json::Map::new();
+    schema.insert("type".into(), serde_json::json!(type_name));
+    if let Some(min) = spec.min {
+        schema.insert("minimum".into(), serde_json::json!(min));
+    }
+    if let Some(max) = spec.max {
+        schema.insert("maximum".into(), serde_json::json!(max));
+    }
+    serde_json::Value::Object(schema)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +466,7 @@ mod tests {
             properties: BTreeMap::new(),
             missing: vec![],
             stale: vec![],
+            version_id: String::new(),
         };
         let (results, _) = evaluate(&guards, &json!({"permit":"p","n":2.0}), 1, |_| {
             Ok(view.clone())
@@ -460,5 +480,16 @@ mod tests {
     fn does_map_text_to_json_schema_string() {
         assert_eq!(json_schema_type("Text"), "string");
         assert_eq!(json_schema_type("DOConcentration"), "number");
+        let clearance = crate::types::ValueTypeSpec {
+            name: "Clearance".into(),
+            base: "number".into(),
+            min: Some(1.0),
+            max: Some(1.0),
+            unit: None,
+        };
+        assert_eq!(
+            json_schema_from_value_type(&clearance)["type"],
+            serde_json::json!("number")
+        );
     }
 }

@@ -21,6 +21,9 @@ pub enum OntoError {
     NotCompensable(String),
     #[error("store: {0}")]
     Store(String),
+    /// Read-set or schema version changed after evaluation. Retry the command.
+    #[error("stale read-set")]
+    StaleRead,
 }
 
 impl From<rusqlite::Error> for OntoError {

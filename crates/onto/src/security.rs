@@ -245,10 +245,9 @@ pub fn filter_view(grants: &[PolicySpec], session: &Session, mut view: ObjectVie
         .is_allow()
     });
     if let Some(title) = &view.title {
-        let visible = view
-            .properties
-            .values()
-            .any(|p| p.value.as_str() == Some(title.as_str()));
+        let visible = ["name", "title"].iter().any(|prop| {
+            view.properties.get(*prop).and_then(|p| p.value.as_str()) == Some(title.as_str())
+        });
         if !visible {
             view.title = None;
         }
@@ -489,6 +488,7 @@ mod tests {
             properties,
             missing: vec![],
             stale: vec![],
+            version_id: String::new(),
         };
         let hidden = filter_view(&grants, &restricted(), raw.clone());
         assert!(!hidden.properties.contains_key("rationale"));

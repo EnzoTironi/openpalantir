@@ -1,5 +1,8 @@
 use crate::bitemporal::{self, AsOf};
+use crate::clock::Clock;
+use crate::command::{self, payload_digest, DecisionApply};
 use crate::compensation::{self, Compensation};
+use crate::disclosure;
 use crate::error::{OntoError, Result};
 use crate::functions::{self, FunctionSpec};
 use crate::guards;
@@ -17,26 +20,28 @@ use crate::write_path::{pin_version, resolve_idempotency_key, StagedOp, WritePat
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
 
 /// Coordinates OMS syscalls. Persistence is [`Store`], not this type's fields.
 pub struct Engine {
     store: Box<dyn Store>,
-    clock: AtomicI64,
+    clock: Clock,
 }
 
 impl Engine {
-    /// Inject a persistence backend. The store owns the connection and lock.
+    /// Inject a persistence backend. Uses the production wall clock.
     #[must_use]
     pub fn from_store(store: impl Store + 'static) -> Self {
         Self {
             store: Box::new(store),
-            clock: AtomicI64::new(1_700_000_000),
+            clock: Clock::live(),
         }
     }
 
     pub fn memory() -> Result<Self> {
-        Ok(Self::from_store(SqliteStore::memory()?))
+        Ok(Self {
+            store: Box::new(SqliteStore::memory()?),
+            clock: Clock::frozen(1_700_000_000),
+        })
     }
 
     pub fn open(path: &str) -> Result<Self> {
@@ -44,12 +49,17 @@ impl Engine {
     }
 
     pub fn set_clock(&self, secs: i64) {
-        self.clock.store(secs, Ordering::SeqCst);
+        self.clock.set(secs);
     }
 
     #[must_use]
     pub fn now(&self) -> i64 {
-        self.clock.load(Ordering::SeqCst)
+        self.clock.now()
+    }
+
+    #[must_use]
+    pub fn clock_is_frozen(&self) -> bool {
+        self.clock.is_frozen()
     }
 
     fn require_builder(session: &Session) -> Result<()> {
@@ -569,27 +579,29 @@ impl Engine {
         ))
     }
 
-    fn authorize_write(
+    fn require_write(&self, session: &Session, type_name: &str, instance_id: &str) -> Result<()> {
+        self.require_write_property(session, type_name, instance_id, None)
+    }
+
+    fn require_write_property(
         &self,
         session: &Session,
         type_name: &str,
         instance_id: &str,
-    ) -> Result<AuthzDecision> {
-        Ok(authorize(
+        property: Option<&str>,
+    ) -> Result<()> {
+        match authorize(
             &self.load_policies()?,
             session,
             AuthzOp::Write,
             Some(type_name),
             Some(instance_id),
-            None,
-        ))
-    }
-
-    fn require_write(&self, session: &Session, type_name: &str, instance_id: &str) -> Result<()> {
-        match self.authorize_write(session, type_name, instance_id)? {
+            property,
+        ) {
             AuthzDecision::Allow => Ok(()),
             AuthzDecision::Deny => Err(OntoError::Denied(format!(
-                "write denied for {type_name}/{instance_id}"
+                "write denied for {type_name}/{instance_id}{}",
+                property.map_or_else(String::new, |p| format!(".{p}"))
             ))),
         }
     }
@@ -674,7 +686,7 @@ impl Engine {
     fn load_object_view(&self, id: &str, as_of: AsOf) -> Result<ObjectView> {
         let loaded = self.store.load_version(id, as_of)?;
         let clock = match as_of {
-            AsOf::Current => self.now(),
+            AsOf::Current | AsOf::Recorded(_) => self.now(),
             AsOf::Valid(t) => t,
         };
         let raw: BTreeMap<String, PropertyView> = serde_json::from_str(&loaded.properties)?;
@@ -721,6 +733,7 @@ impl Engine {
             properties,
             missing,
             stale,
+            version_id: loaded.version_id,
         };
         if let Some(spec) = spec {
             if kernel::attached(&spec.interfaces, KernelInterface::Evidenced) {
@@ -814,7 +827,7 @@ impl Engine {
             self.require_write(session, &rec.type_name, &id)?;
             let mut rec = rec;
             rec.id = Some(id);
-            ids.push(self.ingest_one(rec)?);
+            ids.push(self.ingest_one(session, rec)?);
         }
         self.audit(
             &session.actor.id,
@@ -824,7 +837,7 @@ impl Engine {
         Ok(ids)
     }
 
-    fn ingest_one(&self, rec: IngestRecord) -> Result<String> {
+    fn ingest_one(&self, session: &Session, rec: IngestRecord) -> Result<String> {
         let spec = self.load_object_type(MAIN_BRANCH, &rec.type_name)?;
         let as_of = rec.as_of.clone().unwrap_or_else(|| self.now().to_string());
         let id = rec.id.clone().unwrap_or_else(new_id);
@@ -845,11 +858,11 @@ impl Engine {
             None => BTreeMap::new(),
         };
         for (name, value) in rec.properties {
-            let source = spec
-                .properties
-                .iter()
-                .find(|p| p.name == name)
-                .map_or(PropertySource::Mapped, |p| p.source);
+            let declared = spec.properties.iter().find(|p| p.name == name);
+            if declared.is_some() {
+                self.require_write_property(session, &rec.type_name, &id, Some(&name))?;
+            }
+            let source = declared.map_or(PropertySource::Mapped, |p| p.source);
             if source == PropertySource::ActionWritten {
                 continue;
             }
@@ -902,7 +915,7 @@ impl Engine {
     pub fn list_inbox(&self, session: &Session) -> Result<Vec<InboxItem>> {
         Self::require_consumer(session)?;
         tiers::require_syscall(session.actor.tier, "list_inbox")?;
-        self.store.list_inbox()
+        Ok(disclosure::visible_inbox(session, self.store.list_inbox()?))
     }
 
     pub fn describe_action(&self, session: &Session, name: &str) -> Result<ActionTypeSpec> {
@@ -928,7 +941,7 @@ impl Engine {
                     if session.actor.tier >= action.required_tier
                         && session.actor.tier.allows_syscall("submit_action")
                     {
-                        tools.push(action_to_tool(&action));
+                        tools.push(Self::action_to_tool(&action, &schema.value_types));
                     }
                 }
                 Ok(tools)
@@ -962,6 +975,7 @@ impl Engine {
         overlay: Value,
     ) -> Result<ActionOutcome> {
         Self::require_consumer(session)?;
+        tiers::require_syscall(session.actor.tier, "compensate_action")?;
         let original = self.get_decision_record(session, decision_record_id)?;
         compensation::require_allow(&original)?;
         let original_spec = self.load_action_type(MAIN_BRANCH, &original.action_name)?;
@@ -985,8 +999,13 @@ impl Engine {
             "confirmed" => {
                 let params: Value = serde_json::from_str(&row.params)?;
                 let apply = apply_action_name_from_row(&row);
-                let key = resolve_idempotency_key(&apply, &session.actor.id, &params);
-                if let Some(cached) = self.load_cached_outcome(&key)? {
+                let spec = self.load_action_type(MAIN_BRANCH, &apply)?;
+                if let Err(auth) = self.check_param_and_permission(session, &spec, &params)? {
+                    return Err(OntoError::Denied(auth.reason));
+                }
+                let key =
+                    resolve_idempotency_key(&apply, &session.actor.id, &params, Some(inbox_id));
+                if let Some(cached) = self.load_cached_outcome(&key, &payload_digest(&params))? {
                     return Ok(cached);
                 }
                 return Err(OntoError::Conflict("inbox item is confirmed".into()));
@@ -1072,7 +1091,8 @@ impl Engine {
     pub fn get_decision_record(&self, session: &Session, id: &str) -> Result<DecisionRecordView> {
         Self::require_consumer(session)?;
         let mut rec = self.store.load_decision(id)?;
-        self.redact_snapshot(session, &mut rec.data_snapshot)?;
+        let grants = self.load_policies()?;
+        disclosure::redact_record(&grants, session, &mut rec);
         Ok(rec)
     }
 
@@ -1093,6 +1113,26 @@ impl Engine {
         params: &Value,
         confirmer_inbox: Option<&str>,
     ) -> Result<ActionOutcome> {
+        let mut last = None;
+        for _ in 0..8 {
+            match self.execute_action_once(session, spec, params, confirmer_inbox) {
+                Err(OntoError::StaleRead) => {
+                    last = Some(OntoError::StaleRead);
+                    continue;
+                }
+                other => return other,
+            }
+        }
+        Err(last.unwrap_or(OntoError::Conflict("command retry exhausted".into())))
+    }
+
+    fn execute_action_once(
+        &self,
+        session: &Session,
+        spec: &ActionTypeSpec,
+        params: &Value,
+        confirmer_inbox: Option<&str>,
+    ) -> Result<ActionOutcome> {
         match spec.mode {
             ExecutionMode::Approve if confirmer_inbox.is_none() => {
                 return Err(OntoError::Denied(format!(
@@ -1105,7 +1145,8 @@ impl Engine {
             | ExecutionMode::Shadow
             | ExecutionMode::Approve => {}
         }
-        let key = resolve_idempotency_key(&spec.name, &session.actor.id, params);
+        let key = resolve_idempotency_key(&spec.name, &session.actor.id, params, confirmer_inbox);
+        let digest = payload_digest(params);
         let path = WritePath::begin(key.clone());
         match self.check_param_and_permission(session, spec, params) {
             Err(e) => Err(e),
@@ -1118,10 +1159,10 @@ impl Engine {
                     }],
                     Verdict::Deny,
                 );
-                self.finish_abort(session, spec, params, &path, auth.reason, None)
+                self.finish_abort(session, spec, params, &path, auth.reason, None, &digest)
             }
             Ok(Ok(param_reads)) => {
-                if let Some(cached) = self.load_cached_outcome(&key)? {
+                if let Some(cached) = self.load_cached_outcome(&key, &digest)? {
                     return Ok(cached);
                 }
                 let path = path.param_and_permission(param_reads);
@@ -1141,10 +1182,18 @@ impl Engine {
                         );
                         let alternative = spec.on_review.clone();
                         let path = path.discard_stage();
-                        self.finish_abort(session, spec, params, &path, reason, alternative)
+                        self.finish_abort(
+                            session,
+                            spec,
+                            params,
+                            &path,
+                            reason,
+                            alternative,
+                            &digest,
+                        )
                     }
                     Verdict::Allow => {
-                        self.finish_allow(session, spec, params, confirmer_inbox, path)
+                        self.finish_allow(session, spec, params, confirmer_inbox, path, &digest)
                     }
                 }
             }
@@ -1196,6 +1245,7 @@ impl Engine {
         Ok(Ok(reads))
     }
 
+    #[allow(clippy::too_many_arguments)] // digest travels with the abort seal
     fn finish_abort(
         &self,
         session: &Session,
@@ -1204,6 +1254,7 @@ impl Engine {
         path: &WritePath<crate::write_path::SealDecisionRecord>,
         reason: String,
         alternative: Option<String>,
+        digest: &str,
     ) -> Result<ActionOutcome> {
         let snapshot = path.data_snapshot(
             rule_version(spec),
@@ -1226,7 +1277,9 @@ impl Engine {
             guard_results: path.guards.clone(),
         };
         let outcome_json = serde_json::to_string(&outcome)?;
-        self.store.commit_decision(&DecisionCommit {
+        let read_set = read_set_of(&path.reads);
+        let schema = self.store.schema_revision(MAIN_BRANCH)?;
+        match self.store.commit_decision(&DecisionCommit {
             ops: &[],
             decision: DecisionWrite {
                 id: &rec,
@@ -1243,13 +1296,18 @@ impl Engine {
             },
             idempotency_key: Some(&path.idempotency_key),
             idempotency_outcome: Some(&outcome_json),
+            payload_digest: Some(digest),
+            read_set: &read_set,
+            schema_revision: Some(&schema),
             audit_id: None,
             audit_actor: None,
             audit_kind: None,
             audit_payload: None,
             effect_declaration: None,
-        })?;
-        Ok(outcome)
+        })? {
+            DecisionApply::Written(_) => Ok(outcome),
+            DecisionApply::Replayed(raw) => Ok(serde_json::from_str(&raw)?),
+        }
     }
 
     fn finish_allow(
@@ -1259,6 +1317,7 @@ impl Engine {
         params: &Value,
         confirmer_inbox: Option<&str>,
         path: WritePath<crate::write_path::SubmissionCriteria>,
+        digest: &str,
     ) -> Result<ActionOutcome> {
         let (staged, inbox_id) = self.build_stage(session, spec, params, confirmer_inbox)?;
         let path = path.stage(staged);
@@ -1326,7 +1385,9 @@ impl Engine {
         .to_string();
         let outcome_json = serde_json::to_string(&outcome)?;
         let declaration = declaration.to_string();
-        self.store.commit_decision(&DecisionCommit {
+        let read_set = read_set_of(&path.reads);
+        let schema = self.store.schema_revision(MAIN_BRANCH)?;
+        let applied = self.store.commit_decision(&DecisionCommit {
             ops: &path.staged,
             decision: DecisionWrite {
                 id: &rec,
@@ -1343,6 +1404,9 @@ impl Engine {
             },
             idempotency_key: Some(&path.idempotency_key),
             idempotency_outcome: Some(&outcome_json),
+            payload_digest: Some(digest),
+            read_set: &read_set,
+            schema_revision: Some(&schema),
             audit_id: Some(&audit_id),
             audit_actor: Some(session.actor.id.as_str()),
             audit_kind: Some("side_effect"),
@@ -1350,7 +1414,10 @@ impl Engine {
             effect_declaration: Some(&declaration),
         })?;
         let _: WritePath<crate::write_path::DeclareSideEffects> = path;
-        Ok(outcome)
+        match applied {
+            DecisionApply::Written(_) => Ok(outcome),
+            DecisionApply::Replayed(raw) => Ok(serde_json::from_str(&raw)?),
+        }
     }
 
     fn build_stage(
@@ -1457,33 +1524,7 @@ impl Engine {
                     p.value_type
                 )));
             };
-            match vt.base.as_str() {
-                "number" => {
-                    let n = val.as_f64().ok_or_else(|| {
-                        OntoError::Invalid(format!("{} must be a number", p.name))
-                    })?;
-                    if let Some(min) = vt.min {
-                        if n < min {
-                            return Err(OntoError::Invalid(format!("{} below {}", p.name, min)));
-                        }
-                    }
-                    if let Some(max) = vt.max {
-                        if n > max {
-                            return Err(OntoError::Invalid(format!("{} above {}", p.name, max)));
-                        }
-                    }
-                }
-                "string" => {
-                    if !val.is_string() {
-                        return Err(OntoError::Invalid(format!("{} must be a string", p.name)));
-                    }
-                }
-                other => {
-                    return Err(OntoError::Invalid(format!(
-                        "unsupported value type base {other}"
-                    )));
-                }
-            }
+            Self::validate_loaded_value(&vt, &p.name, val)?;
             if let Some(ot) = &p.object_type {
                 let id = val.as_str().ok_or_else(|| {
                     OntoError::Invalid(format!("{} must be an object id", p.name))
@@ -1495,6 +1536,42 @@ impl Engine {
                         p.name, view.type_name
                     )));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_loaded_value(vt: &ValueTypeSpec, field: &str, val: &Value) -> Result<()> {
+        match vt.base.as_str() {
+            "number" => {
+                let n = val
+                    .as_f64()
+                    .ok_or_else(|| OntoError::Invalid(format!("{field} must be a number")))?;
+                if let Some(min) = vt.min {
+                    if n < min {
+                        return Err(OntoError::Invalid(format!("{field} below {min}")));
+                    }
+                }
+                if let Some(max) = vt.max {
+                    if n > max {
+                        return Err(OntoError::Invalid(format!("{field} above {max}")));
+                    }
+                }
+            }
+            "string" => {
+                if !val.is_string() {
+                    return Err(OntoError::Invalid(format!("{field} must be a string")));
+                }
+            }
+            "boolean" => {
+                if !val.is_boolean() {
+                    return Err(OntoError::Invalid(format!("{field} must be a boolean")));
+                }
+            }
+            other => {
+                return Err(OntoError::Invalid(format!(
+                    "unsupported value type base {other}"
+                )));
             }
         }
         Ok(())
@@ -1514,7 +1591,8 @@ impl Engine {
     #[allow(clippy::too_many_lines)] // create/update/link/close_link stay one write-set builder
     fn stage_effects(&self, effects: &Value, params: &Value, actor: &str) -> Result<Vec<StagedOp>> {
         let mut staged = Vec::new();
-        let mut created = Vec::new();
+        let mut created_ids = Vec::new();
+        let mut created_types: BTreeMap<String, String> = BTreeMap::new();
         let mut pending: BTreeMap<String, BTreeMap<String, PropertyView>> = BTreeMap::new();
         let Some(arr) = effects.as_array() else {
             return Ok(staged);
@@ -1557,7 +1635,8 @@ impl Engine {
                     properties: serde_json::to_string(&props)?,
                     created_at: self.now(),
                 });
-                created.push(id);
+                created_ids.push(id.clone());
+                created_types.insert(id, type_name.into());
             }
             if let Some(target_param) = obj.get("update").and_then(Value::as_str) {
                 let id = param_str(params, target_param)?;
@@ -1604,12 +1683,12 @@ impl Engine {
                 )?;
                 let to = if let Some(to_param) = obj.get("to").and_then(Value::as_str) {
                     param_str(params, to_param)?
-                } else if let Some(last) = created.last() {
+                } else if let Some(last) = created_ids.last() {
                     last.clone()
                 } else {
                     return Err(OntoError::Invalid("link effect needs to".into()));
                 };
-                self.validate_link(&link, &from, &to, &created)?;
+                self.validate_link(&link, &from, &to, &created_types)?;
                 staged.push(StagedOp::InsertLink {
                     id: new_id(),
                     type_name: link,
@@ -1630,27 +1709,32 @@ impl Engine {
                     params,
                     obj.get("from").and_then(Value::as_str).unwrap_or("from"),
                 )?;
-                let to_id = obj
-                    .get("to")
-                    .and_then(Value::as_str)
-                    .map(|name| param_str(params, name))
-                    .transpose()?;
+                let to = param_str(
+                    params,
+                    obj.get("to").and_then(Value::as_str).ok_or_else(|| {
+                        OntoError::Invalid("close_link needs both endpoints".into())
+                    })?,
+                )?;
                 staged.push(StagedOp::CloseLink {
                     type_name,
                     from_id: from,
-                    to_id,
+                    to_id: to,
                 });
             }
         }
         Ok(staged)
     }
 
-    fn load_cached_outcome(&self, key: &str) -> Result<Option<ActionOutcome>> {
-        Ok(self
-            .store
-            .get_idempotency(key)?
-            .map(|s| serde_json::from_str(&s))
-            .transpose()?)
+    fn load_cached_outcome(&self, key: &str, digest: &str) -> Result<Option<ActionOutcome>> {
+        let Some(row) = self.store.get_idempotency(key)? else {
+            return Ok(None);
+        };
+        if !row.payload_digest.is_empty() && row.payload_digest != digest {
+            return Err(OntoError::Conflict(
+                "idempotency key is bound to a different payload".into(),
+            ));
+        }
+        Ok(Some(serde_json::from_str(&row.outcome)?))
     }
 
     fn pin_apply_action(&self, apply_name: &str, propose: &ActionTypeSpec) -> String {
@@ -1672,78 +1756,103 @@ impl Engine {
                 let id = param_str(params, target)?;
                 let type_name = self.store.object_type_of(&id)?;
                 self.require_write(session, &type_name, &id)?;
+                if let Some(fields) = effect.get("properties").and_then(Value::as_object) {
+                    for name in fields.keys() {
+                        self.require_write_property(session, &type_name, &id, Some(name))?;
+                    }
+                }
             }
             if let Some(type_name) = effect.get("create").and_then(Value::as_str) {
                 self.require_write(session, type_name, "*")?;
+            }
+            if effect.get("link").is_some() || effect.get("close_link").is_some() {
+                let from = param_str(
+                    params,
+                    effect.get("from").and_then(Value::as_str).unwrap_or("from"),
+                )?;
+                if self.store.identity_exists(&from)? {
+                    let from_type = self.store.object_type_of(&from)?;
+                    self.require_write(session, &from_type, &from)?;
+                }
+                if let Some(to_param) = effect.get("to").and_then(Value::as_str) {
+                    if let Ok(to) = param_str(params, to_param) {
+                        if self.store.identity_exists(&to)? {
+                            let to_type = self.store.object_type_of(&to)?;
+                            self.require_write(session, &to_type, &to)?;
+                        }
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    fn validate_link(&self, link: &str, from: &str, to: &str, created: &[String]) -> Result<()> {
+    fn validate_link(
+        &self,
+        link: &str,
+        from: &str,
+        to: &str,
+        created: &BTreeMap<String, String>,
+    ) -> Result<()> {
         let spec = self.load_named("schema_link_types", MAIN_BRANCH, link, || {
             format!("link type {link}")
         })?;
         let spec: LinkTypeSpec = spec;
-        let from_ok = created.iter().any(|id| id == from) || self.store.identity_exists(from)?;
-        let to_ok = created.iter().any(|id| id == to) || self.store.identity_exists(to)?;
+        let from_ok = created.contains_key(from) || self.store.identity_exists(from)?;
+        let to_ok = created.contains_key(to) || self.store.identity_exists(to)?;
         if !from_ok || !to_ok {
             return Err(OntoError::Invalid(format!(
                 "link {link} endpoints must exist"
             )));
         }
-        if !created.iter().any(|id| id == from) {
-            let from_type = self.store.object_type_of(from)?;
-            if from_type != spec.from_type {
-                return Err(OntoError::Invalid(format!(
-                    "link {link} from must be {}",
-                    spec.from_type
-                )));
-            }
+        let from_type = created
+            .get(from)
+            .cloned()
+            .map_or_else(|| self.store.object_type_of(from), Ok)?;
+        if from_type != spec.from_type {
+            return Err(OntoError::Invalid(format!(
+                "link {link} from must be {}",
+                spec.from_type
+            )));
         }
-        if !created.iter().any(|id| id == to) {
-            let to_type = self.store.object_type_of(to)?;
-            if to_type != spec.to_type {
-                return Err(OntoError::Invalid(format!(
-                    "link {link} to must be {}",
-                    spec.to_type
-                )));
-            }
+        let to_type = created
+            .get(to)
+            .cloned()
+            .map_or_else(|| self.store.object_type_of(to), Ok)?;
+        if to_type != spec.to_type {
+            return Err(OntoError::Invalid(format!(
+                "link {link} to must be {}",
+                spec.to_type
+            )));
         }
         Ok(())
     }
 
-    fn redact_snapshot(&self, session: &Session, snapshot: &mut Value) -> Result<()> {
-        let grants = self.load_policies()?;
-        let Some(objects) = snapshot.get_mut("objects").and_then(Value::as_array_mut) else {
-            return Ok(());
-        };
-        for obj in objects {
-            let id = obj
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let type_name = obj
-                .get("type_name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if let Some(props) = obj.get_mut("properties").and_then(Value::as_object_mut) {
-                props.retain(|name, _| {
-                    authorize(
-                        &grants,
-                        session,
-                        AuthzOp::Read,
-                        Some(&type_name),
-                        Some(&id),
-                        Some(name),
-                    )
-                    .is_allow()
-                });
+    fn action_to_tool(action: &ActionTypeSpec, value_types: &[ValueTypeSpec]) -> ToolSpec {
+        let mut properties = serde_json::Map::new();
+        let mut required = Vec::new();
+        for p in &action.parameters {
+            let schema = value_types
+                .iter()
+                .find(|vt| vt.name == p.value_type)
+                .map_or_else(
+                    || json!({ "type": guards::json_schema_type(&p.value_type) }),
+                    guards::json_schema_from_value_type,
+                );
+            properties.insert(p.name.clone(), schema);
+            if p.required {
+                required.push(p.name.clone());
             }
         }
-        Ok(())
+        ToolSpec {
+            name: format!("action.{}", action.name),
+            description: format!("Predefined action {}", action.name),
+            input_schema: json!({
+                "type": "object",
+                "properties": properties,
+                "required": required
+            }),
+        }
     }
 }
 
@@ -1891,25 +2000,12 @@ fn consumer_base_tools() -> Vec<ToolSpec> {
     .collect()
 }
 
-fn action_to_tool(action: &ActionTypeSpec) -> ToolSpec {
-    let mut properties = serde_json::Map::new();
-    let mut required = Vec::new();
-    for p in &action.parameters {
-        properties.insert(
-            p.name.clone(),
-            json!({ "type": guards::json_schema_type(&p.value_type) }),
-        );
-        if p.required {
-            required.push(p.name.clone());
-        }
-    }
-    ToolSpec {
-        name: format!("action.{}", action.name),
-        description: format!("Predefined action {}", action.name),
-        input_schema: json!({
-            "type": "object",
-            "properties": properties,
-            "required": required
-        }),
-    }
+fn read_set_of(reads: &[SnapshotObject]) -> Vec<(String, String)> {
+    command::read_set(
+        &reads
+            .iter()
+            .filter(|o| !o.version_id.is_empty())
+            .map(|o| (o.id.clone(), o.version_id.clone()))
+            .collect::<Vec<_>>(),
+    )
 }

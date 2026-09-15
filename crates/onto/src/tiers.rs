@@ -177,7 +177,7 @@ pub fn min_tier_for_syscall(tool: &str) -> AgentTier {
         | "get_decision_record"
         | "get_rejection" => AgentTier::T1,
         "describe_action" | "submit_action" | "funnel_ingest" | "create_link" => AgentTier::T2,
-        "list_inbox" | "confirm_action" | "override_action" => AgentTier::T3,
+        "list_inbox" | "confirm_action" | "override_action" | "compensate_action" => AgentTier::T3,
         _ => AgentTier::T4,
     }
 }
@@ -256,6 +256,8 @@ mod tests {
         assert!(!AgentTier::T2.allows_syscall("override_action"));
         assert!(AgentTier::T3.allows_syscall("confirm_action"));
         assert!(AgentTier::T3.allows_syscall("override_action"));
+        assert!(AgentTier::T3.allows_syscall("compensate_action"));
+        assert!(!AgentTier::T2.allows_syscall("compensate_action"));
         assert!(!AgentTier::T3.allows_syscall("auto_action"));
         assert!(require_syscall(AgentTier::T1, "confirm_action").is_err());
         assert!(require_syscall(AgentTier::T2, "override_action").is_err());

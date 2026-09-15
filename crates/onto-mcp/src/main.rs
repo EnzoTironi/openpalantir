@@ -2,16 +2,23 @@
 #![allow(clippy::missing_panics_doc)] // process entry: bind/open failures abort
 
 use axum::{extract::State, routing::post, Json, Router};
-use onto::{dispatch, Actor, AgentTier, Engine, KeyKind, Session};
+use onto::{dispatch, Actor, AgentTier, Engine, Session};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostRole {
+    Builder,
+    Consumer,
+    Reviewer,
+}
+
 #[derive(Clone)]
 struct App {
     engine: Arc<Engine>,
-    key: KeyKind,
+    role: HostRole,
 }
 
 #[derive(Deserialize)]
@@ -33,24 +40,41 @@ struct RpcResponse {
     error: Option<Value>,
 }
 
-fn session_from_key(key: KeyKind, _params: &Value) -> Session {
-    match key {
-        KeyKind::Builder => Session::new(
+/// Host-resolved principal. Request metadata never chooses roles or tier.
+fn session_from_role(role: HostRole) -> Session {
+    match role {
+        HostRole::Builder => Session::new(
             Actor::builder("mcp.builder", &["modeler", "reviewer"]),
             "mcp",
         ),
-        KeyKind::Consumer => Session::new(
+        HostRole::Consumer => Session::new(
             Actor::consumer("mcp.consumer", &["operator"], AgentTier::T2),
+            "mcp",
+        ),
+        HostRole::Reviewer => Session::new(
+            Actor::consumer("mcp.reviewer", &["supervisor", "operator"], AgentTier::T3),
             "mcp",
         ),
     }
 }
 
-fn handle(engine: &Engine, key: KeyKind, req: RpcRequest) -> RpcResponse {
+fn is_notification(req: &RpcRequest) -> bool {
+    req.method.as_deref().is_some_and(|m| {
+        m.starts_with("notifications/") || (m == "initialized" && req.id.is_none())
+    })
+}
+
+fn handle(engine: &Engine, role: HostRole, req: RpcRequest) -> Option<RpcResponse> {
+    if is_notification(&req) {
+        return None;
+    }
+    if req.jsonrpc.as_deref().is_some_and(|v| v != "2.0") {
+        return Some(rpc_err(req.id, "jsonrpc must be 2.0"));
+    }
     let id = req.id;
     let method = req.method.unwrap_or_default();
     let params = req.params.unwrap_or(json!({}));
-    match method.as_str() {
+    Some(match method.as_str() {
         "initialize" => RpcResponse {
             jsonrpc: "2.0",
             id,
@@ -58,23 +82,18 @@ fn handle(engine: &Engine, key: KeyKind, req: RpcRequest) -> RpcResponse {
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": {} },
                 "serverInfo": {
-                    "name": match key {
-                        KeyKind::Builder => "onto-builder",
-                        KeyKind::Consumer => "onto-consumer",
+                    "name": match role {
+                        HostRole::Builder => "onto-builder",
+                        HostRole::Consumer => "onto-consumer",
+                        HostRole::Reviewer => "onto-reviewer",
                     },
                     "version": onto::ENGINE_VERSION
                 }
             })),
             error: None,
         },
-        "notifications/initialized" | "initialized" => RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(json!({})),
-            error: None,
-        },
         "tools/list" => {
-            let session = session_from_key(key, &params);
+            let session = session_from_role(role);
             match engine.list_tools(&session) {
                 Ok(tools) => {
                     let listed: Vec<Value> = tools
@@ -98,7 +117,7 @@ fn handle(engine: &Engine, key: KeyKind, req: RpcRequest) -> RpcResponse {
             }
         }
         "tools/call" => {
-            let session = session_from_key(key, &params);
+            let session = session_from_role(role);
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
             match dispatch(engine, &session, name, arguments) {
@@ -123,7 +142,7 @@ fn handle(engine: &Engine, key: KeyKind, req: RpcRequest) -> RpcResponse {
             }
         }
         other => rpc_err(id, &format!("unknown method {other}")),
-    }
+    })
 }
 
 fn rpc_err(id: Option<Value>, msg: &str) -> RpcResponse {
@@ -135,25 +154,30 @@ fn rpc_err(id: Option<Value>, msg: &str) -> RpcResponse {
     }
 }
 
-async fn http_rpc(State(app): State<App>, Json(req): Json<RpcRequest>) -> Json<RpcResponse> {
-    Json(handle(&app.engine, app.key, req))
+async fn http_rpc(
+    State(app): State<App>,
+    Json(req): Json<RpcRequest>,
+) -> Json<Option<RpcResponse>> {
+    Json(handle(&app.engine, app.role, req))
 }
 
-fn parse_key() -> KeyKind {
-    let mut key = KeyKind::Consumer;
+fn parse_role() -> HostRole {
+    let mut role = HostRole::Consumer;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--key" {
-            if args.get(i + 1).map(String::as_str) == Some("builder") {
-                key = KeyKind::Builder;
-            }
+            role = match args.get(i + 1).map(String::as_str) {
+                Some("builder") => HostRole::Builder,
+                Some("reviewer") => HostRole::Reviewer,
+                _ => HostRole::Consumer,
+            };
             i += 2;
         } else {
             i += 1;
         }
     }
-    key
+    role
 }
 
 fn wants_http() -> bool {
@@ -171,30 +195,35 @@ fn bootstrap() -> bool {
     std::env::args().any(|a| a == "--bootstrap")
 }
 
+fn role_label(role: HostRole) -> &'static str {
+    match role {
+        HostRole::Builder => "builder",
+        HostRole::Consumer => "consumer",
+        HostRole::Reviewer => "reviewer",
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let key = parse_key();
+    let role = parse_role();
     let engine = match db_path() {
         Some(path) => Engine::open(&path).expect("open db"),
         None => Engine::memory().expect("memory"),
     };
-    if bootstrap() && key == KeyKind::Consumer {
+    if bootstrap() && role == HostRole::Consumer {
         onto_bootstrap::install(&engine).expect("bootstrap");
     }
     let engine = Arc::new(engine);
     if wants_http() {
         let app = Router::new()
             .route("/mcp", post(http_rpc))
-            .with_state(App { engine, key });
+            .with_state(App { engine, role });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:43177")
             .await
             .expect("bind 43177");
         eprintln!(
             "onto-mcp {} on http://127.0.0.1:43177/mcp",
-            match key {
-                KeyKind::Builder => "builder",
-                KeyKind::Consumer => "consumer",
-            }
+            role_label(role)
         );
         axum::serve(listener, app).await.expect("serve");
     } else {
@@ -215,12 +244,36 @@ async fn main() {
                     continue;
                 }
             };
-            if req.jsonrpc.as_deref() != Some("2.0") && req.method.is_none() {
-                continue;
+            if let Some(resp) = handle(&engine, role, req) {
+                writeln!(stdout, "{}", serde_json::to_string(&resp).unwrap()).ok();
+                stdout.flush().ok();
             }
-            let resp = handle(&engine, key, req);
-            writeln!(stdout, "{}", serde_json::to_string(&resp).unwrap()).ok();
-            stdout.flush().ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onto::KeyKind;
+
+    #[test]
+    fn does_omit_response_if_notification() {
+        let engine = Engine::memory().unwrap();
+        let req = RpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: None,
+            method: Some("notifications/initialized".into()),
+            params: None,
+        };
+        assert!(handle(&engine, HostRole::Consumer, req).is_none());
+    }
+
+    #[test]
+    fn does_bind_reviewer_to_t3_host_principal() {
+        let session = session_from_role(HostRole::Reviewer);
+        assert_eq!(session.actor.key, KeyKind::Consumer);
+        assert_eq!(session.actor.tier, AgentTier::T3);
+        assert!(session.actor.has_role("supervisor"));
     }
 }

@@ -5,6 +5,7 @@
 //! `write_path`, OSS, or functions. No public method here takes a rusqlite type.
 
 use crate::bitemporal::{self, AsOf, LoadedVersion, VersionSpan};
+use crate::command::{DecisionApply, IdempotencyRow};
 use crate::decision::EffectStatus;
 use crate::error::{OntoError, Result};
 use crate::oss::OBJECT_SETS_TABLE;
@@ -135,7 +136,8 @@ const OMS_SCHEMA: &str = r"
                 decision_record_id TEXT NOT NULL,
                 action_name TEXT NOT NULL,
                 outcome TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                payload_digest TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS audit_log (
                 id TEXT PRIMARY KEY,
@@ -212,9 +214,9 @@ pub trait Store: Send + Sync {
         outcome: &str,
         at: i64,
     ) -> Result<()>;
-    fn get_idempotency(&self, key: &str) -> Result<Option<String>>;
+    fn get_idempotency(&self, key: &str) -> Result<Option<IdempotencyRow>>;
     fn commit_staged(&self, ops: &[StagedOp], at: i64) -> Result<Vec<String>>;
-    fn commit_decision(&self, unit: &DecisionCommit<'_>) -> Result<Vec<String>>;
+    fn commit_decision(&self, unit: &DecisionCommit<'_>) -> Result<DecisionApply>;
     fn append_version_recorded(
         &self,
         id: &str,
@@ -252,6 +254,9 @@ pub struct DecisionCommit<'a> {
     pub decision: DecisionWrite<'a>,
     pub idempotency_key: Option<&'a str>,
     pub idempotency_outcome: Option<&'a str>,
+    pub payload_digest: Option<&'a str>,
+    pub read_set: &'a [(String, String)],
+    pub schema_revision: Option<&'a str>,
     pub audit_id: Option<&'a str>,
     pub audit_actor: Option<&'a str>,
     pub audit_kind: Option<&'a str>,
@@ -427,21 +432,90 @@ fn apply_staged(tx: &Transaction<'_>, ops: &[StagedOp], at: i64) -> Result<Vec<S
                 from_id,
                 to_id,
             } => {
-                if let Some(to) = to_id {
-                    tx.execute(
-                        "DELETE FROM links WHERE type_name = ?1 AND from_id = ?2 AND to_id = ?3",
-                        params![type_name, from_id, to],
-                    )?;
-                } else {
-                    tx.execute(
-                        "DELETE FROM links WHERE type_name = ?1 AND from_id = ?2",
-                        params![type_name, from_id],
-                    )?;
+                let n = tx.execute(
+                    "DELETE FROM links WHERE type_name = ?1 AND from_id = ?2 AND to_id = ?3",
+                    params![type_name, from_id, to_id],
+                )?;
+                if n == 0 {
+                    return Err(OntoError::NotFound(format!(
+                        "link {type_name} {from_id}->{to_id}"
+                    )));
                 }
             }
         }
     }
     Ok(created)
+}
+
+fn check_read_set(tx: &Transaction<'_>, read_set: &[(String, String)]) -> Result<()> {
+    for (id, expected) in read_set {
+        if expected.is_empty() {
+            continue;
+        }
+        let current = match bitemporal::load(tx, id, AsOf::Current) {
+            Ok(v) => v.version_id,
+            Err(OntoError::NotFound(_)) => {
+                return Err(OntoError::StaleRead);
+            }
+            Err(e) => return Err(e),
+        };
+        if current != *expected {
+            return Err(OntoError::StaleRead);
+        }
+    }
+    Ok(())
+}
+
+fn unique_violation(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
+
+fn load_idempotency_row(tx: &Transaction<'_>, key: &str) -> Result<Option<IdempotencyRow>> {
+    Ok(tx
+        .query_row(
+            "SELECT outcome, COALESCE(payload_digest, '') FROM side_effect_keys WHERE idempotency_key = ?1",
+            params![key],
+            |r| {
+                Ok(IdempotencyRow {
+                    outcome: r.get(0)?,
+                    payload_digest: r.get(1)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn reserve_idempotency(
+    tx: &Transaction<'_>,
+    key: &str,
+    rec_id: &str,
+    action: &str,
+    outcome: &str,
+    digest: &str,
+    at: i64,
+) -> Result<Option<String>> {
+    match tx.execute(
+        "INSERT INTO side_effect_keys(idempotency_key, decision_record_id, action_name, outcome, created_at, payload_digest)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![key, rec_id, action, outcome, at, digest],
+    ) {
+        Ok(_) => Ok(None),
+        Err(e) if unique_violation(&e) => {
+            let row = load_idempotency_row(tx, key)?
+                .ok_or_else(|| OntoError::Conflict(format!("idempotency {key} collided")))?;
+            if row.payload_digest != digest {
+                return Err(OntoError::Conflict(
+                    "idempotency key is bound to a different payload".into(),
+                ));
+            }
+            Ok(Some(row.outcome))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn insert_decision_on(tx: &Transaction<'_>, rec: &DecisionWrite<'_>) -> Result<()> {
@@ -489,6 +563,10 @@ impl Store for SqliteStore {
         );
         let _ = db.execute(
             "ALTER TABLE inbox ADD COLUMN apply_action TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = db.execute(
+            "ALTER TABLE side_effect_keys ADD COLUMN payload_digest TEXT NOT NULL DEFAULT ''",
             [],
         );
         db.execute(
@@ -862,20 +940,25 @@ impl Store for SqliteStore {
         at: i64,
     ) -> Result<()> {
         self.conn()?.execute(
-            "INSERT OR IGNORE INTO side_effect_keys(idempotency_key, decision_record_id, action_name, outcome, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR IGNORE INTO side_effect_keys(idempotency_key, decision_record_id, action_name, outcome, created_at, payload_digest)
+             VALUES (?1, ?2, ?3, ?4, ?5, '')",
             params![key, rec_id, action, outcome, at],
         )?;
         Ok(())
     }
 
-    fn get_idempotency(&self, key: &str) -> Result<Option<String>> {
+    fn get_idempotency(&self, key: &str) -> Result<Option<IdempotencyRow>> {
         Ok(self
             .conn()?
             .query_row(
-                "SELECT outcome FROM side_effect_keys WHERE idempotency_key = ?1",
+                "SELECT outcome, COALESCE(payload_digest, '') FROM side_effect_keys WHERE idempotency_key = ?1",
                 params![key],
-                |r| r.get(0),
+                |r| {
+                    Ok(IdempotencyRow {
+                        outcome: r.get(0)?,
+                        payload_digest: r.get(1)?,
+                    })
+                },
             )
             .optional()?)
     }
@@ -888,18 +971,31 @@ impl Store for SqliteStore {
         Ok(created)
     }
 
-    fn commit_decision(&self, unit: &DecisionCommit<'_>) -> Result<Vec<String>> {
+    fn commit_decision(&self, unit: &DecisionCommit<'_>) -> Result<DecisionApply> {
         let mut db = self.conn()?;
         let tx = db.transaction()?;
+        if let Some(expected) = unit.schema_revision {
+            let current = schema_revision_on(&tx, MAIN_BRANCH)?;
+            if current != expected {
+                return Err(OntoError::StaleRead);
+            }
+        }
+        check_read_set(&tx, unit.read_set)?;
+        if let (Some(key), Some(outcome)) = (unit.idempotency_key, unit.idempotency_outcome) {
+            if let Some(replay) = reserve_idempotency(
+                &tx,
+                key,
+                unit.decision.id,
+                unit.decision.action,
+                outcome,
+                unit.payload_digest.unwrap_or(""),
+                unit.decision.at,
+            )? {
+                return Ok(DecisionApply::Replayed(replay));
+            }
+        }
         let created = apply_staged(&tx, unit.ops, unit.decision.at)?;
         insert_decision_on(&tx, &unit.decision)?;
-        if let (Some(key), Some(outcome)) = (unit.idempotency_key, unit.idempotency_outcome) {
-            tx.execute(
-                "INSERT OR IGNORE INTO side_effect_keys(idempotency_key, decision_record_id, action_name, outcome, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![key, unit.decision.id, unit.decision.action, outcome, unit.decision.at],
-            )?;
-        }
         if let Some(declaration) = unit.effect_declaration {
             tx.execute(
                 "INSERT INTO effect_intentions(decision_record_id, declaration, status, created_at)
@@ -924,7 +1020,7 @@ impl Store for SqliteStore {
             )?;
         }
         tx.commit()?;
-        Ok(created)
+        Ok(DecisionApply::Written(created))
     }
 
     fn append_version_recorded(
@@ -935,8 +1031,12 @@ impl Store for SqliteStore {
         valid_at: i64,
         tx_at: i64,
     ) -> Result<String> {
-        let db = self.conn()?;
-        bitemporal::append_version_recorded(&db, id, properties, title, valid_at, tx_at)
+        let mut db = self.conn()?;
+        let tx = db.transaction()?;
+        let version =
+            bitemporal::append_version_recorded(&tx, id, properties, title, valid_at, tx_at)?;
+        tx.commit()?;
+        Ok(version)
     }
 
     fn insert_object_recorded(
@@ -948,8 +1048,11 @@ impl Store for SqliteStore {
         valid_at: i64,
         tx_at: i64,
     ) -> Result<()> {
-        let db = self.conn()?;
-        bitemporal::insert_object_recorded(&db, id, type_name, title, properties, valid_at, tx_at)
+        let mut db = self.conn()?;
+        let tx = db.transaction()?;
+        bitemporal::insert_object_recorded(&tx, id, type_name, title, properties, valid_at, tx_at)?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn object_type_of(&self, id: &str) -> Result<String> {

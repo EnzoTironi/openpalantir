@@ -149,11 +149,18 @@ fn r03_explicit_instance_write_deny_is_enforced_by_actions() {
     )
     .unwrap();
     merge(&e, &b).unwrap();
-    assert!(blocked(e.submit_action(
-        &boss(),
-        "approve_setpoint_change",
-        setpoint(&ids)
-    )));
+    let proposed = e
+        .submit_action(&ops(), "propose_setpoint_change", setpoint(&ids))
+        .unwrap();
+    assert_eq!(
+        proposed.verdict,
+        Verdict::Allow,
+        "proposal must be created so confirm exercises write policy"
+    );
+    assert!(
+        blocked(e.confirm_action(&boss(), proposed.inbox_id.as_deref().unwrap())),
+        "A pending proposal must not bypass an instance write deny"
+    );
 }
 
 #[test]
@@ -272,16 +279,19 @@ fn r07_stale_branch_merge_cannot_silently_delete_other_release() {
 #[test]
 fn r08_link_endpoints_must_exist() {
     let e = Engine::memory().unwrap();
-    onto_bootstrap::install(&e).unwrap();
-    assert!(blocked(e.submit_action(
-        &ops(),
-        "assert_link",
-        json!({
-            "link_type": "not_declared",
-            "from": "missing-from",
-            "to": "missing-to"
-        })
-    )));
+    let ids = onto_bootstrap::install(&e).unwrap();
+    assert!(
+        blocked(e.submit_action(
+            &ops(),
+            "assert_link",
+            json!({
+                "link_type": "monitors",
+                "from": ids.sensor1,
+                "to": "missing-tank"
+            })
+        )),
+        "declared monitors with one missing endpoint must fail"
+    );
 }
 
 #[test]
@@ -307,28 +317,59 @@ fn r08_string_parameter_must_reject_number() {
 fn r09_late_record_has_distinct_recorded_time() {
     let e = Engine::memory().unwrap();
     let ids = onto_bootstrap::install(&e).unwrap();
-    let observed = e.now();
-    e.set_clock(observed + 100);
+    let t = e.now();
     e.funnel_ingest(
         &ops(),
         vec![IngestRecord {
             type_name: "DO_Sensor".into(),
             id: Some(ids.sensor1.clone()),
-            properties: [("last_reading_at".into(), json!(observed))]
+            properties: [("last_reading_at".into(), json!(999))]
                 .into_iter()
                 .collect(),
-            as_of: Some(observed.to_string()),
-            provenance: Some("late-source".into()),
+            as_of: Some((t + 100).to_string()),
+            provenance: Some("newer-effective".into()),
         }],
     )
     .unwrap();
-    let spans = e.object_spans(&ids.sensor1).unwrap();
-    let newest = spans.iter().find(|s| s.tx_to.is_none()).unwrap();
+    e.set_clock(t + 200);
+    e.funnel_ingest(
+        &ops(),
+        vec![IngestRecord {
+            type_name: "DO_Sensor".into(),
+            id: Some(ids.sensor1.clone()),
+            properties: [("last_reading_at".into(), json!(111))]
+                .into_iter()
+                .collect(),
+            as_of: Some((t + 20).to_string()),
+            provenance: Some("older-effective".into()),
+        }],
+    )
+    .unwrap();
+    let current = e.get_object(&ops(), &ids.sensor1, AsOf::Current).unwrap();
     assert_eq!(
-        newest.tx_from,
-        e.now(),
-        "recorded time is not observation time"
+        current.properties["last_reading_at"].value,
+        json!(999),
+        "older effective event must not replace the current version"
     );
+    let historical = e
+        .get_object(&ops(), &ids.sensor1, AsOf::Valid(t + 30))
+        .unwrap();
+    assert_eq!(
+        historical.properties["last_reading_at"].value,
+        json!(111),
+        "valid-time axis must reconstruct the late older interval"
+    );
+    let spans = e.object_spans(&ids.sensor1).unwrap();
+    let historical_span = spans
+        .iter()
+        .find(|s| s.valid_from == t + 20 && s.tx_from == t + 200)
+        .expect("late older interval");
+    assert_eq!(historical_span.valid_to, Some(t + 100));
+    let current_span = spans
+        .iter()
+        .find(|s| s.valid_to.is_none() && s.tx_to.is_none())
+        .expect("open current");
+    assert_eq!(current_span.valid_from, t + 100);
 }
 
 #[test]
@@ -399,6 +440,32 @@ fn r12_compensation_must_close_the_active_occupies_relation() {
     let confirmed = e
         .confirm_action(&boss(), proposed.inbox_id.as_deref().unwrap())
         .unwrap();
+    e.funnel_ingest(
+        &ops(),
+        vec![IngestRecord {
+            type_name: "Seat".into(),
+            id: Some("seat-other".into()),
+            properties: [
+                ("name".into(), json!("Assento 2")),
+                ("slots".into(), json!(1)),
+            ]
+            .into_iter()
+            .collect(),
+            as_of: None,
+            provenance: None,
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        e.submit_action(
+            &ops(),
+            "assert_link",
+            json!({ "link_type": "occupies", "from": ids.ana, "to": "seat-other" })
+        )
+        .unwrap()
+        .verdict,
+        Verdict::Allow
+    );
     let compensated = e
         .compensate_action(
             &boss(),
@@ -407,12 +474,9 @@ fn r12_compensation_must_close_the_active_occupies_relation() {
         )
         .unwrap();
     assert_eq!(compensated.verdict, Verdict::Allow);
-    assert!(
-        e.traverse_links(&ops(), &ids.ana, "occupies")
-            .unwrap()
-            .is_empty(),
-        "Released seat must not remain an active occupies relationship"
-    );
+    let left = e.traverse_links(&ops(), &ids.ana, "occupies").unwrap();
+    assert_eq!(left.len(), 1, "unrelated occupancy must survive");
+    assert_eq!(left[0].id, "seat-other");
 }
 
 #[test]

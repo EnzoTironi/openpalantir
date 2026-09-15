@@ -280,6 +280,9 @@ pub struct ObjectView {
     pub properties: BTreeMap<String, PropertyView>,
     pub missing: Vec<String>,
     pub stale: Vec<String>,
+    /// Open version id at the moment of the read. Empty on synthetic views.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +336,9 @@ pub struct SnapshotObject {
     pub id: String,
     pub type_name: String,
     pub properties: BTreeMap<String, Value>,
+    /// Open version id used for compare-and-swap at commit.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version_id: String,
     /// Valid-time stamps per property (R13). Empty when the read had none.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub as_of: BTreeMap<String, String>,
@@ -357,6 +363,7 @@ pub fn snapshot_from_view(view: &ObjectView) -> SnapshotObject {
     SnapshotObject {
         id: view.id.clone(),
         type_name: view.type_name.clone(),
+        version_id: view.version_id.clone(),
         properties: view
             .properties
             .iter()

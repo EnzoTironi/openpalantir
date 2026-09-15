@@ -671,7 +671,10 @@ fn does_not_double_apply_if_idempotency_key_repeats() {
         .unwrap();
     assert_eq!(
         rec.effects["idempotency_key"],
-        "approve_setpoint_change:ops.chen:setpoint:tank-1:2.6"
+        format!(
+            "approve_setpoint_change:ops.chen:{}:setpoint:tank-1:2.6",
+            first.inbox_id.as_deref().unwrap()
+        )
     );
     assert_eq!(rec.proof_trace, WritePathStep::ALL.to_vec());
 }

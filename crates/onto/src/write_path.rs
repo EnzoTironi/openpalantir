@@ -54,7 +54,7 @@ pub enum StagedOp {
     CloseLink {
         type_name: String,
         from_id: String,
-        to_id: Option<String>,
+        to_id: String,
     },
 }
 
@@ -232,13 +232,13 @@ pub fn pin_version(label: &str, body: &str) -> String {
     format!("{label}:{h:016x}")
 }
 
-pub fn resolve_idempotency_key(action: &str, actor: &str, params: &Value) -> String {
-    if let Some(k) = params.get("idempotency_key").and_then(|v| v.as_str()) {
-        if !k.is_empty() {
-            return format!("{action}:{actor}:{k}");
-        }
-    }
-    pin_version(&format!("{action}:{actor}"), &params.to_string())
+pub fn resolve_idempotency_key(
+    action: &str,
+    actor: &str,
+    params: &Value,
+    inbox: Option<&str>,
+) -> String {
+    crate::command::idempotency_key(action, actor, params, inbox)
 }
 
 fn dedupe_reads(reads: &[SnapshotObject]) -> Vec<SnapshotObject> {
@@ -351,6 +351,7 @@ mod tests {
         let tank = SnapshotObject {
             id: "tank-1".into(),
             type_name: "AerationTank".into(),
+            version_id: "v1".into(),
             properties: BTreeMap::new(),
             as_of: BTreeMap::new(),
             provenance: BTreeMap::new(),
@@ -358,6 +359,7 @@ mod tests {
         let later = SnapshotObject {
             id: "tank-1".into(),
             type_name: "AerationTank".into(),
+            version_id: "v1".into(),
             properties: BTreeMap::new(),
             as_of: BTreeMap::new(),
             provenance: BTreeMap::new(),
@@ -365,6 +367,7 @@ mod tests {
         let sensor = SnapshotObject {
             id: "sensor-1".into(),
             type_name: "DO_Sensor".into(),
+            version_id: "v2".into(),
             properties: BTreeMap::new(),
             as_of: BTreeMap::new(),
             provenance: BTreeMap::new(),
@@ -384,18 +387,33 @@ mod tests {
             "approve_setpoint_change",
             "ops.chen",
             &json!({ "idempotency_key": "setpoint:tank-1:once", "target_do": 2.5 }),
+            None,
         );
-        assert_eq!(key, "approve_setpoint_change:ops.chen:setpoint:tank-1:once");
+        assert_eq!(
+            key,
+            "approve_setpoint_change:ops.chen:submit:setpoint:tank-1:once"
+        );
     }
 
     #[test]
     fn does_derive_idempotency_key_if_absent() {
-        let a = resolve_idempotency_key("approve_setpoint_change", "ops.chen", &json!({ "n": 1 }));
-        let b = resolve_idempotency_key("approve_setpoint_change", "ops.chen", &json!({ "n": 2 }));
+        let a = resolve_idempotency_key(
+            "approve_setpoint_change",
+            "ops.chen",
+            &json!({ "n": 1 }),
+            None,
+        );
+        let b = resolve_idempotency_key(
+            "approve_setpoint_change",
+            "ops.chen",
+            &json!({ "n": 2 }),
+            None,
+        );
         let empty = resolve_idempotency_key(
             "approve_setpoint_change",
             "ops.chen",
             &json!({ "idempotency_key": "" }),
+            None,
         );
         assert_ne!(a, b);
         assert!(!a.is_empty());

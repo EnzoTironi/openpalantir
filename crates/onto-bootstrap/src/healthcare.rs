@@ -255,6 +255,7 @@ pub fn define_healthcare(engine: &Engine, s: &Session, branch: &str) -> Result<(
             guards: json!([
                 { "freshness": "observation", "max_age_secs": 300 },
                 { "exists_field": "last_reading_at", "object": "observation" },
+                { "gt_field": 0, "object": "observation", "field": "coded_clearance" },
                 { "lte_field": "need_clearance", "object": "observation", "field": "coded_clearance" }
             ]),
             required_roles: vec!["operator".into()],
@@ -273,11 +274,12 @@ pub fn define_healthcare(engine: &Engine, s: &Session, branch: &str) -> Result<(
         branch,
         ActionTypeSpec {
             name: "approve_order".into(),
-            mode: ExecutionMode::Auto,
+            mode: ExecutionMode::Approve,
             parameters: order_params,
             guards: json!([
                 { "freshness": "observation", "max_age_secs": 300 },
                 { "exists_field": "last_reading_at", "object": "observation" },
+                { "gt_field": 0, "object": "observation", "field": "coded_clearance" },
                 { "lte_field": "need_clearance", "object": "observation", "field": "coded_clearance" }
             ]),
             required_roles: vec!["supervisor".into()],

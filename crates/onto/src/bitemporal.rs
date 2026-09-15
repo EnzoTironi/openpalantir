@@ -29,11 +29,13 @@ CREATE INDEX IF NOT EXISTS object_versions_by_object
 ON object_versions(object_id, valid_from);
 ";
 
-/// Valid-time clock for a read. `Current` is the open version.
+/// Valid-time or recorded-time clock for a read. `Current` is the open version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AsOf {
     Current,
     Valid(i64),
+    /// Reconstruct what was known at recorded time `t`.
+    Recorded(i64),
 }
 
 /// Valid time and transaction time of one version. `None` on `*_to` is open.
@@ -166,6 +168,15 @@ pub fn append_version_recorded(
             let span = VersionSpan::recorded(valid_at, tx_at);
             insert_open_version(conn, object_id, title, properties, span)
         }
+        Some(open) if valid_at < open.span.valid_from => insert_historical(
+            conn,
+            object_id,
+            properties,
+            title.or(open.title.as_deref()),
+            valid_at,
+            open.span.valid_from,
+            tx_at,
+        ),
         Some(open) => {
             let (closed, next) = open.span.close_and_succeed_at(valid_at, tx_at)?;
             conn.execute(
@@ -206,6 +217,7 @@ pub fn load(conn: &Connection, id: &str, as_of: AsOf) -> Result<LoadedVersion> {
     match as_of {
         AsOf::Current => load_current(conn, id),
         AsOf::Valid(t) => load_at_valid(conn, id, t),
+        AsOf::Recorded(t) => load_at_recorded(conn, id, t),
     }
 }
 
@@ -271,6 +283,40 @@ fn load_open_row(conn: &Connection, object_id: &str) -> Result<Option<OpenRow>> 
         .optional()?)
 }
 
+/// Closed valid interval that does not disturb the current open version.
+fn insert_historical(
+    conn: &Connection,
+    object_id: &str,
+    properties: &str,
+    title: Option<&str>,
+    valid_from: i64,
+    valid_to: i64,
+    tx_at: i64,
+) -> Result<String> {
+    if valid_to <= valid_from {
+        return Err(OntoError::Invalid(
+            "historical interval must be half-open and non-empty".into(),
+        ));
+    }
+    let version_id = new_id();
+    conn.execute(
+        "INSERT INTO object_versions(
+            version_id, object_id, title, properties, valid_from, valid_to, tx_from, tx_to
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            version_id,
+            object_id,
+            title,
+            properties,
+            valid_from,
+            valid_to,
+            tx_at,
+            Option::<i64>::None,
+        ],
+    )?;
+    Ok(version_id)
+}
+
 fn insert_open_version(
     conn: &Connection,
     object_id: &str,
@@ -314,6 +360,24 @@ fn load_current(conn: &Connection, id: &str) -> Result<LoadedVersion> {
     )
     .optional()?
     .ok_or_else(|| OntoError::NotFound(format!("object {id}")))
+}
+
+fn load_at_recorded(conn: &Connection, id: &str, t: i64) -> Result<LoadedVersion> {
+    conn.query_row(
+        "SELECT v.version_id, o.id, o.type_name, v.title, v.properties,
+                v.valid_from, v.valid_to, v.tx_from, v.tx_to
+         FROM objects o
+         JOIN object_versions v ON v.object_id = o.id
+         WHERE o.id = ?1
+           AND v.tx_from <= ?2
+           AND (v.tx_to IS NULL OR v.tx_to > ?2)
+         ORDER BY v.valid_from DESC, v.tx_from DESC
+         LIMIT 1",
+        params![id, t],
+        row_to_loaded,
+    )
+    .optional()?
+    .ok_or_else(|| OntoError::NotFound(format!("object {id} has no version recorded as of {t}")))
 }
 
 fn load_at_valid(conn: &Connection, id: &str, t: i64) -> Result<LoadedVersion> {
@@ -412,6 +476,20 @@ mod tests {
         assert_eq!(old.properties, "{}");
         let miss = load(&conn, "tank-1", AsOf::Valid(9));
         assert!(matches!(miss, Err(OntoError::NotFound(_))));
+    }
+
+    #[test]
+    fn does_keep_current_if_older_effective_arrives_late() {
+        let conn = mem();
+        insert_object(&conn, "tank-1", "AerationTank", None, "{\"n\":2}", 200).unwrap();
+        append_version_recorded(&conn, "tank-1", "{\"n\":1}", None, 150, 300).unwrap();
+        let current = load(&conn, "tank-1", AsOf::Current).unwrap();
+        assert_eq!(current.properties, "{\"n\":2}");
+        assert_eq!(current.span.valid_from, 200);
+        let old = load(&conn, "tank-1", AsOf::Valid(150)).unwrap();
+        assert_eq!(old.properties, "{\"n\":1}");
+        let known = load(&conn, "tank-1", AsOf::Recorded(300)).unwrap();
+        assert!(known.span.tx_from <= 300);
     }
 
     #[test]

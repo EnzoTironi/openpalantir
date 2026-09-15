@@ -185,6 +185,7 @@ mod tests {
             properties,
             missing: vec![],
             stale: vec![],
+            version_id: String::new(),
         }
     }
 

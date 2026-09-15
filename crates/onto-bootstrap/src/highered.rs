@@ -277,7 +277,8 @@ pub fn define_highered(engine: &Engine, s: &Session, branch: &str) -> Result<()>
                 },
                 {
                     "close_link": "occupies",
-                    "from": "student"
+                    "from": "student",
+                    "to": "seat"
                 }
             ]),
             compensation: None,
