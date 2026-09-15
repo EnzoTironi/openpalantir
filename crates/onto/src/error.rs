@@ -1,0 +1,31 @@
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum OntoError {
+    #[error("{0}")]
+    Denied(String),
+    #[error("{0}")]
+    Review(String),
+    #[error("{0}")]
+    NotFound(String),
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("store: {0}")]
+    Store(String),
+}
+
+impl From<rusqlite::Error> for OntoError {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Store(value.to_string())
+    }
+}
+
+impl From<serde_json::Error> for OntoError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Invalid(value.to_string())
+    }
+}
+
+pub type Result<T> = std::result::Result<T, OntoError>;

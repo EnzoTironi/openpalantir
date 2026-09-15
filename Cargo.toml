@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/onto",
+    "crates/onto-sdk",
+    "crates/onto-mcp",
+    "crates/onto-bootstrap",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Agent-first operational ontology OS (live OMS)"
+
+[workspace.dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "=1.11.1", features = ["v4", "serde"] }
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "signal"] }

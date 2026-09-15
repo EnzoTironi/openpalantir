@@ -1,0 +1,306 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+pub const ENGINE_VERSION: &str = "0.1.0";
+pub const MAIN_BRANCH: &str = "main";
+
+pub const KERNEL_TYPES: &[&str] = &[
+    "ObjectType",
+    "PropertyType",
+    "ValueType",
+    "LinkType",
+    "InterfaceType",
+    "ActionType",
+    "Policy",
+    "OntologyBranch",
+    "OntologyProposal",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyKind {
+    Consumer,
+    Builder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Typology {
+    Entity,
+    Event,
+    State,
+    DecisionRecord,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PropertySource {
+    Mapped,
+    Derived,
+    ActionWritten,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Allow,
+    Review,
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    Auto,
+    Propose,
+    Approve,
+    Shadow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchStatus {
+    Open,
+    Proposed,
+    Merged,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Actor {
+    pub id: String,
+    pub key: KeyKind,
+    pub roles: Vec<String>,
+    pub tier: u8,
+}
+
+impl Actor {
+    pub fn builder(id: impl Into<String>, roles: &[&str]) -> Self {
+        Self {
+            id: id.into(),
+            key: KeyKind::Builder,
+            roles: roles.iter().map(|s| (*s).to_string()).collect(),
+            tier: 1,
+        }
+    }
+
+    pub fn consumer(id: impl Into<String>, roles: &[&str], tier: u8) -> Self {
+        Self {
+            id: id.into(),
+            key: KeyKind::Consumer,
+            roles: roles.iter().map(|s| (*s).to_string()).collect(),
+            tier,
+        }
+    }
+
+    pub fn has_role(&self, role: &str) -> bool {
+        self.roles.iter().any(|r| r == role)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Session {
+    pub actor: Actor,
+    pub purpose: String,
+}
+
+impl Session {
+    pub fn new(actor: Actor, purpose: impl Into<String>) -> Self {
+        Self {
+            actor,
+            purpose: purpose.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValueTypeSpec {
+    pub name: String,
+    pub base: String,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub unit: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PropertySpec {
+    pub name: String,
+    pub value_type: String,
+    pub source: PropertySource,
+    pub nullable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectTypeSpec {
+    pub name: String,
+    pub typology: Typology,
+    pub title_prop: Option<String>,
+    pub interfaces: Vec<String>,
+    pub freshness_budget_secs: Option<i64>,
+    pub properties: Vec<PropertySpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkTypeSpec {
+    pub name: String,
+    pub from_type: String,
+    pub to_type: String,
+    pub cardinality: String,
+    pub allow_cycles: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfaceSpec {
+    pub name: String,
+    pub required_properties: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParamSpec {
+    pub name: String,
+    pub value_type: String,
+    pub object_type: Option<String>,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionTypeSpec {
+    pub name: String,
+    pub mode: ExecutionMode,
+    pub parameters: Vec<ParamSpec>,
+    pub guards: Value,
+    pub required_roles: Vec<String>,
+    pub required_tier: u8,
+    pub effects: Value,
+    pub compensation: Option<String>,
+    pub side_effects: Value,
+    pub on_review: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaSnapshot {
+    pub branch: String,
+    pub value_types: Vec<ValueTypeSpec>,
+    pub object_types: Vec<ObjectTypeSpec>,
+    pub link_types: Vec<LinkTypeSpec>,
+    pub interfaces: Vec<InterfaceSpec>,
+    pub action_types: Vec<ActionTypeSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PropertyView {
+    pub value: Value,
+    pub source: PropertySource,
+    pub as_of: Option<String>,
+    pub provenance: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectView {
+    pub id: String,
+    pub type_name: String,
+    pub title: Option<String>,
+    pub properties: BTreeMap<String, PropertyView>,
+    pub missing: Vec<String>,
+    pub stale: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkView {
+    pub id: String,
+    pub type_name: String,
+    pub from_id: String,
+    pub to_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardResult {
+    pub name: String,
+    pub verdict: Verdict,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionOutcome {
+    pub verdict: Verdict,
+    pub reason: String,
+    pub decision_record_id: Option<String>,
+    pub inbox_id: Option<String>,
+    pub created_ids: Vec<String>,
+    pub alternative: Option<String>,
+    pub guard_results: Vec<GuardResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionRecordView {
+    pub id: String,
+    pub action_name: String,
+    pub actor: String,
+    pub confirmer: Option<String>,
+    pub verdict: Verdict,
+    pub params: Value,
+    pub guard_results: Vec<GuardResult>,
+    pub effects: Value,
+    pub rule_version: String,
+    pub function_version: String,
+    pub engine_version: String,
+    pub data_snapshot: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxItem {
+    pub id: String,
+    pub action_name: String,
+    pub proposed_by: String,
+    pub params: Value,
+    pub status: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestRecord {
+    pub type_name: String,
+    pub id: Option<String>,
+    pub properties: BTreeMap<String, Value>,
+    pub as_of: Option<String>,
+    pub provenance: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Query {
+    pub type_name: Option<String>,
+    pub equals: BTreeMap<String, Value>,
+    pub limit: usize,
+}
+
+impl Default for Query {
+    fn default() -> Self {
+        Self {
+            type_name: None,
+            equals: BTreeMap::new(),
+            limit: 50,
+        }
+    }
+}
+
+pub fn new_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+pub fn now_rfc3339() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}")
+}

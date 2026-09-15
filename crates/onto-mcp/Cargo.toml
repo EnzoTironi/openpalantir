@@ -1,0 +1,15 @@
+[package]
+name = "onto-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Consumer and builder MCP servers (stdio + Streamable HTTP)"
+
+[dependencies]
+onto = { path = "../onto" }
+onto-sdk = { path = "../onto-sdk" }
+onto-bootstrap = { path = "../onto-bootstrap" }
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+tokio.workspace = true
