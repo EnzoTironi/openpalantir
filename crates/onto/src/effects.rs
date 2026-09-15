@@ -89,10 +89,16 @@ fn parse_one(effect: &Value, names: &BTreeSet<&str>) -> Result<EffectOp> {
     let obj = effect
         .as_object()
         .ok_or_else(|| OntoError::Invalid("effect must be object".into()))?;
-    let verbs: Vec<&str> = ["create", "update", "link", "close_link", "count_links"]
-        .into_iter()
-        .filter(|k| obj.contains_key(*k))
-        .collect();
+    let verbs: Vec<&str> = [
+        obj.contains_key("create").then_some("create"),
+        (obj.contains_key("update") && !obj.contains_key("count_links")).then_some("update"),
+        obj.contains_key("link").then_some("link"),
+        obj.contains_key("close_link").then_some("close_link"),
+        obj.contains_key("count_links").then_some("count_links"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let Some(verb) = verbs.first().copied() else {
         return Err(OntoError::Invalid(
             "effect must have exactly one of create, update, link, close_link, count_links".into(),
@@ -293,6 +299,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, OntoError::Invalid(_)));
+    }
+
+    #[test]
+    fn does_parse_count_links_with_update_field() {
+        let plan = parse_plan(
+            &json!([{
+                "count_links": "occupies",
+                "update": "section",
+                "property": "enrolled",
+                "via": "section_has_seat"
+            }]),
+            &params(&["section"]),
+        )
+        .unwrap();
+        assert_eq!(
+            plan,
+            vec![EffectOp::CountLinks {
+                link: "occupies".into(),
+                update: "section".into(),
+                property: "enrolled".into(),
+                via: "section_has_seat".into(),
+            }]
+        );
     }
 
     #[test]
