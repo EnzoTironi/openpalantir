@@ -1,17 +1,17 @@
 //! Instructional healthcare ontology (Zhang 2026). Installed at runtime.
 //!
-//! Patient, Order, Observation, and DecisionRecord are OMS object types.
+//! Patient, Order, Observation, and `DecisionRecord` are OMS object types.
 //! `propose_order` is Propose: complete evidence lands in the inbox; missing or
 //! stale Observation evidence is `Verdict::Review` (Evidenced / Complete); a
 //! coded contraindication flag is permit-like `Verdict::Deny`. Confirm runs
-//! `approve_order` and writes a DecisionRecord. This case never computes a
+//! `approve_order` and writes a `DecisionRecord`. This case never computes a
 //! prescribed quantity. Standing order 9: instructional only.
 //!
 //! Cite Zhang 2026; do not copy. No YAML constitution. No UI.
 //!
 //! # Context
 //! Teaching loop only. Evidence completeness → Review or Deny. Confirm records
-//! a DecisionRecord. There is no derived property and no function that yields a
+//! a `DecisionRecord`. There is no derived property and no function that yields a
 //! prescribed quantity.
 //!
 //! # Inputs
@@ -631,7 +631,7 @@ fn vt(
         base: base.into(),
         min,
         max,
-        unit: unit.map(|s| s.into()),
+        unit: unit.map(str::to_string),
     }
 }
 
@@ -657,7 +657,7 @@ fn obj(
         name: name.into(),
         typology,
         title_prop: Some(title.into()),
-        interfaces: interfaces.iter().map(|s| (*s).to_string()).collect(),
+        interfaces: interfaces.iter().copied().map(str::to_string).collect(),
         freshness_budget_secs: budget,
         properties,
     }
@@ -694,10 +694,10 @@ fn grant(
         level,
         op,
         key,
-        type_name: type_name.map(|s| s.into()),
-        instance_id: instance_id.map(|s| s.into()),
-        property: property.map(|s| s.into()),
-        roles: roles.iter().map(|s| (*s).to_string()).collect(),
+        type_name: type_name.map(str::to_string),
+        instance_id: instance_id.map(str::to_string),
+        property: property.map(str::to_string),
+        roles: roles.iter().copied().map(str::to_string).collect(),
         min_tier,
         decision,
     }

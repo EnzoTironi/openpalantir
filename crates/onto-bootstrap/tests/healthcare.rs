@@ -1,7 +1,7 @@
 //! Named Zhang 2026 instructional healthcare teaching cases.
 //!
 //! Each test fails if the mechanism is deleted or stubbed (missing evidence
-//! Always-Allow, contraindication Always-Allow, confirm without DecisionRecord).
+//! Always-Allow, contraindication Always-Allow, confirm without `DecisionRecord`).
 
 use onto::{dispatch, Actor, AgentTier, AsOf, Engine, KeyKind, Query, Session, Verdict};
 use onto_bootstrap::{define_healthcare, install, install_healthcare};
