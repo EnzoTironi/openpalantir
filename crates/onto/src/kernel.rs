@@ -2,9 +2,9 @@
 //!
 //! `KERNEL_TYPES` is not a closed string list. After [`Engine::memory`] each
 //! name is an `ObjectType` instance on main, queryable with `search_objects`.
-//! Interfaces are contracts: [`KernelInterface::Reviewable`] on an ActionType
+//! Interfaces are contracts: [`KernelInterface::Reviewable`] on an `ActionType`
 //! in Propose mode must mint an inbox object;
-//! [`KernelInterface::Evidenced`] on an ObjectType makes missing or stale
+//! [`KernelInterface::Evidenced`] on an `ObjectType` makes missing or stale
 //! required properties a Complete/Current fail at submit.
 //!
 //! # Context
@@ -14,10 +14,10 @@
 //!
 //! # Inputs
 //! [`install`] takes the OMS connection and clock. Contract helpers take the
-//! live ActionType / ObjectType / Interface specs plus the object view.
+//! live `ActionType` / `ObjectType` / Interface specs plus the object view.
 //!
 //! # Outputs
-//! Kernel ObjectType records, interface specs, and read grants for those
+//! Kernel `ObjectType` records, interface specs, and read grants for those
 //! records. [`require_inbox`] and [`evidenced_guard`] are the checks the
 //! write path must call — mode alone is not the Reviewable contract.
 //!
@@ -44,6 +44,7 @@ use std::collections::BTreeMap;
 /// Named kernel contracts. A new variant is a compile break until the
 /// write path handles it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::module_name_repetitions)] // public OMS name; kernel::Interface collides with InterfaceSpec
 pub enum KernelInterface {
     Reviewable,
     Evidenced,
@@ -187,7 +188,7 @@ pub fn evidenced_guard(
     }
 }
 
-/// Meta ObjectType used to store kernel language records.
+/// Meta `ObjectType` used to store kernel language records.
 #[must_use]
 pub fn object_type_spec() -> ObjectTypeSpec {
     ObjectTypeSpec {
@@ -311,7 +312,7 @@ fn put_spec(db: &Connection, table: &str, branch: &str, name: &str, spec: &Value
     Ok(())
 }
 
-/// Install kernel ObjectType records, Reviewable/Evidenced contracts, and
+/// Install kernel `ObjectType` records, Reviewable/Evidenced contracts, and
 /// consumer read grants onto main. Idempotent.
 pub fn install(db: &Connection, now: i64) -> Result<()> {
     let meta = object_type_spec();
@@ -408,7 +409,7 @@ mod tests {
                 PropertyView {
                     value: v.clone(),
                     source: PropertySource::Mapped,
-                    as_of: as_of.map(|s| s.to_string()),
+                    as_of: as_of.map(str::to_string),
                     provenance: None,
                 },
             );

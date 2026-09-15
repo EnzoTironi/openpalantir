@@ -1769,10 +1769,10 @@ fn reviewable_propose_creates_inbox_unmerged_attach_is_noop() {
     let before = engine
         .submit_action(&operator(), "propose_plain", json!({ "n": 1 }))
         .unwrap();
+    let before_inbox = &before.inbox_id;
     assert!(
         before.inbox_id.is_none(),
-        "Propose without Reviewable on main must not mint inbox, got {:?}",
-        before.inbox_id
+        "Propose without Reviewable on main must not mint inbox, got {before_inbox:?}"
     );
 
     let pending_b = engine
@@ -1784,10 +1784,10 @@ fn reviewable_propose_creates_inbox_unmerged_attach_is_noop() {
     let still = engine
         .submit_action(&operator(), "propose_plain", json!({ "n": 2 }))
         .unwrap();
+    let still_inbox = &still.inbox_id;
     assert!(
         still.inbox_id.is_none(),
-        "unmerged Reviewable attach must have zero effect on main, got {:?}",
-        still.inbox_id
+        "unmerged Reviewable attach must have zero effect on main, got {still_inbox:?}"
     );
 }
 
@@ -1883,12 +1883,11 @@ fn evidenced_submit_reviews_when_evidence_missing() {
     assert_eq!(
         out.verdict,
         Verdict::Review,
-        "submit that reads Evidenced object with missing rationale must Complete-fail, got {:?}",
-        out
+        "submit that reads Evidenced object with missing rationale must Complete-fail, got {out:?}"
     );
+    let reason = &out.reason;
     assert!(
         out.reason.contains("Complete fail"),
-        "expected Complete fail, got {}",
-        out.reason
+        "expected Complete fail, got {reason}"
     );
 }
