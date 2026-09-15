@@ -9,9 +9,9 @@ Inspirado em Zhang, *Operational Ontology: From Business Mirror to Decision Runt
 - A constituição mora no **OMS**. Tipos de domínio nascem em runtime (`open_branch` → create/alter → `submit_proposal` → `review_proposal` → `merge_to_main`).
 - Funções são registros OMS (`create_function` no branch). Propriedades `Derived` nomeiam a função; o motor consulta o registro. Não há `if` no nome da propriedade.
 - Só o meta-modelo é compilado: `ObjectType`, `PropertyType`, `ValueType`, `LinkType`, `InterfaceType`, `ActionType`, `FunctionType`, `Policy`, `OntologyBranch`, `OntologyProposal`.
-- **Chave consumer:** consultar o mundo e executar Actions pré-definidas. Não edita schema.
+- **Chave consumer:** consultar o mundo e executar Actions pré-definidas. Não edita schema. Instâncias são deny-by-default em quatro níveis (Zhang 2026, Ch. 10): plataforma (consumer vs builder), tipo, instância, propriedade. Sem grant é `Deny`. Propriedade `Deny` some na leitura (`get_object` e object sets), não só `rationale`.
 - **Chave builder:** edita schema num branch. Não lê nem escreve instâncias de produção.
-- Toda escrita de negócio passa por Action no write path de 7 passos (`WritePathStep`): submit → param+permission → submission criteria → staged edits (all-or-discard) → commit atômico → selar `DecisionRecord` → declarar side effects com chave de idempotência. Funnel não sobrescreve propriedade `ActionWritten`.
+- Toda escrita de negócio passa por Action no write path de 7 passos (`WritePathStep`): submit → param+permission → submission criteria → staged edits (all-or-discard) → commit atômico → selar `DecisionRecord` → declarar side effects com chave de idempotência. Funnel não sobrescreve propriedade `ActionWritten`. `create_link` não é API pública; links nascem por Action (`assert_link`) ou Funnel.
 - Instâncias são versionadas (Zhang 2026, Ch. 5): cada escrita de propriedades **acrescenta** um `VersionSpan` (valid time + transaction time). `get_object(id)` lê a versão aberta; `get_object(id, as_of)` reconstrói o objeto no tempo válido. Ponta aberta é `None`. Não há overwrite in-place na tabela `objects`.
 - `DecisionRecord.data_snapshot` pina os objetos lidos nos guards, mais `rule_version`, `function_version` (digest das funções invocadas) e `engine_version`.
 - Inbox é objeto, não tela. Confirmar/vetar é Action.

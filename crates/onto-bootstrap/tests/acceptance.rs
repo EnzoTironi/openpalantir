@@ -1041,6 +1041,171 @@ fn restricted_cannot_see_rationale_in_set_results() {
 }
 
 #[test]
+fn intern_cannot_mutate_except_allowed_actions() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    let before = engine
+        .search_objects(
+            &operator(),
+            Query {
+                type_name: Some("AerationTank".into()),
+                ..Query::default()
+            },
+        )
+        .unwrap()
+        .len();
+
+    let leftover = engine.funnel_ingest(
+        &intern(),
+        vec![IngestRecord {
+            type_name: "AerationTank".into(),
+            id: Some("tank-intern".into()),
+            properties: [("name".into(), json!("Intern basin"))]
+                .into_iter()
+                .collect(),
+            as_of: Some(engine.now().to_string()),
+            provenance: Some("intern".into()),
+        }],
+    );
+    assert!(
+        matches!(leftover, Err(onto::OntoError::Denied(_))),
+        "intern must not Funnel-write; missing grant is Deny, got {leftover:?}"
+    );
+
+    let tools = engine.list_tools(&intern()).unwrap();
+    assert!(
+        !tools.iter().any(|t| t.name == "create_link"),
+        "create_link must not be a consumer tool"
+    );
+    let dispatched = dispatch(
+        &engine,
+        &intern(),
+        "create_link",
+        json!({
+            "type_name": "contains",
+            "from_id": ids.plant,
+            "to_id": ids.tank1
+        }),
+    );
+    assert!(
+        matches!(dispatched, Err(onto::OntoError::Denied(_))),
+        "create_link must not be a leftover public write, got {dispatched:?}"
+    );
+
+    let denied_action = engine
+        .submit_action(
+            &intern(),
+            "propose_setpoint_change",
+            json!({
+                "tank": ids.tank1,
+                "sensor": ids.sensor1,
+                "permit": ids.permit,
+                "target_do": 2.0,
+                "rationale": "intern leftover"
+            }),
+        )
+        .unwrap();
+    assert_eq!(denied_action.verdict, Verdict::Deny);
+    let link_denied = engine
+        .submit_action(
+            &intern(),
+            "assert_link",
+            json!({
+                "link_type": "contains",
+                "from": ids.plant,
+                "to": ids.tank1
+            }),
+        )
+        .unwrap();
+    assert_eq!(link_denied.verdict, Verdict::Deny);
+
+    let after = engine
+        .search_objects(
+            &operator(),
+            Query {
+                type_name: Some("AerationTank".into()),
+                ..Query::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(before, after.len());
+    assert!(!after.iter().any(|o| o.id == "tank-intern"));
+}
+
+#[test]
+fn restricted_does_not_see_denied_properties_in_get_object_or_sets() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    engine
+        .funnel_ingest(
+            &operator(),
+            vec![IngestRecord {
+                type_name: "LabMeasurement".into(),
+                id: Some("lab-deny".into()),
+                properties: [
+                    ("name".into(), json!("lab")),
+                    ("value".into(), json!(2.2)),
+                    ("rationale".into(), json!("hold the band")),
+                ]
+                .into_iter()
+                .collect(),
+                as_of: Some(engine.now().to_string()),
+                provenance: Some("test".into()),
+            }],
+        )
+        .unwrap();
+
+    let open = engine
+        .get_object(&operator(), "lab-deny", AsOf::Current)
+        .unwrap();
+    assert_eq!(open.properties["rationale"].value, json!("hold the band"));
+    let closed = engine
+        .get_object(&restricted(), "lab-deny", AsOf::Current)
+        .unwrap();
+    assert!(
+        !closed.properties.contains_key("rationale"),
+        "restricted must not see denied rationale on get_object"
+    );
+    assert!(closed.properties.contains_key("value"));
+
+    let permit_open = engine
+        .get_object(&operator(), &ids.permit, AsOf::Current)
+        .unwrap();
+    assert_eq!(permit_open.properties["do_max"].value, json!(4.0));
+    let permit_closed = engine
+        .get_object(&restricted(), &ids.permit, AsOf::Current)
+        .unwrap();
+    assert!(
+        !permit_closed.properties.contains_key("do_max"),
+        "property-level Deny hides do_max, not just rationale"
+    );
+    assert!(permit_closed.properties.contains_key("name"));
+
+    let set = engine
+        .search_objects(
+            &restricted(),
+            Query {
+                type_name: Some("LabMeasurement".into()),
+                ..Query::default()
+            },
+        )
+        .unwrap();
+    let lab = set.iter().find(|o| o.id == "lab-deny").expect("lab-deny");
+    assert!(!lab.properties.contains_key("rationale"));
+    let permits = engine
+        .search_objects(
+            &restricted(),
+            Query {
+                type_name: Some("PermitVersion".into()),
+                ..Query::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(permits.len(), 1);
+    assert!(!permits[0].properties.contains_key("do_max"));
+}
+
+#[test]
 fn aggregate_counts_filtered_set_not_whole_type() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();

@@ -1,9 +1,9 @@
 //! Install the wastewater case by calling live OMS builder Actions, then Funnel.
 
 use onto::{
-    ActionTypeSpec, Actor, Engine, ExecutionMode, FunctionKind, FunctionSpec, InterfaceSpec,
-    IngestRecord, LinkTypeSpec, ObjectTypeSpec, ParamSpec, PropertySource, PropertySpec, Result,
-    Session, Typology, ValueTypeSpec,
+    ActionTypeSpec, Actor, AuthzDecision, AuthzLevel, AuthzOp, Engine, ExecutionMode, FunctionKind,
+    FunctionSpec, IngestRecord, InterfaceSpec, KeyKind, LinkTypeSpec, ObjectTypeSpec, ParamSpec,
+    PolicySpec, PropertySource, PropertySpec, Result, Session, Typology, ValueTypeSpec,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -21,10 +21,7 @@ pub struct WastewaterIds {
 
 pub fn install(engine: &Engine) -> Result<WastewaterIds> {
     let modeller = Session::new(Actor::builder("human.modeler", &["modeler"]), "bootstrap");
-    let reviewer = Session::new(
-        Actor::builder("human.reviewer", &["reviewer"]),
-        "bootstrap",
-    );
+    let reviewer = Session::new(Actor::builder("human.reviewer", &["reviewer"]), "bootstrap");
     let ops = Session::new(
         Actor::consumer("pipeline.funnel", &["operator"], 2),
         "ingest",
@@ -38,7 +35,13 @@ pub fn install(engine: &Engine) -> Result<WastewaterIds> {
     seed_world(engine, &ops)
 }
 
-fn vt(name: &str, base: &str, min: Option<f64>, max: Option<f64>, unit: Option<&str>) -> ValueTypeSpec {
+fn vt(
+    name: &str,
+    base: &str,
+    min: Option<f64>,
+    max: Option<f64>,
+    unit: Option<&str>,
+) -> ValueTypeSpec {
     ValueTypeSpec {
         name: name.into(),
         base: base.into(),
@@ -92,7 +95,13 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
     engine.create_value_type(
         s,
         branch,
-        vt("DOConcentration", "number", Some(0.0), Some(15.0), Some("mg/L")),
+        vt(
+            "DOConcentration",
+            "number",
+            Some(0.0),
+            Some(15.0),
+            Some("mg/L"),
+        ),
     )?;
 
     engine.create_interface(
@@ -135,7 +144,12 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
             &[],
             vec![
                 prop("name", "Text", PropertySource::Mapped, false),
-                prop("current_do", "DOConcentration", PropertySource::Mapped, true),
+                prop(
+                    "current_do",
+                    "DOConcentration",
+                    PropertySource::Mapped,
+                    true,
+                ),
                 prop(
                     "target_do",
                     "DOConcentration",
@@ -180,9 +194,18 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
             &[],
             vec![
                 prop("name", "Text", PropertySource::Mapped, false),
-                prop("calibration_date", "Timestamp", PropertySource::Mapped, false),
+                prop(
+                    "calibration_date",
+                    "Timestamp",
+                    PropertySource::Mapped,
+                    false,
+                ),
                 prop("last_reading_at", "Timestamp", PropertySource::Mapped, true),
-                derived("days_since_calibration", "Timestamp", "days_since_calibration"),
+                derived(
+                    "days_since_calibration",
+                    "Timestamp",
+                    "days_since_calibration",
+                ),
             ],
         ),
     )?;
@@ -295,7 +318,12 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
             &["Reviewable", "Evidenced"],
             vec![
                 prop("name", "Text", PropertySource::ActionWritten, true),
-                prop("target_do", "DOConcentration", PropertySource::ActionWritten, false),
+                prop(
+                    "target_do",
+                    "DOConcentration",
+                    PropertySource::ActionWritten,
+                    false,
+                ),
                 prop("rationale", "Text", PropertySource::ActionWritten, false),
                 prop("status", "Text", PropertySource::ActionWritten, false),
             ],
@@ -371,7 +399,13 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
         ("monitors", "DO_Sensor", "AerationTank", "1:1", false),
         ("supplies_air", "Blower", "AerationTank", "1:n", false),
         ("treats", "ChemicalDoser", "AerationTank", "n:n", false),
-        ("evidence_for", "TelemetryReading", "ControlRecommendation", "n:n", false),
+        (
+            "evidence_for",
+            "TelemetryReading",
+            "ControlRecommendation",
+            "n:n",
+            false,
+        ),
     ] {
         engine.create_link_type(
             s,
@@ -542,6 +576,48 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
         s,
         branch,
         ActionTypeSpec {
+            name: "assert_link".into(),
+            mode: ExecutionMode::Auto,
+            parameters: vec![
+                ParamSpec {
+                    name: "link_type".into(),
+                    value_type: "Text".into(),
+                    object_type: None,
+                    required: true,
+                },
+                ParamSpec {
+                    name: "from".into(),
+                    value_type: "Text".into(),
+                    object_type: None,
+                    required: true,
+                },
+                ParamSpec {
+                    name: "to".into(),
+                    value_type: "Text".into(),
+                    object_type: None,
+                    required: true,
+                },
+            ],
+            guards: json!([]),
+            required_roles: vec!["operator".into()],
+            required_tier: 2,
+            effects: json!([{
+                "link": "$link_type",
+                "from": "from",
+                "to": "to"
+            }]),
+            compensation: None,
+            side_effects: json!({}),
+            on_review: None,
+        },
+    )?;
+
+    seed_policies(engine, s, branch)?;
+
+    engine.create_action_type(
+        s,
+        branch,
+        ActionTypeSpec {
             name: "request_sensor_calibration".into(),
             mode: ExecutionMode::Auto,
             parameters: vec![ParamSpec {
@@ -566,12 +642,7 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
     Ok(())
 }
 
-fn rec(
-    type_name: &str,
-    id: &str,
-    pairs: &[(&str, serde_json::Value)],
-    as_of: i64,
-) -> IngestRecord {
+fn rec(type_name: &str, id: &str, pairs: &[(&str, serde_json::Value)], as_of: i64) -> IngestRecord {
     IngestRecord {
         type_name: type_name.into(),
         id: Some(id.into()),
@@ -599,10 +670,30 @@ fn seed_world(engine: &Engine, ops: &Session) -> Result<WastewaterIds> {
     engine.funnel_ingest(
         ops,
         vec![
-            rec("TreatmentPlant", &ids.plant, &[("name", json!("Eastworks"))], t),
-            rec("AerationTank", &ids.tank1, &[("name", json!("Basin 1")), ("current_do", json!(1.8))], t),
-            rec("AerationTank", &ids.tank2, &[("name", json!("Basin 2")), ("current_do", json!(2.1))], t),
-            rec("AerationTank", &ids.tank3, &[("name", json!("Basin 3")), ("current_do", json!(1.9))], t),
+            rec(
+                "TreatmentPlant",
+                &ids.plant,
+                &[("name", json!("Eastworks"))],
+                t,
+            ),
+            rec(
+                "AerationTank",
+                &ids.tank1,
+                &[("name", json!("Basin 1")), ("current_do", json!(1.8))],
+                t,
+            ),
+            rec(
+                "AerationTank",
+                &ids.tank2,
+                &[("name", json!("Basin 2")), ("current_do", json!(2.1))],
+                t,
+            ),
+            rec(
+                "AerationTank",
+                &ids.tank3,
+                &[("name", json!("Basin 3")), ("current_do", json!(1.9))],
+                t,
+            ),
             rec(
                 "DO_Sensor",
                 &ids.sensor1,
@@ -613,26 +704,228 @@ fn seed_world(engine: &Engine, ops: &Session) -> Result<WastewaterIds> {
                 ],
                 t,
             ),
-            rec("Blower", &ids.blower, &[("name", json!("B-1")), ("status", json!("on"))], t),
-            rec("ChemicalDoser", &ids.doser, &[("name", json!("Carbon-1"))], t),
-            rec("PermitVersion", &ids.permit, &[("name", json!("2026-A")), ("do_max", json!(4.0))], t),
+            rec(
+                "Blower",
+                &ids.blower,
+                &[("name", json!("B-1")), ("status", json!("on"))],
+                t,
+            ),
+            rec(
+                "ChemicalDoser",
+                &ids.doser,
+                &[("name", json!("Carbon-1"))],
+                t,
+            ),
+            rec(
+                "PermitVersion",
+                &ids.permit,
+                &[("name", json!("2026-A")), ("do_max", json!(4.0))],
+                t,
+            ),
             rec(
                 "TelemetryReading",
                 "tele-1",
-                &[("name", json!("t1")), ("do_value", json!(1.8)), ("observed_at", json!(t))],
+                &[
+                    ("name", json!("t1")),
+                    ("do_value", json!(1.8)),
+                    ("observed_at", json!(t)),
+                ],
                 t,
             ),
         ],
     )?;
-    engine.create_link(ops, "contains", &ids.plant, &ids.tank1)?;
-    engine.create_link(ops, "contains", &ids.plant, &ids.tank2)?;
-    engine.create_link(ops, "contains", &ids.plant, &ids.tank3)?;
-    engine.create_link(ops, "upstream_of", &ids.tank1, &ids.tank2)?;
-    engine.create_link(ops, "upstream_of", &ids.tank2, &ids.tank3)?;
-    engine.create_link(ops, "upstream_of", &ids.tank3, &ids.tank1)?;
-    engine.create_link(ops, "monitors", &ids.sensor1, &ids.tank1)?;
-    engine.create_link(ops, "supplies_air", &ids.blower, &ids.tank1)?;
-    engine.create_link(ops, "treats", &ids.doser, &ids.tank1)?;
-    engine.create_link(ops, "treats", &ids.doser, &ids.tank2)?;
+    seed_links(engine, ops, &ids)?;
     Ok(ids)
+}
+
+fn seed_links(engine: &Engine, ops: &Session, ids: &WastewaterIds) -> Result<()> {
+    for (link_type, from, to) in [
+        ("contains", ids.plant.as_str(), ids.tank1.as_str()),
+        ("contains", ids.plant.as_str(), ids.tank2.as_str()),
+        ("contains", ids.plant.as_str(), ids.tank3.as_str()),
+        ("upstream_of", ids.tank1.as_str(), ids.tank2.as_str()),
+        ("upstream_of", ids.tank2.as_str(), ids.tank3.as_str()),
+        ("upstream_of", ids.tank3.as_str(), ids.tank1.as_str()),
+        ("monitors", ids.sensor1.as_str(), ids.tank1.as_str()),
+        ("supplies_air", ids.blower.as_str(), ids.tank1.as_str()),
+        ("treats", ids.doser.as_str(), ids.tank1.as_str()),
+        ("treats", ids.doser.as_str(), ids.tank2.as_str()),
+    ] {
+        let out = engine.submit_action(
+            ops,
+            "assert_link",
+            json!({
+                "link_type": link_type,
+                "from": from,
+                "to": to,
+            }),
+        )?;
+        match out.verdict {
+            onto::Verdict::Allow => {}
+            onto::Verdict::Deny | onto::Verdict::Review => {
+                return Err(onto::OntoError::Denied(format!(
+                    "assert_link {link_type} {from}->{to}: {}",
+                    out.reason
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn seed_policies(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
+    let consumer = Some(KeyKind::Consumer);
+    let readers: &[&str] = &["operator", "supervisor", "restricted"];
+    let writers: &[&str] = &["operator", "supervisor"];
+    for spec in [
+        grant(
+            "platform_consumer_read",
+            AuthzLevel::Platform,
+            AuthzOp::Read,
+            consumer,
+            None,
+            None,
+            None,
+            &[],
+            0,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "platform_consumer_write",
+            AuthzLevel::Platform,
+            AuthzOp::Write,
+            consumer,
+            None,
+            None,
+            None,
+            &[],
+            0,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "type_star_read",
+            AuthzLevel::Type,
+            AuthzOp::Read,
+            consumer,
+            Some("*"),
+            None,
+            None,
+            readers,
+            1,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "type_star_write",
+            AuthzLevel::Type,
+            AuthzOp::Write,
+            consumer,
+            Some("*"),
+            None,
+            None,
+            writers,
+            2,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "instance_star_read",
+            AuthzLevel::Instance,
+            AuthzOp::Read,
+            consumer,
+            Some("*"),
+            Some("*"),
+            None,
+            readers,
+            1,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "instance_star_write",
+            AuthzLevel::Instance,
+            AuthzOp::Write,
+            consumer,
+            Some("*"),
+            Some("*"),
+            None,
+            writers,
+            2,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "property_star_read",
+            AuthzLevel::Property,
+            AuthzOp::Read,
+            consumer,
+            Some("*"),
+            Some("*"),
+            Some("*"),
+            readers,
+            1,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "property_star_write",
+            AuthzLevel::Property,
+            AuthzOp::Write,
+            consumer,
+            Some("*"),
+            Some("*"),
+            Some("*"),
+            writers,
+            2,
+            AuthzDecision::Allow,
+        ),
+        grant(
+            "property_rationale_deny_restricted",
+            AuthzLevel::Property,
+            AuthzOp::Read,
+            consumer,
+            Some("*"),
+            Some("*"),
+            Some("rationale"),
+            &["restricted"],
+            1,
+            AuthzDecision::Deny,
+        ),
+        grant(
+            "property_do_max_deny_restricted",
+            AuthzLevel::Property,
+            AuthzOp::Read,
+            consumer,
+            Some("*"),
+            Some("*"),
+            Some("do_max"),
+            &["restricted"],
+            1,
+            AuthzDecision::Deny,
+        ),
+    ] {
+        engine.create_policy(s, branch, spec)?;
+    }
+    Ok(())
+}
+
+fn grant(
+    name: &str,
+    level: AuthzLevel,
+    op: AuthzOp,
+    key: Option<KeyKind>,
+    type_name: Option<&str>,
+    instance_id: Option<&str>,
+    property: Option<&str>,
+    roles: &[&str],
+    min_tier: u8,
+    decision: AuthzDecision,
+) -> PolicySpec {
+    PolicySpec {
+        name: name.into(),
+        level,
+        op,
+        key,
+        type_name: type_name.map(|s| s.into()),
+        instance_id: instance_id.map(|s| s.into()),
+        property: property.map(|s| s.into()),
+        roles: roles.iter().map(|s| (*s).to_string()).collect(),
+        min_tier,
+        decision,
+    }
 }

@@ -17,6 +17,7 @@ fn consumer_tools_projected_from_live_oms() {
     assert!(names.contains(&"get_object".into()));
     assert!(names.contains(&"action.propose_setpoint_change".into()));
     assert!(!names.contains(&"create_object_type".into()));
+    assert!(!names.contains(&"create_link".into()));
 }
 
 #[test]
@@ -102,9 +103,11 @@ fn mcp_decision_record_has_write_path_trace() {
             "declare_side_effects"
         ])
     );
-    assert!(rec["data_snapshot"]["objects"].as_array().unwrap().iter().any(|o| {
-        o["id"] == ids.sensor1
-    }));
+    assert!(rec["data_snapshot"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|o| { o["id"] == ids.sensor1 }));
     assert_eq!(rec["data_snapshot"]["engine_version"], onto::ENGINE_VERSION);
 }
 
@@ -122,5 +125,8 @@ fn mcp_keys_stay_separated_on_write_path() {
             "params": { "tank": "tank-1" }
         }),
     );
-    assert!(denied.is_err(), "builder key cannot submit production actions");
+    assert!(
+        denied.is_err(),
+        "builder key cannot submit production actions"
+    );
 }

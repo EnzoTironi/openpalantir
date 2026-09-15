@@ -2,6 +2,7 @@ use crate::bitemporal::AsOf;
 use crate::engine::Engine;
 use crate::error::{OntoError, Result};
 use crate::functions::FunctionSpec;
+use crate::security::PolicySpec;
 use crate::types::*;
 use serde_json::{json, Value};
 
@@ -27,7 +28,8 @@ fn dispatch_builder(engine: &Engine, session: &Session, tool: &str, args: Value)
         }
         "create_value_type" => {
             let branch = str_arg(&args, "branch")?;
-            let spec: ValueTypeSpec = serde_json::from_value(args.get("spec").cloned().unwrap_or(args.clone()))?;
+            let spec: ValueTypeSpec =
+                serde_json::from_value(args.get("spec").cloned().unwrap_or(args.clone()))?;
             Ok(json!({ "name": engine.create_value_type(session, branch, spec)? }))
         }
         "create_object_type" | "alter_object_type" => {
@@ -55,7 +57,11 @@ fn dispatch_builder(engine: &Engine, session: &Session, tool: &str, args: Value)
             Ok(json!({ "ok": true }))
         }
         "archive_object_type" => {
-            engine.archive_object_type(session, str_arg(&args, "branch")?, str_arg(&args, "type_name")?)?;
+            engine.archive_object_type(
+                session,
+                str_arg(&args, "branch")?,
+                str_arg(&args, "type_name")?,
+            )?;
             Ok(json!({ "ok": true }))
         }
         "create_link_type" | "alter_link_type" => {
@@ -91,6 +97,12 @@ fn dispatch_builder(engine: &Engine, session: &Session, tool: &str, args: Value)
                 "name": engine.create_function(session, str_arg(&args, "branch")?, spec)?
             }))
         }
+        "create_policy" => {
+            let spec: PolicySpec = serde_json::from_value(require(&args, "spec")?)?;
+            Ok(json!({
+                "name": engine.create_policy(session, str_arg(&args, "branch")?, spec)?
+            }))
+        }
         "submit_proposal" => Ok(json!({
             "proposal_id": engine.submit_proposal(session, str_arg(&args, "branch")?)?
         })),
@@ -98,7 +110,9 @@ fn dispatch_builder(engine: &Engine, session: &Session, tool: &str, args: Value)
             engine.review_proposal(
                 session,
                 str_arg(&args, "proposal_id")?,
-                args.get("approve").and_then(|v| v.as_bool()).unwrap_or(false),
+                args.get("approve")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             )?;
             Ok(json!({ "ok": true }))
         }
@@ -110,11 +124,9 @@ fn dispatch_builder(engine: &Engine, session: &Session, tool: &str, args: Value)
             let branch = args.get("branch").and_then(|v| v.as_str());
             Ok(serde_json::to_value(engine.get_schema(session, branch)?)?)
         }
-        "get_object" | "search_objects" | "submit_action" | "funnel_ingest" | "list_inbox" => {
-            Err(OntoError::Denied(
-                "builder key cannot read or write production instances".into(),
-            ))
-        }
+        "get_object" | "search_objects" | "submit_action" | "funnel_ingest" | "list_inbox" => Err(
+            OntoError::Denied("builder key cannot read or write production instances".into()),
+        ),
         other => Err(OntoError::NotFound(format!("unknown builder tool {other}"))),
     }
 }
@@ -143,11 +155,15 @@ fn dispatch_consumer(engine: &Engine, session: &Session, tool: &str, args: Value
                     let t = v
                         .as_i64()
                         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                        .ok_or_else(|| OntoError::Invalid("as_of must be an integer clock".into()))?;
+                        .ok_or_else(|| {
+                            OntoError::Invalid("as_of must be an integer clock".into())
+                        })?;
                     AsOf::Valid(t)
                 }
             };
-            Ok(serde_json::to_value(engine.get_object(session, id, as_of)?)?)
+            Ok(serde_json::to_value(
+                engine.get_object(session, id, as_of)?,
+            )?)
         }
         "traverse_links" => Ok(serde_json::to_value(engine.traverse_links(
             session,
@@ -162,7 +178,9 @@ fn dispatch_consumer(engine: &Engine, session: &Session, tool: &str, args: Value
         "submit_action" => {
             let name = str_arg(&args, "action")?;
             let params = args.get("params").cloned().unwrap_or(json!({}));
-            Ok(serde_json::to_value(engine.submit_action(session, name, params)?)?)
+            Ok(serde_json::to_value(
+                engine.submit_action(session, name, params)?,
+            )?)
         }
         "list_inbox" => Ok(serde_json::to_value(engine.list_inbox(session)?)?),
         "confirm_action" => Ok(serde_json::to_value(
@@ -182,12 +200,17 @@ fn dispatch_consumer(engine: &Engine, session: &Session, tool: &str, args: Value
             let records: Vec<IngestRecord> = serde_json::from_value(require(&args, "records")?)?;
             Ok(json!({ "ids": engine.funnel_ingest(session, records)? }))
         }
-        "create_object_type" | "open_branch" | "merge_to_main" | "create_action_type"
-        | "add_property" | "submit_proposal" | "review_proposal" | "create_function" => Err(OntoError::Denied(
-            "consumer key cannot mutate schema".into(),
+        "create_link" => Err(OntoError::Denied(
+            "create_link is not a consumer store write; use Action or Funnel".into(),
         )),
+        "create_object_type" | "open_branch" | "merge_to_main" | "create_action_type"
+        | "add_property" | "submit_proposal" | "review_proposal" | "create_function" => Err(
+            OntoError::Denied("consumer key cannot mutate schema".into()),
+        ),
         "list_tools" => Ok(serde_json::to_value(engine.list_tools(session)?)?),
-        other => Err(OntoError::NotFound(format!("unknown consumer tool {other}"))),
+        other => Err(OntoError::NotFound(format!(
+            "unknown consumer tool {other}"
+        ))),
     }
 }
 
