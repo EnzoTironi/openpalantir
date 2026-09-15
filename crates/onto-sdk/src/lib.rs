@@ -3,7 +3,7 @@
 use onto::{dispatch, ActionOutcome, Result, SchemaSnapshot, ToolSpec};
 use serde_json::{json, Value};
 
-pub use onto::{Actor, Engine, KeyKind, OntoError, Session};
+pub use onto::{Actor, AgentTier, Engine, KeyKind, OntoError, Session};
 
 pub struct Client<'a> {
     pub engine: &'a Engine,
@@ -40,6 +40,7 @@ impl<'a> Client<'a> {
 }
 
 pub fn parse_session(key: &str, id: &str, roles: &[&str], tier: u8) -> Session {
+    let tier = AgentTier::try_from(tier).unwrap_or(AgentTier::T2);
     match key {
         "builder" => Session::new(onto::Actor::builder(id, roles), "model"),
         _ => Session::new(onto::Actor::consumer(id, roles, tier), "operate"),

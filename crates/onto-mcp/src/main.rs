@@ -1,5 +1,5 @@
 use axum::{extract::State, routing::post, Json, Router};
-use onto::{dispatch, Actor, Engine, KeyKind, Session};
+use onto::{dispatch, Actor, AgentTier, Engine, KeyKind, Session};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -51,7 +51,12 @@ fn session_from_key(key: KeyKind, params: &Value) -> Session {
             KeyKind::Builder => vec!["modeler".into(), "reviewer".into()],
             KeyKind::Consumer => vec!["operator".into(), "supervisor".into()],
         });
-    let tier = meta.get("tier").and_then(|v| v.as_u64()).unwrap_or(3) as u8;
+    let tier = meta
+        .get("tier")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u8::try_from(n).ok())
+        .and_then(|n| AgentTier::try_from(n).ok())
+        .unwrap_or(AgentTier::T3);
     let refs: Vec<&str> = roles.iter().map(|s| s.as_str()).collect();
     let actor = match key {
         KeyKind::Builder => Actor::builder(id, &refs),
@@ -113,10 +118,7 @@ fn handle(engine: &Engine, key: KeyKind, req: RpcRequest) -> RpcResponse {
         }
         "tools/call" => {
             let session = session_from_key(key, &params);
-            let name = params
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
             match dispatch(engine, &session, name, arguments) {
                 Ok(v) => RpcResponse {
@@ -202,17 +204,17 @@ async fn main() {
     if wants_http() {
         let app = Router::new()
             .route("/mcp", post(http_rpc))
-            .with_state(App {
-                engine,
-                key,
-            });
+            .with_state(App { engine, key });
         let listener = tokio::net::TcpListener::bind("0.0.0.0:43177")
             .await
             .expect("bind 43177");
-        eprintln!("onto-mcp {} on http://127.0.0.1:43177/mcp", match key {
-            KeyKind::Builder => "builder",
-            KeyKind::Consumer => "consumer",
-        });
+        eprintln!(
+            "onto-mcp {} on http://127.0.0.1:43177/mcp",
+            match key {
+                KeyKind::Builder => "builder",
+                KeyKind::Consumer => "consumer",
+            }
+        );
         axum::serve(listener, app).await.expect("serve");
     } else {
         let stdin = io::stdin();

@@ -9,6 +9,7 @@ mod error;
 mod functions;
 mod oss;
 mod surface;
+mod tiers;
 mod types;
 mod write_path;
 
@@ -18,4 +19,5 @@ pub use error::{OntoError, Result};
 pub use functions::{FunctionKind, FunctionSpec};
 pub use oss::{ObjectSet, ObjectSetFilter, ObjectSetSpec};
 pub use surface::dispatch;
+pub use tiers::{AgentTier, AutoBound, AutoClaim, IllegalTier, RiskBand};
 pub use types::*;

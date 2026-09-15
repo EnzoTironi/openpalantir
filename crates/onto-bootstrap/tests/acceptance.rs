@@ -1,8 +1,8 @@
 use onto::{
-    dispatch, Actor, AsOf, Engine, IngestRecord, KeyKind, ObjectSet, ObjectSetFilter,
-    ObjectSetSpec, Query, Session, Verdict, WritePathStep,
+    dispatch, Actor, AgentTier, AsOf, Engine, IngestRecord, KeyKind, ObjectSet, ObjectSetFilter,
+    ObjectSetSpec, Query, RiskBand, Session, Verdict, WritePathStep,
 };
-use onto_bootstrap::install;
+use onto_bootstrap::{install, WastewaterIds};
 use serde_json::json;
 
 fn modeller() -> Session {
@@ -12,20 +12,29 @@ fn reviewer() -> Session {
     Session::new(Actor::builder("human.reviewer", &["reviewer"]), "test")
 }
 fn operator() -> Session {
-    Session::new(Actor::consumer("ops.maya", &["operator"], 2), "test")
+    Session::new(
+        Actor::consumer("ops.maya", &["operator"], AgentTier::T2),
+        "test",
+    )
 }
 fn supervisor() -> Session {
     Session::new(
-        Actor::consumer("ops.chen", &["supervisor", "operator"], 3),
+        Actor::consumer("ops.chen", &["supervisor", "operator"], AgentTier::T3),
         "test",
     )
 }
 fn intern() -> Session {
-    Session::new(Actor::consumer("ops.intern", &[], 1), "test")
+    Session::new(Actor::consumer("ops.intern", &[], AgentTier::T1), "test")
 }
 fn restricted() -> Session {
     Session::new(
-        Actor::consumer("ops.restricted", &["restricted"], 2),
+        Actor::consumer("ops.restricted", &["restricted"], AgentTier::T2),
+        "test",
+    )
+}
+fn automator() -> Session {
+    Session::new(
+        Actor::consumer("ops.auto", &["operator", "supervisor"], AgentTier::T4),
         "test",
     )
 }
@@ -248,16 +257,30 @@ fn permit_limit_and_unauthorized_deny() {
         .unwrap();
     assert_eq!(over.verdict, Verdict::Deny);
 
+    let intern_denied = engine.submit_action(
+        &intern(),
+        "propose_setpoint_change",
+        json!({
+            "tank": ids.tank1,
+            "sensor": ids.sensor1,
+            "permit": ids.permit,
+            "target_do": 2.0,
+            "rationale": "intern"
+        }),
+    );
+    assert!(intern_denied.is_err(), "T1 cannot submit_action");
+
+    let no_role = Session::new(Actor::consumer("ops.norole", &[], AgentTier::T2), "test");
     let unauth = engine
         .submit_action(
-            &intern(),
+            &no_role,
             "propose_setpoint_change",
             json!({
                 "tank": ids.tank1,
                 "sensor": ids.sensor1,
                 "permit": ids.permit,
                 "target_do": 2.0,
-                "rationale": "intern"
+                "rationale": "no role"
             }),
         )
         .unwrap();
@@ -479,7 +502,7 @@ fn guard_fail_at_step_three_discards_stage() {
     assert_eq!(over.verdict, Verdict::Deny);
     assert!(over.inbox_id.is_none());
     assert!(over.created_ids.is_empty());
-    assert!(engine.list_inbox(&operator()).unwrap().is_empty());
+    assert!(engine.list_inbox(&supervisor()).unwrap().is_empty());
     let tank_after = engine
         .get_object(&operator(), &ids.tank1, onto::AsOf::Current)
         .unwrap();
@@ -1060,4 +1083,201 @@ fn aggregate_counts_filtered_set_not_whole_type() {
         .unwrap();
     assert_eq!(filtered["count"], 1);
     assert_ne!(filtered["count"], whole["count"]);
+}
+
+fn setpoint_params(ids: &WastewaterIds, target_do: f64, rationale: &str) -> serde_json::Value {
+    json!({
+        "tank": ids.tank1,
+        "sensor": ids.sensor1,
+        "permit": ids.permit,
+        "target_do": target_do,
+        "rationale": rationale
+    })
+}
+
+#[test]
+fn intern_t1_can_observe_cannot_submit() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    let tools = engine.list_tools(&intern()).unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(names.contains(&"get_object"), "T1 must see get_object");
+    assert!(
+        names.contains(&"search_objects"),
+        "T1 must see search_objects"
+    );
+    assert!(names.contains(&"traverse_links"));
+    assert!(names.contains(&"aggregate"));
+    assert!(names.contains(&"list_missing_evidence"));
+    assert!(
+        !names.contains(&"submit_action"),
+        "T1 must not see submit_action"
+    );
+    assert!(
+        !names.contains(&"confirm_action"),
+        "T1 must not see confirm_action"
+    );
+    assert!(
+        !names.iter().any(|n| n.starts_with("action.")),
+        "T1 must not see action.* syscalls"
+    );
+
+    engine
+        .get_object(&intern(), &ids.tank1, AsOf::Current)
+        .expect("T1 can get_object");
+    engine
+        .search_objects(
+            &intern(),
+            Query {
+                type_name: Some("AerationTank".into()),
+                ..Query::default()
+            },
+        )
+        .expect("T1 can search_objects");
+
+    let denied = engine.submit_action(
+        &intern(),
+        "propose_setpoint_change",
+        setpoint_params(&ids, 2.0, "intern"),
+    );
+    assert!(denied.is_err(), "T1 cannot submit_action");
+    assert!(dispatch(
+        &engine,
+        &intern(),
+        "submit_action",
+        json!({
+            "action": "propose_setpoint_change",
+            "params": setpoint_params(&ids, 2.0, "intern-dispatch")
+        }),
+    )
+    .is_err());
+    assert!(dispatch(
+        &engine,
+        &intern(),
+        "confirm_action",
+        json!({ "inbox_id": "nope" }),
+    )
+    .is_err());
+}
+
+#[test]
+fn operator_t2_can_propose_cannot_confirm_or_override() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    let tools = engine.list_tools(&operator()).unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(names.contains(&"submit_action"));
+    assert!(names.contains(&"describe_action"));
+    assert!(
+        !names.contains(&"confirm_action"),
+        "T2 must not see confirm_action"
+    );
+    assert!(
+        !names.contains(&"override_action"),
+        "T2 must not see override_action"
+    );
+    assert!(!names.contains(&"auto_action"));
+
+    let proposed = engine
+        .submit_action(
+            &operator(),
+            "propose_setpoint_change",
+            setpoint_params(&ids, 2.3, "operator propose"),
+        )
+        .unwrap();
+    assert_eq!(proposed.verdict, Verdict::Allow);
+    let inbox = proposed.inbox_id.expect("inbox");
+    assert!(engine.confirm_action(&operator(), &inbox).is_err());
+    assert!(engine
+        .override_action(&operator(), &inbox, "process_exception", "no")
+        .is_err());
+    assert!(dispatch(
+        &engine,
+        &operator(),
+        "override_action",
+        json!({
+            "inbox_id": inbox,
+            "category": "process_exception",
+            "reason": "dispatch"
+        }),
+    )
+    .is_err());
+}
+
+#[test]
+fn supervisor_t3_confirms_other_actor_not_self() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    let tools = engine.list_tools(&supervisor()).unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(names.contains(&"confirm_action"));
+    assert!(names.contains(&"override_action"));
+    assert!(names.contains(&"list_inbox"));
+    assert!(!names.contains(&"auto_action"));
+
+    let proposed = engine
+        .submit_action(
+            &operator(),
+            "propose_setpoint_change",
+            setpoint_params(&ids, 2.4, "for chen"),
+        )
+        .unwrap();
+    let inbox = proposed.inbox_id.expect("inbox");
+    let confirmed = engine.confirm_action(&supervisor(), &inbox).unwrap();
+    assert_eq!(confirmed.verdict, Verdict::Allow);
+
+    let own = engine
+        .submit_action(
+            &supervisor(),
+            "propose_setpoint_change",
+            setpoint_params(&ids, 2.1, "self"),
+        )
+        .unwrap();
+    assert_eq!(own.verdict, Verdict::Allow);
+    let own_inbox = own.inbox_id.expect("own inbox");
+    let self_confirm = engine.confirm_action(&supervisor(), &own_inbox);
+    assert!(self_confirm.is_err(), "confirmer must not be the proposer");
+}
+
+#[test]
+fn t4_auto_denied_on_empty_bound() {
+    let engine = Engine::memory().unwrap();
+    let ids = install(&engine).unwrap();
+    let tools = engine.list_tools(&automator()).unwrap();
+    assert!(
+        tools.iter().any(|t| t.name == "auto_action"),
+        "T4 must see auto_action"
+    );
+    let denied = engine.auto_action(
+        &automator(),
+        "request_sensor_calibration",
+        "aeration_tanks",
+        RiskBand::Low,
+        json!({ "sensor": ids.sensor1 }),
+    );
+    assert!(denied.is_err(), "empty bound = no auto");
+    assert!(dispatch(
+        &engine,
+        &automator(),
+        "auto_action",
+        json!({
+            "action": "request_sensor_calibration",
+            "object_set": "aeration_tanks",
+            "risk_band": "low",
+            "params": { "sensor": ids.sensor1 }
+        }),
+    )
+    .is_err());
+    assert!(dispatch(
+        &engine,
+        &supervisor(),
+        "auto_action",
+        json!({
+            "action": "request_sensor_calibration",
+            "object_set": "aeration_tanks",
+            "risk_band": "low",
+            "params": { "sensor": ids.sensor1 }
+        }),
+    )
+    .is_err());
 }

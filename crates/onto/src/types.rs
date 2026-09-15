@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::functions::FunctionSpec;
+use crate::tiers::AgentTier;
 
 pub const ENGINE_VERSION: &str = "0.1.0";
 pub const MAIN_BRANCH: &str = "main";
@@ -116,7 +117,7 @@ pub struct Actor {
     pub id: String,
     pub key: KeyKind,
     pub roles: Vec<String>,
-    pub tier: u8,
+    pub tier: AgentTier,
 }
 
 impl Actor {
@@ -125,11 +126,11 @@ impl Actor {
             id: id.into(),
             key: KeyKind::Builder,
             roles: roles.iter().map(|s| (*s).to_string()).collect(),
-            tier: 1,
+            tier: AgentTier::T1,
         }
     }
 
-    pub fn consumer(id: impl Into<String>, roles: &[&str], tier: u8) -> Self {
+    pub fn consumer(id: impl Into<String>, roles: &[&str], tier: AgentTier) -> Self {
         Self {
             id: id.into(),
             key: KeyKind::Consumer,
@@ -218,7 +219,7 @@ pub struct ActionTypeSpec {
     pub parameters: Vec<ParamSpec>,
     pub guards: Value,
     pub required_roles: Vec<String>,
-    pub required_tier: u8,
+    pub required_tier: AgentTier,
     pub effects: Value,
     pub compensation: Option<String>,
     pub side_effects: Value,
