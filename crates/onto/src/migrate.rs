@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 /// What [`crate::Engine::migrate_legacy`] changed.
+#[allow(clippy::module_name_repetitions)] // public command report name
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrateReport {
     pub cancelled_inbox: Vec<String>,

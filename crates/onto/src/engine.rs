@@ -1382,6 +1382,7 @@ impl Engine {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // cardinality Deny and decision commit stay one path
     fn finish_allow(
         &self,
         session: &Session,

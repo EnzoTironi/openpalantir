@@ -505,38 +505,35 @@ fn transition_effect(
 
 fn load_effect_rows(db: &Connection, filter: Option<EffectStatus>) -> Result<Vec<EffectIntention>> {
     let mut out = Vec::new();
-    match filter {
-        Some(status) => {
-            let mut stmt = db.prepare(
-                "SELECT decision_record_id, declaration, status FROM effect_intentions
-                 WHERE status = ?1 ORDER BY created_at, decision_record_id",
-            )?;
-            let mapped = stmt.query_map(params![status.as_stored()], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })?;
-            for row in mapped {
-                out.push(effect_from_row(row?)?);
-            }
+    if let Some(status) = filter {
+        let mut stmt = db.prepare(
+            "SELECT decision_record_id, declaration, status FROM effect_intentions
+             WHERE status = ?1 ORDER BY created_at, decision_record_id",
+        )?;
+        let mapped = stmt.query_map(params![status.as_stored()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in mapped {
+            out.push(effect_from_row(row?)?);
         }
-        None => {
-            let mut stmt = db.prepare(
-                "SELECT decision_record_id, declaration, status FROM effect_intentions
-                 ORDER BY created_at, decision_record_id",
-            )?;
-            let mapped = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })?;
-            for row in mapped {
-                out.push(effect_from_row(row?)?);
-            }
+    } else {
+        let mut stmt = db.prepare(
+            "SELECT decision_record_id, declaration, status FROM effect_intentions
+             ORDER BY created_at, decision_record_id",
+        )?;
+        let mapped = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in mapped {
+            out.push(effect_from_row(row?)?);
         }
     }
     Ok(out)

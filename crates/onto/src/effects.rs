@@ -80,127 +80,148 @@ pub fn parse_plan(effects: &Value, parameters: &[ParamSpec]) -> Result<Vec<Effec
     let names: BTreeSet<&str> = parameters.iter().map(|p| p.name.as_str()).collect();
     let mut plan = Vec::new();
     for effect in arr {
-        let obj = effect
-            .as_object()
-            .ok_or_else(|| OntoError::Invalid("effect must be object".into()))?;
-        let verbs: Vec<&str> = ["create", "update", "link", "close_link", "count_links"]
-            .into_iter()
-            .filter(|k| obj.contains_key(*k))
-            .collect();
-        if verbs.len() != 1 {
-            return Err(OntoError::Invalid(
-                "effect must have exactly one of create, update, link, close_link, count_links"
-                    .into(),
-            ));
-        }
-        for key in obj.keys() {
-            if !allowed_field(verbs[0], key) {
-                return Err(OntoError::Invalid(format!("unknown effect field {key}")));
-            }
-        }
-        let op = match verbs[0] {
-            "create" => {
-                let type_name = obj
-                    .get("create")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| OntoError::Invalid("create needs a type name".into()))?;
-                let mut properties = BTreeMap::new();
-                if let Some(fields) = obj.get("properties").and_then(Value::as_object) {
-                    for (k, v) in fields {
-                        check_ref(v, &names)?;
-                        properties.insert(k.clone(), v.clone());
-                    }
-                }
-                EffectOp::Create {
-                    type_name: type_name.into(),
-                    properties,
-                }
-            }
-            "update" => {
-                let target = obj
-                    .get("update")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| OntoError::Invalid("update needs a target param".into()))?;
-                require_param(target, &names)?;
-                let mut properties = BTreeMap::new();
-                if let Some(fields) = obj.get("properties").and_then(Value::as_object) {
-                    for (k, v) in fields {
-                        check_ref(v, &names)?;
-                        properties.insert(k.clone(), v.clone());
-                    }
-                }
-                EffectOp::Update {
-                    target: target.into(),
-                    properties,
-                }
-            }
-            "link" => {
-                let link = obj.get("link").cloned().unwrap_or(Value::Null);
-                check_ref(&link, &names)?;
-                let from = obj
-                    .get("from")
-                    .and_then(Value::as_str)
-                    .unwrap_or("from")
-                    .to_string();
-                require_param(&from, &names)?;
-                let to = obj.get("to").and_then(Value::as_str).map(str::to_string);
-                if let Some(t) = &to {
-                    require_param(t, &names)?;
-                }
-                EffectOp::Link { link, from, to }
-            }
-            "close_link" => {
-                let link = obj.get("close_link").cloned().unwrap_or(Value::Null);
-                check_ref(&link, &names)?;
-                let from = obj
-                    .get("from")
-                    .and_then(Value::as_str)
-                    .unwrap_or("from")
-                    .to_string();
-                require_param(&from, &names)?;
-                let to = obj
-                    .get("to")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| OntoError::Invalid("close_link needs both endpoints".into()))?;
-                require_param(to, &names)?;
-                EffectOp::CloseLink {
-                    link,
-                    from,
-                    to: to.into(),
-                }
-            }
-            "count_links" => {
-                let link = obj
-                    .get("count_links")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| OntoError::Invalid("count_links needs a link type".into()))?;
-                let update = obj
-                    .get("update")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| OntoError::Invalid("count_links needs update".into()))?;
-                let property = obj
-                    .get("property")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| OntoError::Invalid("count_links needs property".into()))?;
-                let via = obj
-                    .get("via")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| OntoError::Invalid("count_links needs via".into()))?;
-                require_param(update, &names)?;
-                EffectOp::CountLinks {
-                    link: link.into(),
-                    update: update.into(),
-                    property: property.into(),
-                    via: via.into(),
-                }
-            }
-            other => {
-                return Err(OntoError::Invalid(format!("unknown effect verb {other}")));
-            }
-        };
-        plan.push(op);
+        plan.push(parse_one(effect, &names)?);
     }
     Ok(plan)
+}
+
+fn parse_one(effect: &Value, names: &BTreeSet<&str>) -> Result<EffectOp> {
+    let obj = effect
+        .as_object()
+        .ok_or_else(|| OntoError::Invalid("effect must be object".into()))?;
+    let verbs: Vec<&str> = ["create", "update", "link", "close_link", "count_links"]
+        .into_iter()
+        .filter(|k| obj.contains_key(*k))
+        .collect();
+    let Some(verb) = verbs.first().copied() else {
+        return Err(OntoError::Invalid(
+            "effect must have exactly one of create, update, link, close_link, count_links".into(),
+        ));
+    };
+    if verbs.len() != 1 {
+        return Err(OntoError::Invalid(
+            "effect must have exactly one of create, update, link, close_link, count_links".into(),
+        ));
+    }
+    for key in obj.keys() {
+        if !allowed_field(verb, key) {
+            return Err(OntoError::Invalid(format!("unknown effect field {key}")));
+        }
+    }
+    match verb {
+        "create" => parse_create(obj, names),
+        "update" => parse_update(obj, names),
+        "link" => parse_link(obj, names),
+        "close_link" => parse_close_link(obj, names),
+        "count_links" => parse_count_links(obj, names),
+        other => Err(OntoError::Invalid(format!("unknown effect verb {other}"))),
+    }
+}
+
+fn parse_properties(
+    obj: &serde_json::Map<String, Value>,
+    names: &BTreeSet<&str>,
+) -> Result<BTreeMap<String, Value>> {
+    let mut properties = BTreeMap::new();
+    if let Some(fields) = obj.get("properties").and_then(Value::as_object) {
+        for (k, v) in fields {
+            check_ref(v, names)?;
+            properties.insert(k.clone(), v.clone());
+        }
+    }
+    Ok(properties)
+}
+
+fn parse_create(obj: &serde_json::Map<String, Value>, names: &BTreeSet<&str>) -> Result<EffectOp> {
+    let type_name = obj
+        .get("create")
+        .and_then(Value::as_str)
+        .ok_or_else(|| OntoError::Invalid("create needs a type name".into()))?;
+    Ok(EffectOp::Create {
+        type_name: type_name.into(),
+        properties: parse_properties(obj, names)?,
+    })
+}
+
+fn parse_update(obj: &serde_json::Map<String, Value>, names: &BTreeSet<&str>) -> Result<EffectOp> {
+    let target = obj
+        .get("update")
+        .and_then(Value::as_str)
+        .ok_or_else(|| OntoError::Invalid("update needs a target param".into()))?;
+    require_param(target, names)?;
+    Ok(EffectOp::Update {
+        target: target.into(),
+        properties: parse_properties(obj, names)?,
+    })
+}
+
+fn parse_link(obj: &serde_json::Map<String, Value>, names: &BTreeSet<&str>) -> Result<EffectOp> {
+    let link = obj.get("link").cloned().unwrap_or(Value::Null);
+    check_ref(&link, names)?;
+    let from = obj
+        .get("from")
+        .and_then(Value::as_str)
+        .unwrap_or("from")
+        .to_string();
+    require_param(&from, names)?;
+    let to = obj.get("to").and_then(Value::as_str).map(str::to_string);
+    if let Some(t) = &to {
+        require_param(t, names)?;
+    }
+    Ok(EffectOp::Link { link, from, to })
+}
+
+fn parse_close_link(
+    obj: &serde_json::Map<String, Value>,
+    names: &BTreeSet<&str>,
+) -> Result<EffectOp> {
+    let link = obj.get("close_link").cloned().unwrap_or(Value::Null);
+    check_ref(&link, names)?;
+    let from = obj
+        .get("from")
+        .and_then(Value::as_str)
+        .unwrap_or("from")
+        .to_string();
+    require_param(&from, names)?;
+    let to = obj
+        .get("to")
+        .and_then(Value::as_str)
+        .ok_or_else(|| OntoError::Invalid("close_link needs both endpoints".into()))?;
+    require_param(to, names)?;
+    Ok(EffectOp::CloseLink {
+        link,
+        from,
+        to: to.into(),
+    })
+}
+
+fn parse_count_links(
+    obj: &serde_json::Map<String, Value>,
+    names: &BTreeSet<&str>,
+) -> Result<EffectOp> {
+    let link = obj
+        .get("count_links")
+        .and_then(Value::as_str)
+        .ok_or_else(|| OntoError::Invalid("count_links needs a link type".into()))?;
+    let update = obj
+        .get("update")
+        .and_then(Value::as_str)
+        .ok_or_else(|| OntoError::Invalid("count_links needs update".into()))?;
+    let property = obj
+        .get("property")
+        .and_then(Value::as_str)
+        .ok_or_else(|| OntoError::Invalid("count_links needs property".into()))?;
+    let via = obj
+        .get("via")
+        .and_then(Value::as_str)
+        .ok_or_else(|| OntoError::Invalid("count_links needs via".into()))?;
+    require_param(update, names)?;
+    Ok(EffectOp::CountLinks {
+        link: link.into(),
+        update: update.into(),
+        property: property.into(),
+        via: via.into(),
+    })
 }
 
 fn allowed_field(verb: &str, key: &str) -> bool {
