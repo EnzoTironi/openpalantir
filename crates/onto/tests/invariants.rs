@@ -73,8 +73,12 @@ fn does_keep_engine_free_of_sql() {
         );
     }
     assert!(
-        src.contains("store: SqliteStore"),
+        src.contains("store: Box<dyn Store>"),
         "Engine must coordinate through the Store seam, not a raw connection"
+    );
+    assert!(
+        src.contains("pub fn from_store"),
+        "Store must be injectable; Engine must not hard-wire one backend"
     );
 }
 
