@@ -573,7 +573,7 @@ fn define_language(engine: &Engine, s: &Session, branch: &str) -> Result<()> {
                 { "lte_field": "target_do", "object": "permit", "field": "do_max" }
             ]),
             required_roles: vec!["supervisor".into()],
-            required_tier: 3,
+            required_tier: AgentTier::T3,
             effects: json!([{
                 "update": "tank",
                 "properties": { "target_do": "$target_do" }

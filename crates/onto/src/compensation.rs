@@ -25,7 +25,7 @@
 //!
 //! # Example
 //! ```
-//! use onto::{ActionTypeSpec, Compensation, ExecutionMode};
+//! use onto::{ActionTypeSpec, AgentTier, Compensation, ExecutionMode};
 //! use serde_json::json;
 //!
 //! let spec = ActionTypeSpec {
@@ -34,7 +34,7 @@
 //!     parameters: vec![],
 //!     guards: json!([]),
 //!     required_roles: vec![],
-//!     required_tier: 0,
+//!     required_tier: AgentTier::T3,
 //!     effects: json!([]),
 //!     compensation: Some("revert_setpoint_change".into()),
 //!     side_effects: json!({}),
@@ -135,6 +135,7 @@ pub fn previous_written(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tiers::AgentTier;
     use crate::types::{ENGINE_VERSION, ExecutionMode};
 
     fn spec_with(compensation: Option<&str>) -> ActionTypeSpec {
@@ -144,7 +145,7 @@ mod tests {
             parameters: vec![],
             guards: json!([]),
             required_roles: vec![],
-            required_tier: 0,
+            required_tier: AgentTier::T3,
             effects: json!([]),
             compensation: compensation.map(|s| s.into()),
             side_effects: json!({}),
