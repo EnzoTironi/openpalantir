@@ -348,6 +348,8 @@ pub struct Query {
     pub type_name: Option<String>,
     pub equals: BTreeMap<String, Value>,
     pub limit: usize,
+    /// When set, search resolves this named OMS object set (Zhang 2026, Ch. 6).
+    pub set_name: Option<String>,
 }
 
 impl Default for Query {
@@ -356,6 +358,7 @@ impl Default for Query {
             type_name: None,
             equals: BTreeMap::new(),
             limit: 50,
+            set_name: None,
         }
     }
 }

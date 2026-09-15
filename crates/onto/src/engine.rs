@@ -1,10 +1,12 @@
 use crate::bitemporal::{self, AsOf};
 use crate::error::{OntoError, Result};
 use crate::functions::{self, FunctionSpec};
-use crate::types::*;
-use crate::write_path::{
-    pin_version, resolve_idempotency_key, StagedOp, WritePath,
+use crate::oss::{
+    apply_permission, evaluate_members, ObjectSet, ObjectSetFilter, ObjectSetSpec,
+    OBJECT_SETS_TABLE,
 };
+use crate::types::*;
+use crate::write_path::{pin_version, resolve_idempotency_key, StagedOp, WritePath};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -87,6 +89,12 @@ impl Engine {
                 PRIMARY KEY (branch, name)
             );
             CREATE TABLE IF NOT EXISTS schema_functions (
+                branch TEXT NOT NULL,
+                name TEXT NOT NULL,
+                spec TEXT NOT NULL,
+                PRIMARY KEY (branch, name)
+            );
+            CREATE TABLE IF NOT EXISTS schema_object_sets (
                 branch TEXT NOT NULL,
                 name TEXT NOT NULL,
                 spec TEXT NOT NULL,
@@ -220,11 +228,7 @@ impl Engine {
             )?;
         }
         self.copy_schema(MAIN_BRANCH, name)?;
-        self.audit(
-            &session.actor.id,
-            "open_branch",
-            json!({ "branch": name }),
-        )?;
+        self.audit(&session.actor.id, "open_branch", json!({ "branch": name }))?;
         Ok(name.to_string())
     }
 
@@ -236,6 +240,7 @@ impl Engine {
             "schema_interfaces",
             "schema_action_types",
             "schema_functions",
+            OBJECT_SETS_TABLE,
         ];
         let db = self.db.lock().expect("db");
         for table in tables {
@@ -271,7 +276,13 @@ impl Engine {
         Ok(())
     }
 
-    fn put_spec(db: &Connection, table: &str, branch: &str, name: &str, spec: &Value) -> Result<()> {
+    fn put_spec(
+        db: &Connection,
+        table: &str,
+        branch: &str,
+        name: &str,
+        spec: &Value,
+    ) -> Result<()> {
         db.execute(
             &format!("INSERT OR REPLACE INTO {table}(branch, name, spec) VALUES (?1, ?2, ?3)"),
             params![branch, name, spec.to_string()],
@@ -532,7 +543,12 @@ impl Engine {
         Ok(id)
     }
 
-    pub fn review_proposal(&self, session: &Session, proposal_id: &str, approve: bool) -> Result<()> {
+    pub fn review_proposal(
+        &self,
+        session: &Session,
+        proposal_id: &str,
+        approve: bool,
+    ) -> Result<()> {
         Self::require_builder(session)?;
         if !session.actor.has_role("reviewer") {
             return Err(OntoError::Denied("reviewer role required".into()));
@@ -611,6 +627,7 @@ impl Engine {
             "schema_interfaces",
             "schema_action_types",
             "schema_functions",
+            OBJECT_SETS_TABLE,
         ];
         let db = self.db.lock().expect("db");
         for table in tables {
@@ -654,8 +671,9 @@ impl Engine {
 
     fn load_all<T: for<'de> DeserializeOwned>(&self, branch: &str, table: &str) -> Result<Vec<T>> {
         let db = self.db.lock().expect("db");
-        let mut stmt =
-            db.prepare(&format!("SELECT spec FROM {table} WHERE branch = ?1 ORDER BY name"))?;
+        let mut stmt = db.prepare(&format!(
+            "SELECT spec FROM {table} WHERE branch = ?1 ORDER BY name"
+        ))?;
         let rows = stmt.query_map(params![branch], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -740,49 +758,92 @@ impl Engine {
         Ok(spec.map(|s| serde_json::from_str(&s)).transpose()?)
     }
 
-    pub fn search_objects(&self, session: &Session, query: Query) -> Result<Vec<ObjectView>> {
-        Self::require_consumer(session)?;
+    pub fn create_object_set(
+        &self,
+        session: &Session,
+        branch: &str,
+        spec: ObjectSetSpec,
+    ) -> Result<String> {
+        Self::require_builder(session)?;
+        self.require_open_branch(branch)?;
+        spec.validate()?;
         let db = self.db.lock().expect("db");
-        let mut sql = String::from("SELECT id FROM objects");
-        let mut args: Vec<String> = Vec::new();
-        if let Some(t) = &query.type_name {
-            sql.push_str(" WHERE type_name = ?1");
-            args.push(t.clone());
-        }
-        sql.push_str(" LIMIT ?");
-        let mut stmt = db.prepare(&sql)?;
-        let ids: Vec<String> = if args.is_empty() {
-            stmt.query_map(params![query.limit as i64], |r| r.get(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        } else {
-            stmt.query_map(params![args[0], query.limit as i64], |r| r.get(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
+        Self::put_spec(
+            &db,
+            OBJECT_SETS_TABLE,
+            branch,
+            &spec.name,
+            &serde_json::to_value(&spec)?,
+        )?;
+        Ok(spec.name)
+    }
+
+    pub fn search_objects(&self, session: &Session, query: Query) -> Result<Vec<ObjectView>> {
+        self.search_object_set(session, ObjectSet::from_query(&query))
+    }
+
+    pub fn search_object_set(&self, session: &Session, set: ObjectSet) -> Result<Vec<ObjectView>> {
+        Self::require_consumer(session)?;
+        let resolved = self.resolve_object_set(set)?;
+        let ids = self.candidate_ids(resolved.type_name.as_deref())?;
+        evaluate_members(&resolved, ids, |id| self.load_permitted_view(session, id))
+    }
+
+    pub fn aggregate_set(&self, session: &Session, set: ObjectSet) -> Result<Value> {
+        Self::require_consumer(session)?;
+        let resolved = self.resolve_object_set(set.unbounded())?;
+        let ids = self.candidate_ids(resolved.type_name.as_deref())?;
+        let members = evaluate_members(&resolved, ids, |id| self.load_permitted_view(session, id))?;
+        Ok(json!({
+            "type_name": resolved.type_name,
+            "name": resolved.name,
+            "count": members.len() as i64
+        }))
+    }
+
+    fn resolve_object_set(&self, set: ObjectSet) -> Result<ObjectSet> {
+        let Some(name) = set.name.as_deref() else {
+            return Ok(set);
         };
-        drop(stmt);
-        drop(db);
-        let mut out = Vec::new();
-        for id in ids {
-            let view = self.load_object_view(&id, AsOf::Current)?;
-            if self.matches_equals(&view, &query.equals) {
-                out.push(self.filter_view(session, view));
+        let spec = self.load_object_set_spec(MAIN_BRANCH, name)?;
+        Ok(ObjectSet::from_spec(&spec, set.limit))
+    }
+
+    fn load_object_set_spec(&self, branch: &str, name: &str) -> Result<ObjectSetSpec> {
+        let db = self.db.lock().expect("db");
+        let spec: String = db
+            .query_row(
+                "SELECT spec FROM schema_object_sets WHERE branch = ?1 AND name = ?2",
+                params![branch, name],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| OntoError::NotFound(format!("object set {name} on {branch}")))?;
+        Ok(serde_json::from_str(&spec)?)
+    }
+
+    fn candidate_ids(&self, type_name: Option<&str>) -> Result<Vec<String>> {
+        let db = self.db.lock().expect("db");
+        let ids = match type_name {
+            Some(t) => {
+                let mut stmt = db.prepare("SELECT id FROM objects WHERE type_name = ?1")?;
+                let rows = stmt.query_map(params![t], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
             }
-        }
-        Ok(out)
+            None => {
+                let mut stmt = db.prepare("SELECT id FROM objects")?;
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        };
+        Ok(ids)
     }
 
-    fn matches_equals(&self, view: &ObjectView, equals: &BTreeMap<String, Value>) -> bool {
-        equals.iter().all(|(k, v)| {
-            view.properties
-                .get(k)
-                .is_some_and(|p| p.value == *v)
-        })
-    }
-
-    fn filter_view(&self, session: &Session, mut view: ObjectView) -> ObjectView {
-        if session.actor.has_role("restricted") {
-            view.properties.retain(|name, _| name != "rationale");
-        }
-        view
+    fn load_permitted_view(&self, session: &Session, id: &str) -> Result<ObjectView> {
+        Ok(apply_permission(
+            session,
+            self.load_object_view(id, AsOf::Current)?,
+        ))
     }
 
     /// Current version when `as_of` is [`AsOf::Current`]; otherwise the version
@@ -790,7 +851,7 @@ impl Engine {
     /// not a silent current row.
     pub fn get_object(&self, session: &Session, id: &str, as_of: AsOf) -> Result<ObjectView> {
         Self::require_consumer(session)?;
-        Ok(self.filter_view(session, self.load_object_view(id, as_of)?))
+        Ok(apply_permission(session, self.load_object_view(id, as_of)?))
     }
 
     /// Spans for one identity, oldest valid_from first.
@@ -889,14 +950,14 @@ impl Engine {
     }
 
     pub fn aggregate(&self, session: &Session, type_name: &str) -> Result<Value> {
-        Self::require_consumer(session)?;
-        let db = self.db.lock().expect("db");
-        let count: i64 = db.query_row(
-            "SELECT COUNT(*) FROM objects WHERE type_name = ?1",
-            params![type_name],
-            |r| r.get(0),
-        )?;
-        Ok(json!({ "type_name": type_name, "count": count }))
+        self.aggregate_set(
+            session,
+            ObjectSet::inline(
+                Some(type_name.into()),
+                ObjectSetFilter::default(),
+                usize::MAX,
+            ),
+        )
     }
 
     pub fn list_missing_evidence(&self, session: &Session, id: &str) -> Result<Value> {
@@ -925,7 +986,11 @@ impl Engine {
         Ok(id)
     }
 
-    pub fn funnel_ingest(&self, session: &Session, records: Vec<IngestRecord>) -> Result<Vec<String>> {
+    pub fn funnel_ingest(
+        &self,
+        session: &Session,
+        records: Vec<IngestRecord>,
+    ) -> Result<Vec<String>> {
         Self::require_consumer(session)?;
         let mut ids = Vec::new();
         for rec in records {
@@ -941,10 +1006,7 @@ impl Engine {
 
     fn ingest_one(&self, rec: IngestRecord) -> Result<String> {
         let spec = self.load_object_type(MAIN_BRANCH, &rec.type_name)?;
-        let as_of = rec
-            .as_of
-            .clone()
-            .unwrap_or_else(|| self.now().to_string());
+        let as_of = rec.as_of.clone().unwrap_or_else(|| self.now().to_string());
         let id = rec.id.clone().unwrap_or_else(new_id);
         let existing = {
             let db = self.db.lock().expect("db");
@@ -987,10 +1049,11 @@ impl Engine {
                 },
             );
         }
-        let title = spec
-            .title_prop
-            .as_ref()
-            .and_then(|t| props.get(t).and_then(|p| p.value.as_str().map(|s| s.to_string())));
+        let title = spec.title_prop.as_ref().and_then(|t| {
+            props
+                .get(t)
+                .and_then(|p| p.value.as_str().map(|s| s.to_string()))
+        });
         let encoded = serde_json::to_string(&props)?;
         let at = rec
             .as_of
@@ -1068,7 +1131,9 @@ impl Engine {
     pub fn confirm_action(&self, session: &Session, inbox_id: &str) -> Result<ActionOutcome> {
         Self::require_consumer(session)?;
         if !session.actor.has_role("supervisor") && session.actor.tier < 3 {
-            return Err(OntoError::Denied("confirmer must be supervisor or tier 3+".into()));
+            return Err(OntoError::Denied(
+                "confirmer must be supervisor or tier 3+".into(),
+            ));
         }
         let (action_name, params, status): (String, String, String) = {
             let db = self.db.lock().expect("db");
@@ -1260,7 +1325,9 @@ impl Engine {
                         let path = path.discard_stage();
                         self.finish_abort(session, spec, &params, path, reason, alternative)
                     }
-                    Verdict::Allow => self.finish_allow(session, spec, params, confirmer_inbox, path),
+                    Verdict::Allow => {
+                        self.finish_allow(session, spec, params, confirmer_inbox, path)
+                    }
                 }
             }
         }
@@ -1475,9 +1542,9 @@ impl Engine {
             };
             if let Some(vt) = self.load_value_type(MAIN_BRANCH, &p.value_type)? {
                 if vt.base == "number" {
-                    let n = val
-                        .as_f64()
-                        .ok_or_else(|| OntoError::Invalid(format!("{} must be a number", p.name)))?;
+                    let n = val.as_f64().ok_or_else(|| {
+                        OntoError::Invalid(format!("{} must be a number", p.name))
+                    })?;
                     if let Some(min) = vt.min {
                         if n < min {
                             return Err(OntoError::Invalid(format!("{} below {}", p.name, min)));
@@ -1491,9 +1558,9 @@ impl Engine {
                 }
             }
             if let Some(ot) = &p.object_type {
-                let id = val
-                    .as_str()
-                    .ok_or_else(|| OntoError::Invalid(format!("{} must be an object id", p.name)))?;
+                let id = val.as_str().ok_or_else(|| {
+                    OntoError::Invalid(format!("{} must be an object id", p.name))
+                })?;
                 let view = self.load_object_view(id, AsOf::Current)?;
                 if view.type_name != *ot {
                     return Err(OntoError::Invalid(format!(
@@ -1523,7 +1590,10 @@ impl Engine {
             ));
         }
         let Some(arr) = guards.as_array() else {
-            return Ok((vec![self.eval_one_guard(guards, params, &mut reads)?], reads));
+            return Ok((
+                vec![self.eval_one_guard(guards, params, &mut reads)?],
+                reads,
+            ));
         };
         let mut out = Vec::new();
         for g in arr {
@@ -1542,7 +1612,10 @@ impl Engine {
             .as_object()
             .ok_or_else(|| OntoError::Invalid("guard must be object".into()))?;
         if let Some(name) = obj.get("freshness").and_then(|v| v.as_str()) {
-            let max = obj.get("max_age_secs").and_then(|v| v.as_i64()).unwrap_or(300);
+            let max = obj
+                .get("max_age_secs")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(300);
             let id = param_str(params, name)?;
             let view = self.read_for_guard(&id, reads)?;
             let as_of = view
@@ -1567,7 +1640,10 @@ impl Engine {
                 return Ok(GuardResult {
                     name: "freshness".into(),
                     verdict: Verdict::Review,
-                    reason: format!("stale {name}: age {}s > {max}s (Current fail)", self.now() - ts),
+                    reason: format!(
+                        "stale {name}: age {}s > {max}s (Current fail)",
+                        self.now() - ts
+                    ),
                 });
             }
             return Ok(GuardResult {
@@ -1598,8 +1674,14 @@ impl Engine {
             });
         }
         if let Some(param) = obj.get("lte_field").and_then(|v| v.as_str()) {
-            let object_param = obj.get("object").and_then(|v| v.as_str()).unwrap_or("permit");
-            let field = obj.get("field").and_then(|v| v.as_str()).unwrap_or("do_max");
+            let object_param = obj
+                .get("object")
+                .and_then(|v| v.as_str())
+                .unwrap_or("permit");
+            let field = obj
+                .get("field")
+                .and_then(|v| v.as_str())
+                .unwrap_or("do_max");
             let n = param_f64(params, param)?;
             let permit_id = param_str(params, object_param)?;
             let view = self.read_for_guard(&permit_id, reads)?;
@@ -1622,7 +1704,10 @@ impl Engine {
             });
         }
         if let Some(max) = obj.get("lte").and_then(|v| v.as_f64()) {
-            let param = obj.get("param").and_then(|v| v.as_str()).unwrap_or("target_do");
+            let param = obj
+                .get("param")
+                .and_then(|v| v.as_str())
+                .unwrap_or("target_do");
             let n = param_f64(params, param)?;
             if n > max {
                 return Ok(GuardResult {
@@ -1637,8 +1722,14 @@ impl Engine {
                 reason: "ok".into(),
             });
         }
-        if let Some(days) = obj.get("max_days_since_calibration").and_then(|v| v.as_i64()) {
-            let object_param = obj.get("object").and_then(|v| v.as_str()).unwrap_or("sensor");
+        if let Some(days) = obj
+            .get("max_days_since_calibration")
+            .and_then(|v| v.as_i64())
+        {
+            let object_param = obj
+                .get("object")
+                .and_then(|v| v.as_str())
+                .unwrap_or("sensor");
             let id = param_str(params, object_param)?;
             let view = self.read_for_guard(&id, reads)?;
             let cal = view
@@ -1673,12 +1764,7 @@ impl Engine {
         Ok(view)
     }
 
-    fn stage_effects(
-        &self,
-        effects: &Value,
-        params: &Value,
-        actor: &str,
-    ) -> Result<Vec<StagedOp>> {
+    fn stage_effects(&self, effects: &Value, params: &Value, actor: &str) -> Result<Vec<StagedOp>> {
         let mut staged = Vec::new();
         let mut created = Vec::new();
         let Some(arr) = effects.as_array() else {
@@ -1927,10 +2013,7 @@ fn snapshot_from_view(view: &ObjectView) -> SnapshotObject {
 }
 
 fn rule_version(spec: &ActionTypeSpec) -> String {
-    pin_version(
-        &spec.name,
-        &serde_json::to_string(spec).unwrap_or_default(),
-    )
+    pin_version(&spec.name, &serde_json::to_string(spec).unwrap_or_default())
 }
 
 fn param_str(params: &Value, name: &str) -> Result<String> {
@@ -1969,11 +2052,17 @@ fn worst_verdict(results: &[GuardResult]) -> Verdict {
 
 fn builder_tools() -> Vec<ToolSpec> {
     [
-        ("open_branch", "Open a working schema branch copied from main"),
+        (
+            "open_branch",
+            "Open a working schema branch copied from main",
+        ),
         ("create_value_type", "Create a value type on a branch"),
         ("create_object_type", "Create an object type on a branch"),
         ("alter_object_type", "Replace an object type on a branch"),
-        ("add_property", "Add a property to an object type on a branch"),
+        (
+            "add_property",
+            "Add a property to an object type on a branch",
+        ),
         ("alter_property", "Alter a property on a branch"),
         ("archive_object_type", "Archive an object type on a branch"),
         ("create_link_type", "Create a link type on a branch"),
@@ -1983,10 +2072,14 @@ fn builder_tools() -> Vec<ToolSpec> {
         ("create_action_type", "Create an action type on a branch"),
         ("alter_action_type", "Alter an action type on a branch"),
         ("create_function", "Create a function record on a branch"),
+        ("create_object_set", "Create a named object set on a branch"),
         ("submit_proposal", "Submit a branch for review"),
         ("review_proposal", "Approve or reject a proposal"),
         ("merge_to_main", "Merge an approved proposal into main"),
-        ("get_schema", "Read schema of a branch (never production instances)"),
+        (
+            "get_schema",
+            "Read schema of a branch (never production instances)",
+        ),
     ]
     .into_iter()
     .map(|(name, description)| ToolSpec {
@@ -1999,19 +2092,34 @@ fn builder_tools() -> Vec<ToolSpec> {
 
 fn consumer_base_tools() -> Vec<ToolSpec> {
     [
-        ("search_objects", "Permission-first object search"),
-        ("get_object", "Load one object with freshness, provenance, missing fields; as_of is valid time"),
+        ("search_objects", "Permission-first object-set search"),
+        (
+            "get_object",
+            "Load one object with freshness, provenance, missing fields; as_of is valid time",
+        ),
         ("traverse_links", "Cycle-aware link traversal"),
-        ("aggregate", "Count objects of a type"),
-        ("list_missing_evidence", "Missing and stale fields for an object"),
+        ("aggregate", "Count members of an object set"),
+        (
+            "list_missing_evidence",
+            "Missing and stale fields for an object",
+        ),
         ("describe_action", "Projected Action card"),
         ("submit_action", "Submit a predefined Action"),
         ("list_inbox", "Pending proposals as objects"),
-        ("confirm_action", "Confirm a pending proposal (TOCTOU revalidation)"),
-        ("override_action", "Categorized override of a pending proposal"),
+        (
+            "confirm_action",
+            "Confirm a pending proposal (TOCTOU revalidation)",
+        ),
+        (
+            "override_action",
+            "Categorized override of a pending proposal",
+        ),
         ("get_decision_record", "Replayable decision dossier"),
         ("get_rejection", "Structured rejection reasons"),
-        ("funnel_ingest", "Event-path ingest; never overwrites ActionWritten"),
+        (
+            "funnel_ingest",
+            "Event-path ingest; never overwrites ActionWritten",
+        ),
         ("create_link", "Create a named link between instances"),
     ]
     .into_iter()

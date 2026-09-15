@@ -15,6 +15,7 @@ Inspirado em Zhang, *Operational Ontology: From Business Mirror to Decision Runt
 - Instâncias são versionadas (Zhang 2026, Ch. 5): cada escrita de propriedades **acrescenta** um `VersionSpan` (valid time + transaction time). `get_object(id)` lê a versão aberta; `get_object(id, as_of)` reconstrói o objeto no tempo válido. Ponta aberta é `None`. Não há overwrite in-place na tabela `objects`.
 - `DecisionRecord.data_snapshot` pina os objetos lidos nos guards, mais `rule_version`, `function_version` (digest das funções invocadas) e `engine_version`.
 - Inbox é objeto, não tela. Confirmar/vetar é Action.
+- **OSS:** `ObjectSet` é spec tipada (tipo + filtro + nome opcional), não uma lista de ids. `search_objects` avalia o conjunto depois do filtro de permissão. Conjuntos nomeados nascem num branch de builder (`create_object_set`) e só aparecem no `main` depois do merge. Conjunto vazio é `Ok([])`. `aggregate` conta o conjunto filtrado.
 
 ## Crates
 
