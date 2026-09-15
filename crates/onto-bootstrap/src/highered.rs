@@ -2,8 +2,8 @@
 //!
 //! Course, Section, Student, Seat, Waitlist are OMS object types. Enrollment
 //! uses the same dual keys and seven-step write path as wastewater. A full
-//! section cannot Auto-enroll: `propose_enroll` is Propose, so it lands in the
-//! Review inbox. Supervisor confirm runs `approve_enroll`, which assigns the
+//! section cannot Auto-enroll: `propose_enroll` is Propose + Reviewable, so it
+//! lands in the Review inbox. Supervisor confirm runs `approve_enroll`, which assigns the
 //! Seat or Denies if `slots` is already 0. A second confirm on the same seat
 //! therefore cannot double-book. Compensation is `release_seat` (forward inverse).
 //!
@@ -200,7 +200,7 @@ pub fn define_highered(engine: &Engine, s: &Session, branch: &str) -> Result<()>
         },
     ];
 
-    // Full section: Propose, not Auto. Lands in the Review inbox.
+    // Full section: Propose + Reviewable, not Auto. Lands in the Review inbox.
     engine.create_action_type(
         s,
         branch,
@@ -215,8 +215,10 @@ pub fn define_highered(engine: &Engine, s: &Session, branch: &str) -> Result<()>
             compensation: Some("release_seat".into()),
             side_effects: json!({}),
             on_review: Some("join_waitlist".into()),
+            interfaces: vec![],
         },
     )?;
+    engine.attach_interface(s, branch, "propose_enroll", "Reviewable")?;
 
     // Confirm assigns the seat. lte_field claim vs seat.slots Denies a double-book.
     engine.create_action_type(
@@ -249,6 +251,7 @@ pub fn define_highered(engine: &Engine, s: &Session, branch: &str) -> Result<()>
             compensation: Some("release_seat".into()),
             side_effects: json!({ "registrar": "assign_seat", "idempotent": true }),
             on_review: Some("join_waitlist".into()),
+            interfaces: vec![],
         },
     )?;
 
@@ -269,6 +272,7 @@ pub fn define_highered(engine: &Engine, s: &Session, branch: &str) -> Result<()>
             compensation: None,
             side_effects: json!({ "registrar": "release_seat", "idempotent": true }),
             on_review: None,
+            interfaces: vec![],
         },
     )?;
 
@@ -302,6 +306,7 @@ pub fn define_highered(engine: &Engine, s: &Session, branch: &str) -> Result<()>
             compensation: None,
             side_effects: json!({}),
             on_review: None,
+            interfaces: vec![],
         },
     )?;
 
@@ -342,6 +347,7 @@ pub fn define_highered(engine: &Engine, s: &Session, branch: &str) -> Result<()>
             compensation: None,
             side_effects: json!({}),
             on_review: None,
+            interfaces: vec![],
         },
     )?;
 
