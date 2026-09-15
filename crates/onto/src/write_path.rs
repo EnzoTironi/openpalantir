@@ -235,7 +235,7 @@ pub fn pin_version(label: &str, body: &str) -> String {
 pub fn resolve_idempotency_key(action: &str, actor: &str, params: &Value) -> String {
     if let Some(k) = params.get("idempotency_key").and_then(|v| v.as_str()) {
         if !k.is_empty() {
-            return k.to_string();
+            return format!("{action}:{actor}:{k}");
         }
     }
     pin_version(&format!("{action}:{actor}"), &params.to_string())
@@ -385,7 +385,7 @@ mod tests {
             "ops.chen",
             &json!({ "idempotency_key": "setpoint:tank-1:once", "target_do": 2.5 }),
         );
-        assert_eq!(key, "setpoint:tank-1:once");
+        assert_eq!(key, "approve_setpoint_change:ops.chen:setpoint:tank-1:once");
     }
 
     #[test]

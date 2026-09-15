@@ -669,7 +669,10 @@ fn does_not_double_apply_if_idempotency_key_repeats() {
     let rec = engine
         .get_decision_record(&operator(), first.decision_record_id.as_deref().unwrap())
         .unwrap();
-    assert_eq!(rec.effects["idempotency_key"], "setpoint:tank-1:2.6");
+    assert_eq!(
+        rec.effects["idempotency_key"],
+        "approve_setpoint_change:ops.chen:setpoint:tank-1:2.6"
+    );
     assert_eq!(rec.proof_trace, WritePathStep::ALL.to_vec());
 }
 
