@@ -11,7 +11,7 @@ use crate::error::{OntoError, Result};
 use crate::types::new_id;
 use rusqlite::{params, Connection, OptionalExtension};
 
-pub const SCHEMA: &str = r#"
+pub const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS object_versions (
     version_id TEXT PRIMARY KEY,
     object_id TEXT NOT NULL,
@@ -27,7 +27,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS object_versions_one_open
 ON object_versions(object_id) WHERE valid_to IS NULL AND tx_to IS NULL;
 CREATE INDEX IF NOT EXISTS object_versions_by_object
 ON object_versions(object_id, valid_from);
-"#;
+";
 
 /// Valid-time clock for a read. `Current` is the open version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +47,7 @@ pub struct VersionSpan {
 
 impl VersionSpan {
     /// First (or successor) current version: open `valid_to` and open `tx_to`.
+    #[must_use]
     pub fn current(at: i64) -> Self {
         Self {
             valid_from: at,
@@ -56,13 +57,15 @@ impl VersionSpan {
         }
     }
 
+    #[must_use]
     pub fn is_open(&self) -> bool {
         self.valid_to.is_none() && self.tx_to.is_none()
     }
 
     /// Half-open valid coverage: `valid_from <= t < valid_to`, or open end.
+    #[must_use]
     pub fn covers_valid(&self, t: i64) -> bool {
-        self.valid_from <= t && self.valid_to.map(|end| t < end).unwrap_or(true)
+        self.valid_from <= t && self.valid_to.is_none_or(|end| t < end)
     }
 
     /// Close this open version at `at` and return `(closed, successor open)`.
@@ -279,11 +282,7 @@ fn load_at_valid(conn: &Connection, id: &str, t: i64) -> Result<LoadedVersion> {
         row_to_loaded,
     )
     .optional()?
-    .ok_or_else(|| {
-        OntoError::NotFound(format!(
-            "object {id} has no version covering as_of {t}"
-        ))
-    })
+    .ok_or_else(|| OntoError::NotFound(format!("object {id} has no version covering as_of {t}")))
 }
 
 fn row_to_loaded(r: &rusqlite::Row<'_>) -> rusqlite::Result<LoadedVersion> {
@@ -310,14 +309,14 @@ mod tests {
     fn mem() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            r#"
+            r"
             PRAGMA foreign_keys = ON;
             CREATE TABLE objects (
                 id TEXT PRIMARY KEY,
                 type_name TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
-            "#,
+            ",
         )
         .unwrap();
         conn.execute_batch(SCHEMA).unwrap();

@@ -8,178 +8,44 @@ use crate::oss::{
     OBJECT_SETS_TABLE,
 };
 use crate::security::{authorize, filter_view, AuthzDecision, AuthzOp, PolicySpec, POLICIES_TABLE};
+use crate::store::{DecisionWrite, SqliteStore, Store};
 use crate::tiers::{self, AutoBound, RiskBand};
+#[allow(clippy::wildcard_imports)] // engine is the OMS wiring hub over types
 use crate::types::*;
 use crate::write_path::{pin_version, resolve_idempotency_key, StagedOp, WritePath};
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 
+/// Coordinates OMS syscalls. Persistence is [`Store`], not this type's fields.
 pub struct Engine {
-    db: Mutex<Connection>,
-    clock: Mutex<i64>,
+    store: SqliteStore,
+    clock: AtomicI64,
 }
 
 impl Engine {
     pub fn memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        let engine = Self {
-            db: Mutex::new(conn),
-            clock: Mutex::new(1_700_000_000),
-        };
-        engine.init()?;
-        Ok(engine)
+        Ok(Self {
+            store: SqliteStore::memory()?,
+            clock: AtomicI64::new(1_700_000_000),
+        })
     }
 
     pub fn open(path: &str) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        let engine = Self {
-            db: Mutex::new(conn),
-            clock: Mutex::new(1_700_000_000),
-        };
-        engine.init()?;
-        Ok(engine)
+        Ok(Self {
+            store: SqliteStore::open(path)?,
+            clock: AtomicI64::new(1_700_000_000),
+        })
     }
 
     pub fn set_clock(&self, secs: i64) {
-        *self.clock.lock().expect("clock") = secs;
+        self.clock.store(secs, Ordering::SeqCst);
     }
 
+    #[must_use]
     pub fn now(&self) -> i64 {
-        *self.clock.lock().expect("clock")
-    }
-
-    fn init(&self) -> Result<()> {
-        let db = self.db.lock().expect("db");
-        db.execute_batch(
-            r#"
-            PRAGMA foreign_keys = ON;
-            CREATE TABLE IF NOT EXISTS branches (
-                name TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                created_by TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS schema_value_types (
-                branch TEXT NOT NULL,
-                name TEXT NOT NULL,
-                spec TEXT NOT NULL,
-                PRIMARY KEY (branch, name)
-            );
-            CREATE TABLE IF NOT EXISTS schema_object_types (
-                branch TEXT NOT NULL,
-                name TEXT NOT NULL,
-                spec TEXT NOT NULL,
-                PRIMARY KEY (branch, name)
-            );
-            CREATE TABLE IF NOT EXISTS schema_link_types (
-                branch TEXT NOT NULL,
-                name TEXT NOT NULL,
-                spec TEXT NOT NULL,
-                PRIMARY KEY (branch, name)
-            );
-            CREATE TABLE IF NOT EXISTS schema_interfaces (
-                branch TEXT NOT NULL,
-                name TEXT NOT NULL,
-                spec TEXT NOT NULL,
-                PRIMARY KEY (branch, name)
-            );
-            CREATE TABLE IF NOT EXISTS schema_action_types (
-                branch TEXT NOT NULL,
-                name TEXT NOT NULL,
-                spec TEXT NOT NULL,
-                PRIMARY KEY (branch, name)
-            );
-            CREATE TABLE IF NOT EXISTS schema_functions (
-                branch TEXT NOT NULL,
-                name TEXT NOT NULL,
-                spec TEXT NOT NULL,
-                PRIMARY KEY (branch, name)
-            );
-            CREATE TABLE IF NOT EXISTS schema_object_sets (
-                branch TEXT NOT NULL,
-                name TEXT NOT NULL,
-                spec TEXT NOT NULL,
-                PRIMARY KEY (branch, name)
-            );
-            CREATE TABLE IF NOT EXISTS schema_policies (
-                branch TEXT NOT NULL,
-                name TEXT NOT NULL,
-                spec TEXT NOT NULL,
-                PRIMARY KEY (branch, name)
-            );
-            CREATE TABLE IF NOT EXISTS proposals (
-                id TEXT PRIMARY KEY,
-                branch TEXT NOT NULL,
-                status TEXT NOT NULL,
-                submitted_by TEXT,
-                reviewed_by TEXT,
-                created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS objects (
-                id TEXT PRIMARY KEY,
-                type_name TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS links (
-                id TEXT PRIMARY KEY,
-                type_name TEXT NOT NULL,
-                from_id TEXT NOT NULL,
-                to_id TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS inbox (
-                id TEXT PRIMARY KEY,
-                action_name TEXT NOT NULL,
-                proposed_by TEXT NOT NULL,
-                params TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS decision_records (
-                id TEXT PRIMARY KEY,
-                action_name TEXT NOT NULL,
-                actor TEXT NOT NULL,
-                confirmer TEXT,
-                verdict TEXT NOT NULL,
-                params TEXT NOT NULL,
-                guard_results TEXT NOT NULL,
-                effects TEXT NOT NULL,
-                rule_version TEXT NOT NULL,
-                function_version TEXT NOT NULL,
-                engine_version TEXT NOT NULL,
-                data_snapshot TEXT NOT NULL,
-                proof_trace TEXT NOT NULL DEFAULT '[]',
-                created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS side_effect_keys (
-                idempotency_key TEXT PRIMARY KEY,
-                decision_record_id TEXT NOT NULL,
-                action_name TEXT NOT NULL,
-                outcome TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id TEXT PRIMARY KEY,
-                at INTEGER NOT NULL,
-                actor TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                payload TEXT NOT NULL
-            );
-            "#,
-        )?;
-        db.execute_batch(bitemporal::SCHEMA)?;
-        let _ = db.execute(
-            "ALTER TABLE decision_records ADD COLUMN proof_trace TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        db.execute(
-            "INSERT OR IGNORE INTO branches(name, status, created_by, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![MAIN_BRANCH, "merged", "kernel", 0],
-        )?;
-        crate::kernel::install(&db, 1_700_000_000)?;
-        Ok(())
+        self.clock.load(Ordering::SeqCst)
     }
 
     fn require_builder(session: &Session) -> Result<()> {
@@ -200,15 +66,12 @@ impl Engine {
         }
     }
 
-    fn audit(&self, actor: &str, kind: &str, payload: Value) -> Result<()> {
-        let db = self.db.lock().expect("db");
-        db.execute(
-            "INSERT INTO audit_log(id, at, actor, kind, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![new_id(), self.now(), actor, kind, payload.to_string()],
-        )?;
-        Ok(())
+    fn audit(&self, actor: &str, kind: &str, payload: &Value) -> Result<()> {
+        self.store
+            .insert_audit(&new_id(), self.now(), actor, kind, &payload.to_string())
     }
 
+    #[must_use]
     pub fn kernel_types() -> &'static [&'static str] {
         KERNEL_TYPES
     }
@@ -218,53 +81,17 @@ impl Engine {
         if name == MAIN_BRANCH {
             return Err(OntoError::Invalid("cannot reopen main".into()));
         }
-        {
-            let db = self.db.lock().expect("db");
-            let exists: Option<String> = db
-                .query_row(
-                    "SELECT status FROM branches WHERE name = ?1",
-                    params![name],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(status) = exists {
-                if status == "open" {
-                    return Ok(name.to_string());
-                }
-                return Err(OntoError::Conflict(format!("branch {name} is {status}")));
+        if let Some(status) = self.store.branch_status(name)? {
+            if status == "open" {
+                return Ok(name.to_string());
             }
-            db.execute(
-                "INSERT INTO branches(name, status, created_by, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![name, "open", session.actor.id, self.now()],
-            )?;
+            return Err(OntoError::Conflict(format!("branch {name} is {status}")));
         }
-        self.copy_schema(MAIN_BRANCH, name)?;
-        self.audit(&session.actor.id, "open_branch", json!({ "branch": name }))?;
+        self.store
+            .insert_open_branch(name, &session.actor.id, self.now())?;
+        self.store.copy_schema(MAIN_BRANCH, name)?;
+        self.audit(&session.actor.id, "open_branch", &json!({ "branch": name }))?;
         Ok(name.to_string())
-    }
-
-    fn copy_schema(&self, from: &str, to: &str) -> Result<()> {
-        let tables = [
-            "schema_value_types",
-            "schema_object_types",
-            "schema_link_types",
-            "schema_interfaces",
-            "schema_action_types",
-            "schema_functions",
-            OBJECT_SETS_TABLE,
-            POLICIES_TABLE,
-        ];
-        let db = self.db.lock().expect("db");
-        for table in tables {
-            db.execute(
-                &format!(
-                    "INSERT OR REPLACE INTO {table}(branch, name, spec)
-                     SELECT ?1, name, spec FROM {table} WHERE branch = ?2"
-                ),
-                params![to, from],
-            )?;
-        }
-        Ok(())
     }
 
     fn require_open_branch(&self, branch: &str) -> Result<()> {
@@ -273,14 +100,9 @@ impl Engine {
                 "mutate schema on a working branch, not main".into(),
             ));
         }
-        let db = self.db.lock().expect("db");
-        let status: String = db
-            .query_row(
-                "SELECT status FROM branches WHERE name = ?1",
-                params![branch],
-                |r| r.get(0),
-            )
-            .optional()?
+        let status = self
+            .store
+            .branch_status(branch)?
             .ok_or_else(|| OntoError::NotFound(format!("branch {branch}")))?;
         if status != "open" {
             return Err(OntoError::Conflict(format!("branch {branch} is {status}")));
@@ -288,18 +110,8 @@ impl Engine {
         Ok(())
     }
 
-    fn put_spec(
-        db: &Connection,
-        table: &str,
-        branch: &str,
-        name: &str,
-        spec: &Value,
-    ) -> Result<()> {
-        db.execute(
-            &format!("INSERT OR REPLACE INTO {table}(branch, name, spec) VALUES (?1, ?2, ?3)"),
-            params![branch, name, spec.to_string()],
-        )?;
-        Ok(())
+    fn put_spec(&self, table: &str, branch: &str, name: &str, spec: &Value) -> Result<()> {
+        self.store.put_spec(table, branch, name, &spec.to_string())
     }
 
     pub fn create_value_type(
@@ -310,9 +122,7 @@ impl Engine {
     ) -> Result<String> {
         Self::require_builder(session)?;
         self.require_open_branch(branch)?;
-        let db = self.db.lock().expect("db");
-        Self::put_spec(
-            &db,
+        self.put_spec(
             "schema_value_types",
             branch,
             &spec.name,
@@ -329,9 +139,7 @@ impl Engine {
     ) -> Result<String> {
         Self::require_builder(session)?;
         self.require_open_branch(branch)?;
-        let db = self.db.lock().expect("db");
-        Self::put_spec(
-            &db,
+        self.put_spec(
             "schema_functions",
             branch,
             &spec.name,
@@ -351,9 +159,7 @@ impl Engine {
         if KERNEL_TYPES.contains(&spec.name.as_str()) {
             return Err(OntoError::Invalid("kernel type name is reserved".into()));
         }
-        let db = self.db.lock().expect("db");
-        Self::put_spec(
-            &db,
+        self.put_spec(
             "schema_object_types",
             branch,
             &spec.name,
@@ -388,9 +194,7 @@ impl Engine {
             )));
         }
         spec.properties.push(prop);
-        let db = self.db.lock().expect("db");
-        Self::put_spec(
-            &db,
+        self.put_spec(
             "schema_object_types",
             branch,
             type_name,
@@ -413,9 +217,7 @@ impl Engine {
             Some(existing) => *existing = prop,
             None => spec.properties.push(prop),
         }
-        let db = self.db.lock().expect("db");
-        Self::put_spec(
-            &db,
+        self.put_spec(
             "schema_object_types",
             branch,
             type_name,
@@ -432,12 +234,8 @@ impl Engine {
     ) -> Result<()> {
         Self::require_builder(session)?;
         self.require_open_branch(branch)?;
-        let db = self.db.lock().expect("db");
-        db.execute(
-            "DELETE FROM schema_object_types WHERE branch = ?1 AND name = ?2",
-            params![branch, type_name],
-        )?;
-        Ok(())
+        self.store
+            .delete_spec("schema_object_types", branch, type_name)
     }
 
     pub fn create_link_type(
@@ -448,9 +246,7 @@ impl Engine {
     ) -> Result<String> {
         Self::require_builder(session)?;
         self.require_open_branch(branch)?;
-        let db = self.db.lock().expect("db");
-        Self::put_spec(
-            &db,
+        self.put_spec(
             "schema_link_types",
             branch,
             &spec.name,
@@ -476,9 +272,7 @@ impl Engine {
     ) -> Result<String> {
         Self::require_builder(session)?;
         self.require_open_branch(branch)?;
-        let db = self.db.lock().expect("db");
-        Self::put_spec(
-            &db,
+        self.put_spec(
             "schema_interfaces",
             branch,
             &spec.name,
@@ -501,30 +295,24 @@ impl Engine {
                 if !spec.interfaces.iter().any(|i| i == interface) {
                     spec.interfaces.push(interface.to_string());
                 }
-                let db = self.db.lock().expect("db");
-                Self::put_spec(
-                    &db,
+                self.put_spec(
                     "schema_object_types",
                     branch,
                     type_name,
                     &serde_json::to_value(&spec)?,
-                )?;
-                Ok(())
+                )
             }
             Err(OntoError::NotFound(_)) => {
                 let mut spec = self.load_action_type(branch, type_name)?;
                 if !spec.interfaces.iter().any(|i| i == interface) {
                     spec.interfaces.push(interface.to_string());
                 }
-                let db = self.db.lock().expect("db");
-                Self::put_spec(
-                    &db,
+                self.put_spec(
                     "schema_action_types",
                     branch,
                     type_name,
                     &serde_json::to_value(&spec)?,
-                )?;
-                Ok(())
+                )
             }
             Err(e) => Err(e),
         }
@@ -538,9 +326,7 @@ impl Engine {
     ) -> Result<String> {
         Self::require_builder(session)?;
         self.require_open_branch(branch)?;
-        let db = self.db.lock().expect("db");
-        Self::put_spec(
-            &db,
+        self.put_spec(
             "schema_action_types",
             branch,
             &spec.name,
@@ -562,15 +348,9 @@ impl Engine {
         Self::require_builder(session)?;
         self.require_open_branch(branch)?;
         let id = new_id();
-        let db = self.db.lock().expect("db");
-        db.execute(
-            "UPDATE branches SET status = 'proposed' WHERE name = ?1",
-            params![branch],
-        )?;
-        db.execute(
-            "INSERT INTO proposals(id, branch, status, submitted_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, branch, "under_review", session.actor.id, self.now()],
-        )?;
+        self.store.set_branch_status(branch, "proposed")?;
+        self.store
+            .insert_proposal(&id, branch, &session.actor.id, self.now())?;
         Ok(id)
     }
 
@@ -584,29 +364,17 @@ impl Engine {
         if !session.actor.has_role("reviewer") {
             return Err(OntoError::Denied("reviewer role required".into()));
         }
-        let db = self.db.lock().expect("db");
-        let (branch, status): (String, String) = db.query_row(
-            "SELECT branch, status FROM proposals WHERE id = ?1",
-            params![proposal_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        let (branch, status) = self.store.proposal_branch_status(proposal_id)?;
         if status != "under_review" {
             return Err(OntoError::Conflict(format!("proposal is {status}")));
         }
         if approve {
-            db.execute(
-                "UPDATE proposals SET status = 'approved', reviewed_by = ?1 WHERE id = ?2",
-                params![session.actor.id, proposal_id],
-            )?;
+            self.store
+                .set_proposal(proposal_id, "approved", Some(&session.actor.id))?;
         } else {
-            db.execute(
-                "UPDATE proposals SET status = 'rejected', reviewed_by = ?1 WHERE id = ?2",
-                params![session.actor.id, proposal_id],
-            )?;
-            db.execute(
-                "UPDATE branches SET status = 'rejected' WHERE name = ?1",
-                params![branch],
-            )?;
+            self.store
+                .set_proposal(proposal_id, "rejected", Some(&session.actor.id))?;
+            self.store.set_branch_status(&branch, "rejected")?;
         }
         Ok(())
     }
@@ -616,65 +384,20 @@ impl Engine {
         if !session.actor.has_role("reviewer") {
             return Err(OntoError::Denied("reviewer role required".into()));
         }
-        let branch = {
-            let db = self.db.lock().expect("db");
-            let (branch, status): (String, String) = db.query_row(
-                "SELECT branch, status FROM proposals WHERE id = ?1",
-                params![proposal_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            if status != "approved" {
-                return Err(OntoError::Conflict(
-                    "proposal must be approved before merge".into(),
-                ));
-            }
-            branch
-        };
-        self.replace_main_schema(&branch)?;
-        {
-            let db = self.db.lock().expect("db");
-            db.execute(
-                "UPDATE proposals SET status = 'merged' WHERE id = ?1",
-                params![proposal_id],
-            )?;
-            db.execute(
-                "UPDATE branches SET status = 'merged' WHERE name = ?1",
-                params![branch],
-            )?;
+        let (branch, status) = self.store.proposal_branch_status(proposal_id)?;
+        if status != "approved" {
+            return Err(OntoError::Conflict(
+                "proposal must be approved before merge".into(),
+            ));
         }
+        self.store.replace_main_schema(&branch)?;
+        self.store.set_proposal(proposal_id, "merged", None)?;
+        self.store.set_branch_status(&branch, "merged")?;
         self.audit(
             &session.actor.id,
             "merge_to_main",
-            json!({ "proposal": proposal_id, "branch": branch }),
+            &json!({ "proposal": proposal_id, "branch": branch }),
         )?;
-        Ok(())
-    }
-
-    fn replace_main_schema(&self, from: &str) -> Result<()> {
-        let tables = [
-            "schema_value_types",
-            "schema_object_types",
-            "schema_link_types",
-            "schema_interfaces",
-            "schema_action_types",
-            "schema_functions",
-            OBJECT_SETS_TABLE,
-            POLICIES_TABLE,
-        ];
-        let db = self.db.lock().expect("db");
-        for table in tables {
-            db.execute(
-                &format!("DELETE FROM {table} WHERE branch = ?1"),
-                params![MAIN_BRANCH],
-            )?;
-            db.execute(
-                &format!(
-                    "INSERT INTO {table}(branch, name, spec)
-                     SELECT ?1, name, spec FROM {table} WHERE branch = ?2"
-                ),
-                params![MAIN_BRANCH, from],
-            )?;
-        }
         Ok(())
     }
 
@@ -702,68 +425,49 @@ impl Engine {
     }
 
     fn load_all<T: for<'de> DeserializeOwned>(&self, branch: &str, table: &str) -> Result<Vec<T>> {
-        let db = self.db.lock().expect("db");
-        let mut stmt = db.prepare(&format!(
-            "SELECT spec FROM {table} WHERE branch = ?1 ORDER BY name"
-        ))?;
-        let rows = stmt.query_map(params![branch], |r| r.get::<_, String>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(serde_json::from_str(&row?)?);
-        }
-        Ok(out)
+        self.store
+            .load_specs(branch, table)?
+            .iter()
+            .map(|s| serde_json::from_str(s).map_err(Into::into))
+            .collect()
+    }
+
+    fn load_named<T: for<'de> DeserializeOwned>(
+        &self,
+        table: &str,
+        branch: &str,
+        name: &str,
+        missing: impl FnOnce() -> String,
+    ) -> Result<T> {
+        let spec = self
+            .store
+            .load_spec(table, branch, name)?
+            .ok_or_else(|| OntoError::NotFound(missing()))?;
+        Ok(serde_json::from_str(&spec)?)
     }
 
     fn load_object_type(&self, branch: &str, name: &str) -> Result<ObjectTypeSpec> {
-        let db = self.db.lock().expect("db");
-        let spec: String = db
-            .query_row(
-                "SELECT spec FROM schema_object_types WHERE branch = ?1 AND name = ?2",
-                params![branch, name],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| OntoError::NotFound(format!("object type {name} on {branch}")))?;
-        Ok(serde_json::from_str(&spec)?)
-    }
-
-    fn load_interface(&self, branch: &str, name: &str) -> Result<InterfaceSpec> {
-        let db = self.db.lock().expect("db");
-        let spec: String = db
-            .query_row(
-                "SELECT spec FROM schema_interfaces WHERE branch = ?1 AND name = ?2",
-                params![branch, name],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| OntoError::NotFound(format!("interface {name} on {branch}")))?;
-        Ok(serde_json::from_str(&spec)?)
+        self.load_named("schema_object_types", branch, name, || {
+            format!("object type {name} on {branch}")
+        })
     }
 
     fn load_action_type(&self, branch: &str, name: &str) -> Result<ActionTypeSpec> {
-        let db = self.db.lock().expect("db");
-        let spec: String = db
-            .query_row(
-                "SELECT spec FROM schema_action_types WHERE branch = ?1 AND name = ?2",
-                params![branch, name],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| OntoError::NotFound(format!("action type {name}")))?;
-        Ok(serde_json::from_str(&spec)?)
+        self.load_named("schema_action_types", branch, name, || {
+            format!("action type {name}")
+        })
     }
 
     fn load_function(&self, branch: &str, name: &str) -> Result<FunctionSpec> {
-        let db = self.db.lock().expect("db");
-        let spec: String = db
-            .query_row(
-                "SELECT spec FROM schema_functions WHERE branch = ?1 AND name = ?2",
-                params![branch, name],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| OntoError::NotFound(format!("function {name} on {branch}")))?;
-        Ok(serde_json::from_str(&spec)?)
+        self.load_named("schema_functions", branch, name, || {
+            format!("function {name} on {branch}")
+        })
+    }
+
+    fn load_interface(&self, branch: &str, name: &str) -> Result<InterfaceSpec> {
+        self.load_named("schema_interfaces", branch, name, || {
+            format!("interface {name} on {branch}")
+        })
     }
 
     /// Pins functions whose derived output is present on objects actually read.
@@ -792,15 +496,11 @@ impl Engine {
     }
 
     fn load_value_type(&self, branch: &str, name: &str) -> Result<Option<ValueTypeSpec>> {
-        let db = self.db.lock().expect("db");
-        let spec: Option<String> = db
-            .query_row(
-                "SELECT spec FROM schema_value_types WHERE branch = ?1 AND name = ?2",
-                params![branch, name],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(spec.map(|s| serde_json::from_str(&s)).transpose()?)
+        Ok(self
+            .store
+            .load_spec("schema_value_types", branch, name)?
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?)
     }
 
     pub fn create_object_set(
@@ -812,9 +512,7 @@ impl Engine {
         Self::require_builder(session)?;
         self.require_open_branch(branch)?;
         spec.validate()?;
-        let db = self.db.lock().expect("db");
-        Self::put_spec(
-            &db,
+        self.put_spec(
             OBJECT_SETS_TABLE,
             branch,
             &spec.name,
@@ -832,9 +530,7 @@ impl Engine {
         Self::require_builder(session)?;
         self.require_open_branch(branch)?;
         spec.validate()?;
-        let db = self.db.lock().expect("db");
-        Self::put_spec(
-            &db,
+        self.put_spec(
             POLICIES_TABLE,
             branch,
             &spec.name,
@@ -888,6 +584,7 @@ impl Engine {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)] // owned Query is the public search card
     pub fn search_objects(&self, session: &Session, query: Query) -> Result<Vec<ObjectView>> {
         self.search_object_set(session, ObjectSet::from_query(&query))
     }
@@ -899,6 +596,7 @@ impl Engine {
         evaluate_members(&resolved, ids, |id| self.load_permitted_view(session, id))
     }
 
+    #[allow(clippy::needless_pass_by_value)] // owned ObjectSet is the public aggregate card
     pub fn aggregate_set(&self, session: &Session, set: ObjectSet) -> Result<Value> {
         Self::require_consumer(session)?;
         let resolved = self.resolve_object_set(set.unbounded())?;
@@ -907,7 +605,7 @@ impl Engine {
         Ok(json!({
             "type_name": resolved.type_name,
             "name": resolved.name,
-            "count": members.len() as i64
+            "count": i64::try_from(members.len()).unwrap_or(i64::MAX)
         }))
     }
 
@@ -920,33 +618,13 @@ impl Engine {
     }
 
     fn load_object_set_spec(&self, branch: &str, name: &str) -> Result<ObjectSetSpec> {
-        let db = self.db.lock().expect("db");
-        let spec: String = db
-            .query_row(
-                "SELECT spec FROM schema_object_sets WHERE branch = ?1 AND name = ?2",
-                params![branch, name],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| OntoError::NotFound(format!("object set {name} on {branch}")))?;
-        Ok(serde_json::from_str(&spec)?)
+        self.load_named(OBJECT_SETS_TABLE, branch, name, || {
+            format!("object set {name} on {branch}")
+        })
     }
 
     fn candidate_ids(&self, type_name: Option<&str>) -> Result<Vec<String>> {
-        let db = self.db.lock().expect("db");
-        let ids = match type_name {
-            Some(t) => {
-                let mut stmt = db.prepare("SELECT id FROM objects WHERE type_name = ?1")?;
-                let rows = stmt.query_map(params![t], |r| r.get(0))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            None => {
-                let mut stmt = db.prepare("SELECT id FROM objects")?;
-                let rows = stmt.query_map([], |r| r.get(0))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            }
-        };
-        Ok(ids)
+        self.store.candidate_ids(type_name)
     }
 
     fn load_permitted_view(&self, session: &Session, id: &str) -> Result<ObjectView> {
@@ -962,7 +640,7 @@ impl Engine {
 
     /// Current version when `as_of` is [`AsOf::Current`]; otherwise the version
     /// whose valid span covers that time. Missing coverage is [`OntoError::NotFound`],
-    /// not a silent current row. Property-level Deny hides the property.
+    /// not a silent current row. Property-level `Deny` hides the property.
     pub fn get_object(&self, session: &Session, id: &str, as_of: AsOf) -> Result<ObjectView> {
         Self::require_consumer(session)?;
         let view = self.load_object_view(id, as_of)?;
@@ -978,17 +656,13 @@ impl Engine {
         }
     }
 
-    /// Spans for one identity, oldest valid_from first.
+    /// Spans for one identity, oldest `valid_from` first.
     pub fn object_spans(&self, id: &str) -> Result<Vec<bitemporal::VersionSpan>> {
-        let db = self.db.lock().expect("db");
-        bitemporal::list_spans(&db, id)
+        self.store.list_spans(id)
     }
 
     fn load_object_view(&self, id: &str, as_of: AsOf) -> Result<ObjectView> {
-        let loaded = {
-            let db = self.db.lock().expect("db");
-            bitemporal::load(&db, id, as_of)?
-        };
+        let loaded = self.store.load_version(id, as_of)?;
         let clock = match as_of {
             AsOf::Current => self.now(),
             AsOf::Valid(t) => t,
@@ -1075,16 +749,8 @@ impl Engine {
             .link_types
             .iter()
             .find(|l| l.name == link_type)
-            .map(|l| l.allow_cycles)
-            .unwrap_or(false);
-        let db = self.db.lock().expect("db");
-        let mut stmt =
-            db.prepare("SELECT to_id FROM links WHERE from_id = ?1 AND type_name = ?2")?;
-        let targets: Vec<String> = stmt
-            .query_map(params![from_id, link_type], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-        drop(db);
+            .is_some_and(|l| l.allow_cycles);
+        let targets = self.store.link_targets(from_id, link_type)?;
         let mut visited = HashSet::from([from_id.to_string()]);
         let mut out = Vec::new();
         for tid in targets {
@@ -1133,7 +799,7 @@ impl Engine {
         self.audit(
             &session.actor.id,
             "funnel_ingest",
-            json!({ "count": ids.len() }),
+            &json!({ "count": ids.len() }),
         )?;
         Ok(ids)
     }
@@ -1142,26 +808,21 @@ impl Engine {
         let spec = self.load_object_type(MAIN_BRANCH, &rec.type_name)?;
         let as_of = rec.as_of.clone().unwrap_or_else(|| self.now().to_string());
         let id = rec.id.clone().unwrap_or_else(new_id);
-        let existing = {
-            let db = self.db.lock().expect("db");
-            if bitemporal::identity_exists(&db, &id)? {
-                Some(bitemporal::current_properties(&db, &id)?)
-            } else {
-                None
-            }
+        let existing = if self.store.identity_exists(&id)? {
+            Some(self.store.current_properties(&id)?)
+        } else {
+            None
         };
-        let mut props: BTreeMap<String, PropertyView> = existing
-            .as_ref()
-            .map(|s| serde_json::from_str(s))
-            .transpose()?
-            .unwrap_or_default();
+        let mut props: BTreeMap<String, PropertyView> = match existing.as_ref() {
+            Some(s) => serde_json::from_str(s)?,
+            None => BTreeMap::new(),
+        };
         for (name, value) in rec.properties {
             let source = spec
                 .properties
                 .iter()
                 .find(|p| p.name == name)
-                .map(|p| p.source)
-                .unwrap_or(PropertySource::Mapped);
+                .map_or(PropertySource::Mapped, |p| p.source);
             if source == PropertySource::ActionWritten {
                 continue;
             }
@@ -1186,7 +847,7 @@ impl Engine {
         let title = spec.title_prop.as_ref().and_then(|t| {
             props
                 .get(t)
-                .and_then(|p| p.value.as_str().map(|s| s.to_string()))
+                .and_then(|p| p.value.as_str().map(str::to_string))
         });
         let encoded = serde_json::to_string(&props)?;
         let at = rec
@@ -1194,11 +855,12 @@ impl Engine {
             .as_ref()
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or_else(|| self.now());
-        let db = self.db.lock().expect("db");
         if existing.is_some() {
-            bitemporal::append_version(&db, &id, &encoded, title.as_deref(), at)?;
+            self.store
+                .append_version(&id, &encoded, title.as_deref(), at)?;
         } else {
-            bitemporal::insert_object(&db, &id, &rec.type_name, title.as_deref(), &encoded, at)?;
+            self.store
+                .insert_object(&id, &rec.type_name, title.as_deref(), &encoded, at)?;
         }
         Ok(id)
     }
@@ -1206,25 +868,7 @@ impl Engine {
     pub fn list_inbox(&self, session: &Session) -> Result<Vec<InboxItem>> {
         Self::require_consumer(session)?;
         tiers::require_syscall(session.actor.tier, "list_inbox")?;
-        let db = self.db.lock().expect("db");
-        let mut stmt = db.prepare(
-            "SELECT id, action_name, proposed_by, params, status, created_at FROM inbox ORDER BY created_at",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(InboxItem {
-                id: r.get(0)?,
-                action_name: r.get(1)?,
-                proposed_by: r.get(2)?,
-                params: serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or(Value::Null),
-                status: r.get(4)?,
-                created_at: r.get::<_, i64>(5)?.to_string(),
-            })
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        self.store.list_inbox()
     }
 
     pub fn describe_action(&self, session: &Session, name: &str) -> Result<ActionTypeSpec> {
@@ -1258,6 +902,7 @@ impl Engine {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)] // params is the public JSON card
     pub fn submit_action(
         &self,
         session: &Session,
@@ -1267,14 +912,15 @@ impl Engine {
         Self::require_consumer(session)?;
         tiers::require_syscall(session.actor.tier, "submit_action")?;
         let spec = self.load_action_type(MAIN_BRANCH, action_name)?;
-        self.execute_action(session, &spec, params, None)
+        self.execute_action(session, &spec, &params, None)
     }
 
-    /// Submit the named inverse Action for an Allow DecisionRecord.
+    /// Submit the named inverse Action for an `Allow` `DecisionRecord`.
     ///
-    /// The original record is left in place. A new DecisionRecord is sealed
+    /// The original record is left in place. A new `DecisionRecord` is sealed
     /// through [`Self::execute_action`]. Missing compensation is
     /// [`OntoError::NoCompensation`], not a silent success.
+    #[allow(clippy::needless_pass_by_value)] // overlay is the public param object
     pub fn compensate_action(
         &self,
         session: &Session,
@@ -1288,35 +934,27 @@ impl Engine {
         let Compensation::Inverse { action } = Compensation::from_spec(&original_spec)?;
         let spec = self.load_action_type(MAIN_BRANCH, &action)?;
         let params = compensation::inverse_params(&original, &overlay);
-        self.execute_action(session, &spec, params, None)
+        self.execute_action(session, &spec, &params, None)
     }
 
     pub fn confirm_action(&self, session: &Session, inbox_id: &str) -> Result<ActionOutcome> {
         Self::require_consumer(session)?;
         tiers::require_syscall(session.actor.tier, "confirm_action")?;
-        let (action_name, params, status, proposed_by): (String, String, String, String) = {
-            let db = self.db.lock().expect("db");
-            db.query_row(
-                "SELECT action_name, params, status, proposed_by FROM inbox WHERE id = ?1",
-                params![inbox_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )?
-        };
+        let (action_name, params, status, proposed_by) = self.store.load_inbox(inbox_id)?;
         tiers::require_distinct_confirmer(&session.actor.id, &proposed_by)?;
         if status != "pending" {
             return Err(OntoError::Conflict(format!("inbox item is {status}")));
         }
         let params: Value = serde_json::from_str(&params)?;
         let apply_name = action_name.replacen("propose_", "approve_", 1);
-        let spec = match self.load_action_type(MAIN_BRANCH, &apply_name) {
-            Ok(spec) => spec,
-            Err(_) => {
-                let mut spec = self.load_action_type(MAIN_BRANCH, &action_name)?;
-                spec.mode = ExecutionMode::Auto;
-                spec
-            }
+        let spec = if let Ok(spec) = self.load_action_type(MAIN_BRANCH, &apply_name) {
+            spec
+        } else {
+            let mut spec = self.load_action_type(MAIN_BRANCH, &action_name)?;
+            spec.mode = ExecutionMode::Auto;
+            spec
         };
-        let outcome = self.execute_action(session, &spec, params, Some(inbox_id))?;
+        let outcome = self.execute_action(session, &spec, &params, Some(inbox_id))?;
         Ok(outcome)
     }
 
@@ -1333,13 +971,7 @@ impl Engine {
             return Err(OntoError::Denied("override requires supervisor".into()));
         }
         let params = {
-            let db = self.db.lock().expect("db");
-            let (action_name, raw, status, proposed_by): (String, String, String, String) = db
-                .query_row(
-                    "SELECT action_name, params, status, proposed_by FROM inbox WHERE id = ?1",
-                    params![inbox_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                )?;
+            let (action_name, raw, status, proposed_by) = self.store.load_inbox(inbox_id)?;
             if status != "pending" {
                 return Err(OntoError::Conflict(format!("inbox item is {status}")));
             }
@@ -1351,15 +983,12 @@ impl Engine {
                 map.insert("source_action".into(), json!(action_name));
                 map.insert("proposed_by".into(), json!(proposed_by));
             }
-            db.execute(
-                "UPDATE inbox SET status = 'overridden' WHERE id = ?1",
-                params![inbox_id],
-            )?;
+            self.store.set_inbox_status(inbox_id, "overridden")?;
             p
         };
         let override_spec = self.load_action_type(MAIN_BRANCH, "override_setpoint").ok();
         if let Some(spec) = override_spec {
-            return self.execute_action(session, &spec, params, Some(inbox_id));
+            return self.execute_action(session, &spec, &params, Some(inbox_id));
         }
         let rec = self.persist_decision(
             session,
@@ -1415,42 +1044,7 @@ impl Engine {
 
     pub fn get_decision_record(&self, session: &Session, id: &str) -> Result<DecisionRecordView> {
         Self::require_consumer(session)?;
-        let db = self.db.lock().expect("db");
-        db.query_row(
-            "SELECT id, action_name, actor, confirmer, verdict, params, guard_results, effects, rule_version, function_version, engine_version, data_snapshot, created_at, COALESCE(proof_trace, '[]')
-             FROM decision_records WHERE id = ?1",
-            params![id],
-            |r| {
-                let verdict_raw: String = r.get(4)?;
-                let verdict = match verdict_raw.as_str() {
-                    "allow" => Verdict::Allow,
-                    "review" => Verdict::Review,
-                    "deny" => Verdict::Deny,
-                    _ => Verdict::Deny,
-                };
-                Ok(DecisionRecordView {
-                    id: r.get(0)?,
-                    action_name: r.get(1)?,
-                    actor: r.get(2)?,
-                    confirmer: r.get(3)?,
-                    verdict,
-                    params: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or(Value::Null),
-                    guard_results: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
-                    effects: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or(Value::Null),
-                    rule_version: r.get(8)?,
-                    function_version: r.get(9)?,
-                    engine_version: r.get(10)?,
-                    data_snapshot: serde_json::from_str(&r.get::<_, String>(11)?).unwrap_or(Value::Null),
-                    created_at: r.get::<_, i64>(12)?.to_string(),
-                    proof_trace: serde_json::from_str(&r.get::<_, String>(13).unwrap_or_else(|_| "[]".into()))
-                        .unwrap_or_default(),
-                })
-            },
-        )
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => OntoError::NotFound(format!("decision {id}")),
-            other => OntoError::Store(other.to_string()),
-        })
+        self.store.load_decision(id)
     }
 
     pub fn get_rejection(&self, session: &Session, decision_id: &str) -> Result<Value> {
@@ -1467,16 +1061,16 @@ impl Engine {
         &self,
         session: &Session,
         spec: &ActionTypeSpec,
-        params: Value,
+        params: &Value,
         confirmer_inbox: Option<&str>,
     ) -> Result<ActionOutcome> {
-        let key = resolve_idempotency_key(&spec.name, &session.actor.id, &params);
+        let key = resolve_idempotency_key(&spec.name, &session.actor.id, params);
         if let Some(cached) = self.load_cached_outcome(&key)? {
             return Ok(cached);
         }
 
         let path = WritePath::begin(key.clone());
-        match self.check_param_and_permission(session, spec, &params) {
+        match self.check_param_and_permission(session, spec, params) {
             Err(e) => Err(e),
             Ok(Err(auth)) => {
                 let path = path.param_and_permission(Vec::new()).abort_seal(
@@ -1487,29 +1081,27 @@ impl Engine {
                     }],
                     Verdict::Deny,
                 );
-                self.finish_abort(session, spec, &params, path, auth.reason, None)
+                self.finish_abort(session, spec, params, &path, auth.reason, None)
             }
             Ok(Ok(param_reads)) => {
                 let path = path.param_and_permission(param_reads);
-                let (mut guards, guard_reads) = self.evaluate_guards(&spec.guards, &params)?;
-                guards.extend(self.evidenced_guards(spec, &params)?);
+                let (mut guards, guard_reads) = self.evaluate_guards(&spec.guards, params)?;
+                guards.extend(self.evidenced_guards(spec, params)?);
                 let worst = worst_verdict(&guards);
                 let path = path.submission_criteria(guards, guard_reads, worst);
                 match worst {
                     Verdict::Deny | Verdict::Review => {
-                        let reason = path
-                            .guards
-                            .iter()
-                            .find(|g| g.verdict == worst)
-                            .map(|g| g.reason.clone())
-                            .unwrap_or_else(|| match worst {
+                        let reason = path.guards.iter().find(|g| g.verdict == worst).map_or_else(
+                            || match worst {
                                 Verdict::Deny => "denied".into(),
                                 Verdict::Review => "needs review".into(),
                                 Verdict::Allow => unreachable!("matched deny/review"),
-                            });
+                            },
+                            |g| g.reason.clone(),
+                        );
                         let alternative = spec.on_review.clone();
                         let path = path.discard_stage();
-                        self.finish_abort(session, spec, &params, path, reason, alternative)
+                        self.finish_abort(session, spec, params, &path, reason, alternative)
                     }
                     Verdict::Allow => {
                         self.finish_allow(session, spec, params, confirmer_inbox, path)
@@ -1546,7 +1138,7 @@ impl Engine {
         let mut reads = Vec::new();
         for p in &spec.parameters {
             if p.object_type.is_some() {
-                if let Some(id) = params.get(&p.name).and_then(|v| v.as_str()) {
+                if let Some(id) = params.get(&p.name).and_then(Value::as_str) {
                     reads.push(self.snapshot_object(id)?);
                 }
             }
@@ -1559,7 +1151,7 @@ impl Engine {
         session: &Session,
         spec: &ActionTypeSpec,
         params: &Value,
-        path: WritePath<crate::write_path::SealDecisionRecord>,
+        path: &WritePath<crate::write_path::SealDecisionRecord>,
         reason: String,
         alternative: Option<String>,
     ) -> Result<ActionOutcome> {
@@ -1568,11 +1160,7 @@ impl Engine {
             self.function_version_for_reads(&path.reads),
             ENGINE_VERSION.into(),
         );
-        let confirmer = match path.verdict {
-            Verdict::Deny => None,
-            Verdict::Review => None,
-            Verdict::Allow => None,
-        };
+        let confirmer = None;
         let effects = match path.verdict {
             Verdict::Review => json!({ "alternative": spec.on_review }),
             Verdict::Deny | Verdict::Allow => json!({}),
@@ -1605,11 +1193,11 @@ impl Engine {
         &self,
         session: &Session,
         spec: &ActionTypeSpec,
-        params: Value,
+        params: &Value,
         confirmer_inbox: Option<&str>,
         path: WritePath<crate::write_path::SubmissionCriteria>,
     ) -> Result<ActionOutcome> {
-        let (staged, inbox_id) = self.build_stage(session, spec, &params, confirmer_inbox)?;
+        let (staged, inbox_id) = self.build_stage(session, spec, params, confirmer_inbox)?;
         let path = path.stage(staged);
         let created = self.commit_staged(&path.staged)?;
         let path = path.commit(created.clone());
@@ -1644,7 +1232,7 @@ impl Engine {
             &spec.name,
             confirmer,
             Verdict::Allow,
-            &params,
+            params,
             &path.guards,
             effects,
             &snapshot,
@@ -1667,14 +1255,14 @@ impl Engine {
         self.audit(
             &session.actor.id,
             "side_effect",
-            json!({
+            &json!({
                 "idempotency_key": path.idempotency_key,
                 "action": spec.name,
                 "declaration": spec.side_effects,
                 "decision_record_id": rec,
             }),
         )?;
-        let _finished: WritePath<crate::write_path::DeclareSideEffects> = path;
+        let _: WritePath<crate::write_path::DeclareSideEffects> = path;
         Ok(outcome)
     }
 
@@ -1717,7 +1305,7 @@ impl Engine {
             }
             ExecutionMode::Auto | ExecutionMode::Approve => {
                 let mut ops = self.stage_effects(&spec.effects, params, &session.actor.id)?;
-                let inbox_id = confirmer_inbox.map(|s| s.to_string());
+                let inbox_id = confirmer_inbox.map(str::to_string);
                 if let Some(id) = &inbox_id {
                     ops.push(StagedOp::ConfirmInbox { id: id.clone() });
                 }
@@ -1741,7 +1329,7 @@ impl Engine {
                 continue;
             }
             let iface = self.load_interface(MAIN_BRANCH, KernelInterface::Evidenced.as_str())?;
-            let Some(id) = params.get(&p.name).and_then(|v| v.as_str()) else {
+            let Some(id) = params.get(&p.name).and_then(Value::as_str) else {
                 continue;
             };
             let view = self.load_object_view(id, AsOf::Current)?;
@@ -1830,6 +1418,7 @@ impl Engine {
         Ok((out, reads))
     }
 
+    #[allow(clippy::too_many_lines)] // closed JSON guard interpreter; arms stay one function
     fn eval_one_guard(
         &self,
         guard: &Value,
@@ -1839,10 +1428,10 @@ impl Engine {
         let obj = guard
             .as_object()
             .ok_or_else(|| OntoError::Invalid("guard must be object".into()))?;
-        if let Some(name) = obj.get("freshness").and_then(|v| v.as_str()) {
+        if let Some(name) = obj.get("freshness").and_then(Value::as_str) {
             let max = obj
                 .get("max_age_secs")
-                .and_then(|v| v.as_i64())
+                .and_then(Value::as_i64)
                 .unwrap_or(300);
             let id = param_str(params, name)?;
             let view = self.read_for_guard(&id, reads)?;
@@ -1853,7 +1442,7 @@ impl Engine {
                 .and_then(|p| {
                     p.as_of
                         .clone()
-                        .or_else(|| p.value.as_str().map(|s| s.to_string()))
+                        .or_else(|| p.value.as_str().map(str::to_string))
                         .or_else(|| p.value.as_i64().map(|n| n.to_string()))
                 });
             let Some(as_of) = as_of else {
@@ -1883,12 +1472,12 @@ impl Engine {
         if let Some(field) = obj.get("exists_field") {
             let object_param = obj
                 .get("object")
-                .and_then(|v| v.as_str())
+                .and_then(Value::as_str)
                 .ok_or_else(|| OntoError::Invalid("exists_field needs object".into()))?;
             let field = field.as_str().unwrap_or("");
             let id = param_str(params, object_param)?;
             let view = self.read_for_guard(&id, reads)?;
-            if view.properties.get(field).is_none() {
+            if !view.properties.contains_key(field) {
                 return Ok(GuardResult {
                     name: "complete".into(),
                     verdict: Verdict::Review,
@@ -1901,15 +1490,12 @@ impl Engine {
                 reason: "present".into(),
             });
         }
-        if let Some(param) = obj.get("lte_field").and_then(|v| v.as_str()) {
+        if let Some(param) = obj.get("lte_field").and_then(Value::as_str) {
             let object_param = obj
                 .get("object")
-                .and_then(|v| v.as_str())
+                .and_then(Value::as_str)
                 .unwrap_or("permit");
-            let field = obj
-                .get("field")
-                .and_then(|v| v.as_str())
-                .unwrap_or("do_max");
+            let field = obj.get("field").and_then(Value::as_str).unwrap_or("do_max");
             let n = param_f64(params, param)?;
             let permit_id = param_str(params, object_param)?;
             let view = self.read_for_guard(&permit_id, reads)?;
@@ -1931,10 +1517,10 @@ impl Engine {
                 reason: "within permit".into(),
             });
         }
-        if let Some(max) = obj.get("lte").and_then(|v| v.as_f64()) {
+        if let Some(max) = obj.get("lte").and_then(Value::as_f64) {
             let param = obj
                 .get("param")
-                .and_then(|v| v.as_str())
+                .and_then(Value::as_str)
                 .unwrap_or("target_do");
             let n = param_f64(params, param)?;
             if n > max {
@@ -1952,11 +1538,11 @@ impl Engine {
         }
         if let Some(days) = obj
             .get("max_days_since_calibration")
-            .and_then(|v| v.as_i64())
+            .and_then(Value::as_i64)
         {
             let object_param = obj
                 .get("object")
-                .and_then(|v| v.as_str())
+                .and_then(Value::as_str)
                 .unwrap_or("sensor");
             let id = param_str(params, object_param)?;
             let view = self.read_for_guard(&id, reads)?;
@@ -2002,9 +1588,9 @@ impl Engine {
             let obj = effect
                 .as_object()
                 .ok_or_else(|| OntoError::Invalid("effect must be object".into()))?;
-            if let Some(type_name) = obj.get("create").and_then(|v| v.as_str()) {
+            if let Some(type_name) = obj.get("create").and_then(Value::as_str) {
                 let mut props = BTreeMap::new();
-                if let Some(fields) = obj.get("properties").and_then(|v| v.as_object()) {
+                if let Some(fields) = obj.get("properties").and_then(Value::as_object) {
                     for (k, v) in fields {
                         let value = resolve_value(v, params);
                         props.insert(
@@ -2022,7 +1608,7 @@ impl Engine {
                 let title = props
                     .get("title")
                     .or_else(|| props.get("name"))
-                    .and_then(|p| p.value.as_str().map(|s| s.to_string()));
+                    .and_then(|p| p.value.as_str().map(str::to_string));
                 staged.push(StagedOp::InsertObject {
                     id: id.clone(),
                     type_name: type_name.into(),
@@ -2032,14 +1618,13 @@ impl Engine {
                 });
                 created.push(id);
             }
-            if let Some(target_param) = obj.get("update").and_then(|v| v.as_str()) {
+            if let Some(target_param) = obj.get("update").and_then(Value::as_str) {
                 let id = param_str(params, target_param)?;
                 let mut view_props = {
-                    let db = self.db.lock().expect("db");
-                    let raw = bitemporal::current_properties(&db, &id)?;
+                    let raw = self.store.current_properties(&id)?;
                     serde_json::from_str::<BTreeMap<String, PropertyView>>(&raw)?
                 };
-                if let Some(fields) = obj.get("properties").and_then(|v| v.as_object()) {
+                if let Some(fields) = obj.get("properties").and_then(Value::as_object) {
                     for (k, v) in fields {
                         let value = resolve_value(v, params);
                         view_props.insert(
@@ -2067,9 +1652,9 @@ impl Engine {
                 };
                 let from = param_str(
                     params,
-                    obj.get("from").and_then(|v| v.as_str()).unwrap_or("from"),
+                    obj.get("from").and_then(Value::as_str).unwrap_or("from"),
                 )?;
-                let to = if let Some(to_param) = obj.get("to").and_then(|v| v.as_str()) {
+                let to = if let Some(to_param) = obj.get("to").and_then(Value::as_str) {
                     param_str(params, to_param)?
                 } else if let Some(last) = created.last() {
                     last.clone()
@@ -2088,68 +1673,10 @@ impl Engine {
     }
 
     fn commit_staged(&self, ops: &[StagedOp]) -> Result<Vec<String>> {
-        let at = self.now();
-        let mut db = self.db.lock().expect("db");
-        let tx = db.transaction()?;
-        let mut created = Vec::new();
-        for op in ops {
-            match op {
-                StagedOp::InsertObject {
-                    id,
-                    type_name,
-                    title,
-                    properties,
-                    created_at,
-                } => {
-                    bitemporal::insert_object(
-                        &tx,
-                        id,
-                        type_name,
-                        title.as_deref(),
-                        properties,
-                        *created_at,
-                    )?;
-                    created.push(id.clone());
-                }
-                StagedOp::UpdateObject { id, properties } => {
-                    bitemporal::append_version(&tx, id, properties, None, at)?;
-                }
-                StagedOp::InsertLink {
-                    id,
-                    type_name,
-                    from_id,
-                    to_id,
-                } => {
-                    tx.execute(
-                        "INSERT INTO links(id, type_name, from_id, to_id) VALUES (?1, ?2, ?3, ?4)",
-                        params![id, type_name, from_id, to_id],
-                    )?;
-                }
-                StagedOp::InsertInbox {
-                    id,
-                    action_name,
-                    proposed_by,
-                    params: inbox_params,
-                    created_at,
-                } => {
-                    tx.execute(
-                        "INSERT INTO inbox(id, action_name, proposed_by, params, status, created_at)
-                         VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
-                        params![id, action_name, proposed_by, inbox_params, created_at],
-                    )?;
-                }
-                StagedOp::ConfirmInbox { id } => {
-                    tx.execute(
-                        "UPDATE inbox SET status = 'confirmed' WHERE id = ?1",
-                        params![id],
-                    )?;
-                }
-            }
-        }
-        tx.commit()?;
-        Ok(created)
+        self.store.commit_staged(ops, self.now())
     }
 
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)] // DecisionRecord columns
     fn persist_decision(
         &self,
         session: &Session,
@@ -2163,34 +1690,19 @@ impl Engine {
         trace: &[WritePathStep],
     ) -> Result<String> {
         let id = new_id();
-        let verdict_s = match verdict {
-            Verdict::Allow => "allow",
-            Verdict::Review => "review",
-            Verdict::Deny => "deny",
-        };
-        let db = self.db.lock().expect("db");
-        db.execute(
-            "INSERT INTO decision_records(
-                id, action_name, actor, confirmer, verdict, params, guard_results, effects,
-                rule_version, function_version, engine_version, data_snapshot, proof_trace, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![
-                id,
-                action,
-                session.actor.id,
-                confirmer,
-                verdict_s,
-                params.to_string(),
-                serde_json::to_string(guards)?,
-                effects.to_string(),
-                snapshot.rule_version,
-                snapshot.function_version,
-                snapshot.engine_version,
-                serde_json::to_string(snapshot)?,
-                serde_json::to_string(trace)?,
-                self.now()
-            ],
-        )?;
+        self.store.insert_decision(&DecisionWrite {
+            id: &id,
+            action,
+            actor: &session.actor.id,
+            confirmer,
+            verdict,
+            params,
+            guards,
+            effects: &effects,
+            snapshot,
+            trace,
+            at: self.now(),
+        })?;
         Ok(id)
     }
 
@@ -2201,31 +1713,21 @@ impl Engine {
         rec_id: &str,
         outcome: &ActionOutcome,
     ) -> Result<()> {
-        let db = self.db.lock().expect("db");
-        db.execute(
-            "INSERT OR IGNORE INTO side_effect_keys(idempotency_key, decision_record_id, action_name, outcome, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                key,
-                rec_id,
-                action,
-                serde_json::to_string(outcome)?,
-                self.now()
-            ],
-        )?;
-        Ok(())
+        self.store.put_idempotency(
+            key,
+            rec_id,
+            action,
+            &serde_json::to_string(outcome)?,
+            self.now(),
+        )
     }
 
     fn load_cached_outcome(&self, key: &str) -> Result<Option<ActionOutcome>> {
-        let db = self.db.lock().expect("db");
-        let raw: Option<String> = db
-            .query_row(
-                "SELECT outcome FROM side_effect_keys WHERE idempotency_key = ?1",
-                params![key],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(raw.map(|s| serde_json::from_str(&s)).transpose()?)
+        Ok(self
+            .store
+            .get_idempotency(key)?
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?)
     }
 }
 
@@ -2253,15 +1755,15 @@ fn rule_version(spec: &ActionTypeSpec) -> String {
 fn param_str(params: &Value, name: &str) -> Result<String> {
     params
         .get(name)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .and_then(Value::as_str)
+        .map(str::to_string)
         .ok_or_else(|| OntoError::Invalid(format!("param {name} must be a string id")))
 }
 
 fn param_f64(params: &Value, name: &str) -> Result<f64> {
     params
         .get(name)
-        .and_then(|v| v.as_f64())
+        .and_then(Value::as_f64)
         .ok_or_else(|| OntoError::Invalid(format!("param {name} must be a number")))
 }
 
@@ -2302,10 +1804,7 @@ fn builder_tools() -> Vec<ToolSpec> {
         ("create_link_type", "Create a link type on a branch"),
         ("alter_link_type", "Alter a link type on a branch"),
         ("create_interface", "Create an interface on a branch"),
-        (
-            "attach_interface",
-            "Attach an interface to an object or action type",
-        ),
+        ("attach_interface", "Attach an interface to an object type"),
         ("create_action_type", "Create an action type on a branch"),
         ("alter_action_type", "Alter an action type on a branch"),
         ("create_function", "Create a function record on a branch"),

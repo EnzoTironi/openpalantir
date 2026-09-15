@@ -1,3 +1,6 @@
+#![allow(clippy::missing_errors_doc)] // OntoError is the public contract
+#![allow(clippy::missing_panics_doc)] // process entry: bind/open failures abort
+
 use axum::{extract::State, routing::post, Json, Router};
 use onto::{dispatch, Actor, AgentTier, Engine, KeyKind, Session};
 use serde::{Deserialize, Serialize};
@@ -34,30 +37,29 @@ fn session_from_key(key: KeyKind, params: &Value) -> Session {
     let meta = params.get("_meta").cloned().unwrap_or(json!({}));
     let id = meta
         .get("actor")
-        .and_then(|v| v.as_str())
+        .and_then(Value::as_str)
         .unwrap_or(match key {
             KeyKind::Builder => "builder",
             KeyKind::Consumer => "consumer",
         });
-    let roles: Vec<String> = meta
-        .get("roles")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_else(|| match key {
+    let roles: Vec<String> = meta.get("roles").and_then(Value::as_array).map_or_else(
+        || match key {
             KeyKind::Builder => vec!["modeler".into(), "reviewer".into()],
             KeyKind::Consumer => vec!["operator".into(), "supervisor".into()],
-        });
+        },
+        |a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        },
+    );
     let tier = meta
         .get("tier")
-        .and_then(|v| v.as_u64())
+        .and_then(Value::as_u64)
         .and_then(|n| u8::try_from(n).ok())
         .and_then(|n| AgentTier::try_from(n).ok())
         .unwrap_or(AgentTier::T3);
-    let refs: Vec<&str> = roles.iter().map(|s| s.as_str()).collect();
+    let refs: Vec<&str> = roles.iter().map(String::as_str).collect();
     let actor = match key {
         KeyKind::Builder => Actor::builder(id, &refs),
         KeyKind::Consumer => Actor::consumer(id, &refs, tier),
@@ -113,12 +115,12 @@ fn handle(engine: &Engine, key: KeyKind, req: RpcRequest) -> RpcResponse {
                         error: None,
                     }
                 }
-                Err(e) => rpc_err(id, e.to_string()),
+                Err(e) => rpc_err(id, &e.to_string()),
             }
         }
         "tools/call" => {
             let session = session_from_key(key, &params);
-            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
             match dispatch(engine, &session, name, arguments) {
                 Ok(v) => RpcResponse {
@@ -141,11 +143,11 @@ fn handle(engine: &Engine, key: KeyKind, req: RpcRequest) -> RpcResponse {
                 },
             }
         }
-        other => rpc_err(id, format!("unknown method {other}")),
+        other => rpc_err(id, &format!("unknown method {other}")),
     }
 }
 
-fn rpc_err(id: Option<Value>, msg: String) -> RpcResponse {
+fn rpc_err(id: Option<Value>, msg: &str) -> RpcResponse {
     RpcResponse {
         jsonrpc: "2.0",
         id,
@@ -164,7 +166,7 @@ fn parse_key() -> KeyKind {
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--key" {
-            if args.get(i + 1).map(|s| s.as_str()) == Some("builder") {
+            if args.get(i + 1).map(String::as_str) == Some("builder") {
                 key = KeyKind::Builder;
             }
             i += 2;
@@ -228,7 +230,7 @@ async fn main() {
             let req: RpcRequest = match serde_json::from_str(&line) {
                 Ok(r) => r,
                 Err(e) => {
-                    let resp = rpc_err(None, e.to_string());
+                    let resp = rpc_err(None, &e.to_string());
                     writeln!(stdout, "{}", serde_json::to_string(&resp).unwrap()).ok();
                     stdout.flush().ok();
                     continue;

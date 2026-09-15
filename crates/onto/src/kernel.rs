@@ -26,7 +26,7 @@
 //! kernel boot path; builders still cannot mutate main directly.
 //!
 //! # Relations
-//! [`crate::Engine::init`] calls [`install`]. [`crate::Engine::attach_interface`]
+//! [`crate::store::SqliteStore::init`] calls [`install`]. [`crate::Engine::attach_interface`]
 //! records the attach on a branch. Unmerged attach is invisible to these
 //! helpers because submit loads specs from main.
 
@@ -52,6 +52,7 @@ pub enum KernelInterface {
 impl KernelInterface {
     pub const ALL: [KernelInterface; 2] = [Self::Reviewable, Self::Evidenced];
 
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Reviewable => "Reviewable",
@@ -59,6 +60,7 @@ impl KernelInterface {
         }
     }
 
+    #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "Reviewable" => Some(Self::Reviewable),
@@ -68,6 +70,7 @@ impl KernelInterface {
     }
 
     /// Required properties on the interface record (Zhang 2026, Ch. 4).
+    #[must_use]
     pub fn required_properties(self) -> &'static [&'static str] {
         match self {
             Self::Reviewable => &["status"],
@@ -75,6 +78,7 @@ impl KernelInterface {
         }
     }
 
+    #[must_use]
     pub fn spec(self) -> InterfaceSpec {
         InterfaceSpec {
             name: self.as_str().into(),
@@ -88,12 +92,14 @@ impl KernelInterface {
 }
 
 /// Whether `names` lists this kernel interface.
+#[must_use]
 pub fn attached(names: &[String], iface: KernelInterface) -> bool {
     names.iter().any(|n| n == iface.as_str())
 }
 
 /// Propose + Reviewable must create an inbox object. Propose without the
 /// interface must not. Mode alone is not the contract.
+#[must_use]
 pub fn require_inbox(spec: &ActionTypeSpec) -> bool {
     match spec.mode {
         ExecutionMode::Propose => attached(&spec.interfaces, KernelInterface::Reviewable),
@@ -114,6 +120,7 @@ pub enum EvidenceGap {
 
 /// Missing or stale required evidence on a view. Empty when Evidenced is
 /// not attached to the type (including unmerged attach).
+#[must_use]
 pub fn evidence_gaps(
     object_type: &ObjectTypeSpec,
     interface: &InterfaceSpec,
@@ -152,6 +159,7 @@ pub fn evidence_gaps(
 }
 
 /// First evidence gap as a Complete/Current Review guard.
+#[must_use]
 pub fn evidenced_guard(
     object_type: &ObjectTypeSpec,
     interface: &InterfaceSpec,
@@ -180,6 +188,7 @@ pub fn evidenced_guard(
 }
 
 /// Meta ObjectType used to store kernel language records.
+#[must_use]
 pub fn object_type_spec() -> ObjectTypeSpec {
     ObjectTypeSpec {
         name: "ObjectType".into(),

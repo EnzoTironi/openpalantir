@@ -37,6 +37,9 @@
 //! [`crate::install`] is the wastewater case. Both may live in one engine:
 //! install wastewater first, then this module on a branch until merge.
 
+#![allow(clippy::module_name_repetitions)] // public Highered* names match the case
+#![allow(clippy::too_many_lines)] // teaching-case install is one schema dump
+
 use onto::{
     ActionTypeSpec, Actor, AgentTier, AuthzDecision, AuthzLevel, AuthzOp, Engine, ExecutionMode,
     IngestRecord, KeyKind, LinkTypeSpec, ObjectTypeSpec, ParamSpec, PolicySpec, PropertySource,
@@ -616,7 +619,7 @@ fn vt(
         base: base.into(),
         min,
         max,
-        unit: unit.map(|s| s.into()),
+        unit: unit.map(str::to_string),
     }
 }
 
@@ -659,6 +662,7 @@ fn rec(type_name: &str, id: &str, pairs: &[(&str, serde_json::Value)], as_of: i6
     }
 }
 
+#[allow(clippy::too_many_arguments)] // policy grant fixture matches PolicySpec columns
 fn grant(
     name: &str,
     level: AuthzLevel,
@@ -676,10 +680,10 @@ fn grant(
         level,
         op,
         key,
-        type_name: type_name.map(|s| s.into()),
-        instance_id: instance_id.map(|s| s.into()),
-        property: property.map(|s| s.into()),
-        roles: roles.iter().map(|s| (*s).to_string()).collect(),
+        type_name: type_name.map(str::to_string),
+        instance_id: instance_id.map(str::to_string),
+        property: property.map(str::to_string),
+        roles: roles.iter().copied().map(str::to_string).collect(),
         min_tier,
         decision,
     }

@@ -2,6 +2,11 @@
 //!
 //! Schema lives in OMS and is mutated at runtime on a branch. Consumer syscalls
 //! are projected from main after merge. There is no file-based constitution.
+//!
+//! [`SqliteStore`] owns the `SQLite` lock. [`Engine`] coordinates. The [`Store`]
+//! trait is the only persistence seam (one sqlite impl now).
+
+#![allow(clippy::missing_errors_doc)] // OntoError is the public contract
 
 mod bitemporal;
 mod compensation;
@@ -11,6 +16,7 @@ mod functions;
 mod kernel;
 mod oss;
 mod security;
+mod store;
 mod surface;
 mod tiers;
 mod types;
@@ -24,6 +30,7 @@ pub use functions::{FunctionKind, FunctionSpec};
 pub use kernel::KernelInterface;
 pub use oss::{ObjectSet, ObjectSetFilter, ObjectSetSpec};
 pub use security::{AuthzDecision, AuthzLevel, AuthzOp, PolicySpec};
+pub use store::{SqliteStore, Store};
 pub use surface::dispatch;
 pub use tiers::{AgentTier, AutoBound, AutoClaim, IllegalTier, RiskBand};
 pub use types::*;

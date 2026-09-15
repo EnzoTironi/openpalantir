@@ -27,9 +27,13 @@ Inspirado em Zhang, *Operational Ontology: From Business Mirror to Decision Runt
 - `crates/onto-mcp` — MCP stdio e HTTP em `:43177/mcp`
 - `crates/onto-bootstrap` — casos wastewater e ensino superior via as mesmas APIs de builder
 
-## Rodar
+## Lint
+
+Clippy pedantic está em deny no workspace. `SQLite` é o backend de ensino; [`Store`] em `crates/onto` é dono do lock da conexão.
 
 ```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D clippy::pedantic -D warnings
 cargo test --workspace -- --test-threads=1
 ```
 

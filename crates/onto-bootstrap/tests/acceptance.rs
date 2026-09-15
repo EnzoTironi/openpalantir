@@ -6,6 +6,7 @@ use onto::{
 };
 use onto_bootstrap::{install, WastewaterIds};
 use serde_json::json;
+use std::collections::BTreeMap;
 
 fn modeller() -> Session {
     Session::new(Actor::builder("human.modeler", &["modeler"]), "test")
@@ -687,6 +688,7 @@ fn wastewater_sensor_exposes_days_since_calibration() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // function registry merge is one teaching case
 fn runtime_registered_function_visible_after_merge() {
     let engine = Engine::memory().unwrap();
     install(&engine).unwrap();
@@ -914,7 +916,7 @@ fn named_set_invisible_on_main_until_merge() {
             ObjectSetSpec {
                 name: "aeration_tanks".into(),
                 type_name: Some("AerationTank".into()),
-                equals: Default::default(),
+                equals: BTreeMap::default(),
             },
         )
         .unwrap();
@@ -959,7 +961,7 @@ fn named_set_includes_new_match_excludes_non_match() {
         ObjectSetSpec {
             name: "aeration_tanks".into(),
             type_name: Some("AerationTank".into()),
-            equals: Default::default(),
+            equals: BTreeMap::default(),
         },
     );
     let before = engine
